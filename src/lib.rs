@@ -4,9 +4,11 @@
 
 pub mod agent;
 pub mod cancel;
+pub mod crash;
 pub mod config;
 pub mod lsp;
 pub mod provider;
+pub mod render;
 pub mod session;
 pub mod skills;
 pub mod tools;

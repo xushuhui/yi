@@ -173,8 +173,8 @@ pub fn collect(agent: &mut Agent, prompt: &str) -> (String, Vec<String>, Vec<Str
             Event::Text(piece) => text.push_str(&piece),
             Event::Reasoning(piece) => reasoning.push(piece),
             Event::ToolCall { summary, .. } => tools.push(summary),
-            // 压缩提示只影响界面显示，断言看会话文件。
-            Event::Notice(_) => {}
+            // 压缩提示和工具结果行只影响界面显示，断言看会话文件。
+            Event::Notice(_) | Event::ToolResult { .. } => {}
         })
         .expect("本轮对话成功");
     (text, reasoning, tools)

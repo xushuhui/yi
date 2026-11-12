@@ -30,6 +30,8 @@ impl Agent {
             &cfg.model,
             cfg.effort.as_deref().unwrap_or("auto"),
         )?;
+        // panic 时会话文件要靠这两个信息才能接一条 notice。
+        crate::crash::install(session_path, session.last_seq());
         let effort = session.current_effort().or(cfg.effort.clone());
         let log_dir = session_path.parent().unwrap_or(Path::new(".")).join("logs");
 
@@ -47,7 +49,12 @@ impl Agent {
         })
     }
 
-    /// 工具结果算不算失败：显式的 `ERROR`，或 bash 的非零退出码。
+    /// 取第一行，给界面用。
+fn first_line(text: &str) -> &str {
+    text.lines().next().unwrap_or("")
+}
+
+/// 工具结果算不算失败：显式的 `ERROR`，或 bash 的非零退出码。
     /// 只看末尾的退出码行，避免命令输出里恰好出现「退出码：」被误判。
     fn looks_failed(text: &str) -> bool {
         if text.starts_with("ERROR") {
@@ -133,10 +140,10 @@ impl Agent {
                 }
                 on(Event::ToolCall {
                     name: call.name.clone(),
-                    summary: Tools::describe(&call),
+                    summary: self.tools.describe(&call),
                 });
                 let signature = (call.name.clone(), call.arguments.clone());
-                last_summary = Tools::describe(&call);
+                last_summary = self.tools.describe(&call);
                 match self.tools.execute(&call) {
                     Outcome::Text(text) => {
                         let failed = Self::looks_failed(&text);
@@ -148,6 +155,20 @@ impl Agent {
                             failures = 0;
                         }
                         last_call = Some(signature);
+                        // 失败原因和 edit 改动量值得让人看见；成功的大段输出不回显。
+                        if failed {
+                            on(Event::ToolResult {
+                                name: call.name.clone(),
+                                failed: true,
+                                note: Self::first_line(&text).to_string(),
+                            });
+                        } else if call.name == "edit" {
+                            on(Event::ToolResult {
+                                name: call.name.clone(),
+                                failed: false,
+                                note: Self::first_line(&text).to_string(),
+                            });
+                        }
                         self.session.append_tool_result(&call.id, text)?;
                     }
                     Outcome::Image { path, note } => {

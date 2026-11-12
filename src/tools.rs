@@ -177,7 +177,25 @@ impl Tools {
     }
 
     /// 一行人类可读的调用摘要，用于终端回显。
-    pub fn describe(call: &ToolCall) -> String {
+    /// 把命令开头多余的 `cd <项目根> && ` 去掉：项目根本来就是工作目录。
+    /// 只认完全等于项目根的路径；别的目录保持原样。
+    fn strip_redundant_cd(&self, command: &str) -> String {
+        let root = self.root.to_string_lossy();
+        let root = root.trim_end_matches('/');
+        for prefix in [
+            format!("cd {root} && "),
+            format!("cd {root}/ && "),
+            format!("cd \"{root}\" && "),
+            format!("cd '{root}' && "),
+        ] {
+            if let Some(rest) = command.strip_prefix(&prefix) {
+                return rest.to_string();
+            }
+        }
+        command.to_string()
+    }
+
+    pub fn describe(&self, call: &ToolCall) -> String {
         let args: Value = serde_json::from_str(&call.arguments).unwrap_or(Value::Null);
         let pick = |key: &str| {
             args.get(key)
@@ -192,11 +210,8 @@ impl Tools {
                 let head = first.lines().next().unwrap_or("").to_string();
                 format!("edit {head}")
             }
-            "bash" => {
-                let mut command = pick("command");
-                command.truncate(80);
-                format!("bash {command}")
-            }
+            // bash 只给命令本身，界面会加上 `$` 前缀；不截断，长命令照原样显示。
+            "bash" => self.strip_redundant_cd(&pick("command")),
             "grep" => format!("grep {}", pick("pattern")),
             "glob" => format!("glob {}", pick("pattern")),
             "lsp" => format!("lsp {} {}", pick("action"), pick("path")),
@@ -583,6 +598,8 @@ impl Tools {
         let Some(command) = args.get("command").and_then(Value::as_str) else {
             return "ERROR: 缺少 command".to_string();
         };
+        // 模型常把项目根写成 `cd <根> && ...`：工作目录本来就是项目根，剥掉再跑。
+        let command = self.strip_redundant_cd(command);
         let timeout = args
             .get("timeout")
             .and_then(Value::as_u64)
@@ -608,7 +625,7 @@ impl Tools {
 
         let mut child = match Command::new("/bin/sh")
             .arg("-c")
-            .arg(command)
+            .arg(&command)
             .current_dir(&working_dir)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -1286,4 +1303,67 @@ fn truncate_chars(text: &str, max: usize) -> String {
     let mut out: String = text.chars().take(max).collect();
     out.push('…');
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn tools(root: &std::path::Path) -> Tools {
+        Tools::new(
+            root.to_path_buf(),
+            root.join("logs"),
+            "gopls".to_string(),
+            "phpantom_lsp".to_string(),
+        )
+    }
+
+    fn bash_call(command: &str) -> ToolCall {
+        ToolCall {
+            id: "c1".to_string(),
+            name: "bash".to_string(),
+            arguments: json!({ "command": command }).to_string(),
+        }
+    }
+
+    #[test]
+    fn describe_drops_a_redundant_cd_to_the_project_root() {
+        let root = std::env::temp_dir().join("yi-strip-proj");
+        let line = tools(&root).describe(&bash_call(&format!(
+            "cd {} && go test ./...",
+            root.display()
+        )));
+        assert_eq!(line, "go test ./...");
+    }
+
+    #[test]
+    fn describe_keeps_a_cd_to_another_directory() {
+        let root = std::env::temp_dir().join("yi-strip-proj");
+        let line = tools(&root).describe(&bash_call("cd /tmp/elsewhere && ls"));
+        assert_eq!(line, "cd /tmp/elsewhere && ls");
+    }
+
+    #[test]
+    fn strip_is_exact_and_also_handles_quotes() {
+        let root = std::env::temp_dir().join("yi-strip-proj");
+        let tools = tools(&root);
+        let plain = format!("cd {} && ls", root.display());
+        assert_eq!(tools.strip_redundant_cd(&plain), "ls");
+        let quoted = format!("cd \"{}\" && ls", root.display());
+        assert_eq!(tools.strip_redundant_cd(&quoted), "ls");
+        // 别的目录、或者只是长得像，都不能动。
+        assert_eq!(tools.strip_redundant_cd("cd /tmp && ls"), "cd /tmp && ls");
+    }
+
+    #[test]
+    fn execution_drops_the_same_prefix() {
+        let root = std::env::temp_dir().join("yi-strip-exec");
+        std::fs::create_dir_all(&root).expect("建目录");
+        let mut tools = tools(&root);
+        let out = tools.bash(&json!({
+            "command": format!("cd {} && echo 还在项目根", root.display()),
+        }));
+        assert!(out.contains("还在项目根"), "{out}");
+    }
 }

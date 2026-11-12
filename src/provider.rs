@@ -17,6 +17,12 @@ pub enum Event {
         name: String,
         summary: String,
     },
+    /// 工具执行完的一行提示：失败给原因，`edit` 成功给摘要；其余成功不打扰。
+    ToolResult {
+        name: String,
+        failed: bool,
+        note: String,
+    },
     /// 给用户看的一行提示（压缩完成、压缩失败等）。
     Notice(String),
 }
@@ -404,4 +410,20 @@ fn base64(bytes: &[u8]) -> String {
         });
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::truncate;
+
+    #[test]
+    fn truncate_never_splits_a_character() {
+        // 79 个 ASCII 字节后是「中」的首字节：上限 80 落在字中间，必须退回到 79。
+        let text = format!("{}中{}", "a".repeat(79), "b".repeat(20));
+        assert_eq!(truncate(&text, 80), format!("{}…", "a".repeat(79)));
+
+        // 上限正好落在「中」之后（82），可以完整保留它。
+        let kept = truncate(&text, 82);
+        assert!(kept.starts_with(&format!("{}中", "a".repeat(79))), "{kept}");
+    }
 }

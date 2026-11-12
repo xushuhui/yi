@@ -472,7 +472,14 @@ impl Session {
         self.next_seq += 1;
         self.write_json(&entry)?;
         self.entries.push(entry);
+        // 让崩溃钩子知道下一条该用哪个序号。
+        crate::crash::observe(self.next_seq - 1);
         Ok(())
+    }
+
+    /// 当前最后一条记录的序号，交给崩溃钩子接续。
+    pub fn last_seq(&self) -> u64 {
+        self.next_seq.saturating_sub(1)
     }
 
     fn write_json<T: Serialize>(&mut self, value: &T) -> Result<()> {

@@ -817,3 +817,22 @@ fn grep_skips_snapshots_for_huge_files() {
         last_tool_output(&home)
     );
 }
+
+#[test]
+fn describe_survives_a_command_whose_80th_byte_is_inside_a_chinese_character() {
+    // 旧实现用 String::truncate(80) 按字节截断，第 80 个字节落在「中」中间时 panic。
+    let command = format!("{}中{}", "a".repeat(79), "b".repeat(20));
+    let call = yi::session::ToolCall {
+        id: "c1".to_string(),
+        name: "bash".to_string(),
+        arguments: serde_json::json!({ "command": command }).to_string(),
+    };
+    let tools = yi::tools::Tools::new(
+        std::env::temp_dir(),
+        std::env::temp_dir().join("yi-logs"),
+        "gopls".to_string(),
+        "phpantom_lsp".to_string(),
+    );
+    let line = tools.describe(&call);
+    assert!(line.contains('中'), "整条命令都要留下：{line}");
+}

@@ -3,6 +3,7 @@ use std::io::{self, IsTerminal, Write};
 use yi::agent::Agent;
 use yi::config::{self, CONTEXT_WINDOW, Config};
 use yi::provider::Event;
+use yi::render::{self, Renderer};
 use yi::session::{HISTORY_LIMIT, Usage};
 use yi::{Error, Result};
 
@@ -14,6 +15,7 @@ fn main() {
 }
 
 fn run() -> Result<()> {
+    yi::crash::install_hook();
     for arg in std::env::args().skip(1) {
         match arg.as_str() {
             // 默认行为就是继续本项目会话，`-c` 只为保留手感。
@@ -41,6 +43,9 @@ fn run() -> Result<()> {
         .join("session.jsonl");
     let mut agent = Agent::new(&cfg, &cwd, &session_path)?;
     let mut editor = make_editor(&agent)?;
+    // 只在真终端里上色；管道输出、NO_COLOR 时保持原样。
+    let color = io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
+    let mut renderer = Renderer::new(color);
 
     println!("yi · {} · {cwd}", cfg.model);
     println!("会话：{}", session_path.display());
@@ -72,7 +77,8 @@ fn run() -> Result<()> {
         yi::cancel::arm();
         let result = agent.submit(&message, &mut |event| match event {
             Event::Text(text) => {
-                print!("{text}");
+                let out = renderer.push(&text);
+                print!("{out}");
                 let _ = io::stdout().flush();
             }
             Event::Reasoning(_) => {
@@ -84,18 +90,47 @@ fn run() -> Result<()> {
                 }
             }
             Event::Notice(notice) => {
+                let half = renderer.flush_line();
+                print!("{half}");
                 println!();
                 println!("· {notice}");
             }
-            Event::ToolCall { summary, .. } => {
+            Event::ToolCall { name, summary } => {
+                let half = renderer.flush_line();
+                print!("{half}");
                 println!();
-                println!("→ {summary}");
+                // 命令按 shell 的样子显示（`$ 命令`），其余工具用箭头加名字。
+                if name == "bash" {
+                    if color {
+                        println!("\x1b[32m$\x1b[0m {summary}");
+                    } else {
+                        println!("$ {summary}");
+                    }
+                } else if color {
+                    println!("\x1b[36m→\x1b[0m \x1b[2m{summary}\x1b[0m");
+                } else {
+                    println!("→ {summary}");
+                }
                 // 同上：刷新失败不影响本轮结果。
+                let _ = io::stdout().flush();
+            }
+            Event::ToolResult {
+                name,
+                failed,
+                note,
+            } => {
+                let half = renderer.flush_line();
+                print!("{half}");
+                let short: String = note.chars().take(160).collect();
+                println!("{}", render::tool_line(&name, failed, &short, color));
                 let _ = io::stdout().flush();
             }
         });
 
         yi::cancel::disarm();
+        // 把没换行的半行、没闭合的代码块放出来，再打页脚。
+        let tail = renderer.finish();
+        print!("{tail}");
         match result {
             Ok(usage) => {
                 println!();
