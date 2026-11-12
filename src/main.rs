@@ -42,7 +42,7 @@ fn run() -> Result<()> {
     let mut agent = Agent::new(&cfg, &cwd, &session_path)?;
 
     println!("yi · {} · {cwd}", cfg.model);
-    println!("会话：{}", agent.session_path().display());
+    println!("会话：{}", session_path.display());
     println!("输入 /help 查看命令，Ctrl-D 退出。\n");
 
     loop {
@@ -72,8 +72,19 @@ fn run() -> Result<()> {
                 if !thinking_shown {
                     thinking_shown = true;
                     println!("思考中…");
+                    // 终端已经不在了就没必要报错，后续输出自然会失败。
                     let _ = io::stdout().flush();
                 }
+            }
+            Event::Notice(notice) => {
+                println!();
+                println!("· {notice}");
+            }
+            Event::ToolCall { summary, .. } => {
+                println!();
+                println!("→ {summary}");
+                // 同上：刷新失败不影响本轮结果。
+                let _ = io::stdout().flush();
             }
         });
 
@@ -147,7 +158,9 @@ fn footer(usage: &Usage) -> String {
     let percent = prompt * 100 / CONTEXT_WINDOW;
     let rate = (usage.cache_hit * 100).checked_div(prompt).unwrap_or(0);
     format!(
-        "[上下文 {percent}% · 缓存命中 {rate}% · 本轮 {} in / {} out]",
+        "[上下文 {percent}% · 缓存命中 {rate}%（{} / {}）· 本轮 {} in / {} out]",
+        human(usage.cache_hit),
+        human(prompt),
         human(prompt),
         human(usage.output)
     )

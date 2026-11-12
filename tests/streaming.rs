@@ -2,144 +2,11 @@
 //!
 //! 断言只看外部可见的东西：累积出来的文本、会话 JSONL、假服务器收到的请求体。
 
-use parking_lot::Mutex;
-use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
+mod common;
 
-use serde_json::{Value, json};
+use common::*;
+use serde_json::Value;
 use yi::agent::Agent;
-use yi::config::Config;
-use yi::provider::Event;
-
-struct FakeServer {
-    port: u16,
-    bodies: Arc<Mutex<Vec<Value>>>,
-}
-
-/// 按给定顺序回应每个请求，并把收到的请求体留档。
-fn start_server(responses: Vec<String>) -> FakeServer {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("绑定本地端口");
-    let port = listener.local_addr().expect("取端口").port();
-    let bodies = Arc::new(Mutex::new(Vec::new()));
-    let recorded = Arc::clone(&bodies);
-
-    thread::spawn(move || {
-        for response in responses {
-            let Ok((stream, _)) = listener.accept() else {
-                return;
-            };
-            let body = read_request(&stream);
-            if let Ok(json) = serde_json::from_str::<Value>(&body) {
-                recorded.lock().push(json);
-            }
-            let mut stream = stream;
-            let _ = stream.write_all(response.as_bytes());
-            let _ = stream.flush();
-        }
-    });
-
-    FakeServer { port, bodies }
-}
-
-fn read_request(stream: &TcpStream) -> String {
-    let mut reader = BufReader::new(stream);
-    let mut content_length = 0usize;
-    let mut line = String::new();
-    loop {
-        line.clear();
-        if reader.read_line(&mut line).unwrap_or(0) == 0 {
-            break;
-        }
-        let head = line.trim_end();
-        if head.is_empty() {
-            break;
-        }
-        let lower = head.to_ascii_lowercase();
-        if let Some(value) = lower.strip_prefix("content-length:") {
-            content_length = value.trim().parse().unwrap_or(0);
-        }
-    }
-    let mut body = vec![0u8; content_length];
-    let _ = reader.read_exact(&mut body);
-    String::from_utf8_lossy(&body).to_string()
-}
-
-fn sse_response(content: &[&str], reasoning: &[&str], usage: Value) -> String {
-    let mut out = String::from(
-        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
-    );
-    for piece in reasoning {
-        out.push_str(&format!(
-            "data: {}\n\n",
-            json!({"choices": [{"index": 0, "delta": {"reasoning_content": piece}}]})
-        ));
-    }
-    for piece in content {
-        out.push_str(&format!(
-            "data: {}\n\n",
-            json!({"choices": [{"index": 0, "delta": {"content": piece}}]})
-        ));
-    }
-    out.push_str(&format!(
-        "data: {}\n\n",
-        json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}], "usage": usage})
-    ));
-    out.push_str("data: [DONE]\n\n");
-    out
-}
-
-fn plain_response(content: &[&str]) -> String {
-    sse_response(
-        content,
-        &[],
-        json!({
-            "prompt_tokens": 120,
-            "completion_tokens": 7,
-            "prompt_cache_hit_tokens": 100,
-            "prompt_cache_miss_tokens": 20,
-        }),
-    )
-}
-
-fn temp_home(tag: &str) -> PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or_default();
-    let dir = std::env::temp_dir().join(format!("yi-{tag}-{}", nanos));
-    std::fs::create_dir_all(&dir).expect("建临时目录");
-    dir
-}
-
-fn config(port: u16, home: &Path, effort: Option<&str>) -> Config {
-    Config {
-        api_key: "test-key".to_string(),
-        base_url: format!("http://127.0.0.1:{port}"),
-        model: "deepseek-flash".to_string(),
-        effort: effort.map(str::to_string),
-        home: home.to_path_buf(),
-    }
-}
-
-fn session_path(home: &Path) -> PathBuf {
-    home.join("sessions").join("proj").join("session.jsonl")
-}
-
-fn collect(agent: &mut Agent, prompt: &str) -> (String, Vec<String>) {
-    let mut text = String::new();
-    let mut reasoning = Vec::new();
-    agent
-        .submit(prompt, &mut |event| match event {
-            Event::Text(piece) => text.push_str(&piece),
-            Event::Reasoning(piece) => reasoning.push(piece),
-        })
-        .expect("本轮对话成功");
-    (text, reasoning)
-}
 
 #[test]
 fn streams_text_and_records_the_session() {
@@ -152,30 +19,29 @@ fn streams_text_and_records_the_session() {
     )
     .expect("打开会话");
 
-    let (text, reasoning) = collect(&mut agent, "hi");
+    let (text, reasoning, tools) = collect(&mut agent, "hi");
     assert_eq!(text, "Hello world");
     assert!(reasoning.is_empty());
+    assert!(tools.is_empty());
 
     let request = server.bodies.lock()[0].clone();
     assert_eq!(request["model"], "deepseek-flash");
     assert_eq!(request["messages"][0]["role"], "system");
     assert_eq!(request["messages"][1]["content"], "hi");
+    assert!(request["tools"].as_array().is_some_and(|t| t.len() == 6));
 
-    let raw = std::fs::read_to_string(session_path(&home)).expect("读会话文件");
-    let lines: Vec<&str> = raw.lines().filter(|l| !l.trim().is_empty()).collect();
-    assert_eq!(lines.len(), 3, "头 + 用户 + 助手：{raw}");
-    let header: Value = serde_json::from_str(lines[0]).unwrap();
-    assert_eq!(header["type"], "session");
-    assert_eq!(header["version"].as_u64(), Some(1));
-    let assistant: Value = serde_json::from_str(lines[2]).unwrap();
-    assert_eq!(assistant["message"]["role"], "assistant");
-    assert_eq!(assistant["message"]["content"], "Hello world");
+    let entries = session_entries(&home);
+    assert_eq!(entries.len(), 3, "头 + 用户 + 助手：{entries:?}");
+    assert_eq!(entries[0]["type"], "session");
+    assert_eq!(entries[0]["version"].as_u64(), Some(1));
+    assert_eq!(entries[2]["message"]["role"], "assistant");
+    assert_eq!(entries[2]["message"]["content"], "Hello world");
     assert_eq!(
-        assistant["message"]["usage"]["cache_hit"].as_u64(),
+        entries[2]["message"]["usage"]["cache_hit"].as_u64(),
         Some(100)
     );
     assert_eq!(
-        assistant["message"]["usage"]["input_uncached"].as_u64(),
+        entries[2]["message"]["usage"]["input_uncached"].as_u64(),
         Some(20)
     );
 }
@@ -205,6 +71,7 @@ fn second_turn_reuses_the_prefix_byte_for_byte() {
     assert_eq!(second[2]["role"], "assistant");
     assert_eq!(second[2]["content"], "first");
     assert_eq!(second[3]["content"], "two");
+    assert_eq!(bodies[0]["tools"], bodies[1]["tools"], "工具定义必须一致");
 }
 
 #[test]
@@ -243,7 +110,7 @@ fn reasoning_streams_separately_from_content() {
     let server = start_server(vec![sse_response(
         &["answer"],
         &["thinking", " harder"],
-        json!({"prompt_tokens": 10, "completion_tokens": 2}),
+        serde_json::json!({"prompt_tokens": 10, "completion_tokens": 2}),
     )]);
     let home = temp_home("reasoning");
     let mut agent = Agent::new(
@@ -253,7 +120,7 @@ fn reasoning_streams_separately_from_content() {
     )
     .expect("打开会话");
 
-    let (text, reasoning) = collect(&mut agent, "hi");
+    let (text, reasoning, _) = collect(&mut agent, "hi");
     assert_eq!(text, "answer");
     assert_eq!(reasoning.concat(), "thinking harder");
 }
@@ -284,4 +151,113 @@ fn a_second_instance_in_the_same_project_is_refused() {
     let second = Agent::new(&config(1, &home, None), "/tmp/proj", &path);
     assert!(second.is_err(), "同一项目不允许两个实例");
     drop(first);
+}
+
+#[test]
+fn tool_call_round_trip_keeps_the_conversation_paired() {
+    let server = start_server(vec![
+        tool_response(&[("call_1", "read", serde_json::json!({"path": "a.txt"}))]),
+        plain_response(&["done"]),
+    ]);
+    let home = temp_home("paired");
+    let workspace = temp_home("workspace");
+    std::fs::write(workspace.join("a.txt"), "hello\n").unwrap();
+    let mut agent = Agent::new(
+        &config(server.port, &home, None),
+        &workspace.to_string_lossy(),
+        &session_path(&home),
+    )
+    .expect("打开会话");
+
+    let (text, _, tools) = collect(&mut agent, "读一下 a.txt");
+    assert_eq!(text, "done");
+    assert_eq!(tools.len(), 1);
+    assert!(tools[0].starts_with("read a.txt"));
+
+    let bodies = server.bodies.lock();
+    let second = &bodies[1]["messages"];
+    let assistant = second
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["role"] == "assistant" && m.get("tool_calls").is_some())
+        .expect("第二轮应带工具调用记录");
+    assert_eq!(assistant["tool_calls"][0]["id"], "call_1");
+    let tool = second
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["role"] == "tool")
+        .expect("第二轮应带工具结果");
+    assert_eq!(tool["tool_call_id"], "call_1");
+    assert!(
+        tool["content"].as_str().unwrap().contains("hello"),
+        "工具结果应包含文件内容：{}",
+        tool["content"]
+    );
+}
+
+#[test]
+fn a_tool_error_is_fed_back_instead_of_ending_the_turn() {
+    let server = start_server(vec![
+        tool_response(&[("call_1", "read", serde_json::json!({"path": "missing.txt"}))]),
+        plain_response(&["我换一种方式"]),
+    ]);
+    let home = temp_home("tool-error");
+    let workspace = temp_home("workspace-error");
+    let mut agent = Agent::new(
+        &config(server.port, &home, None),
+        &workspace.to_string_lossy(),
+        &session_path(&home),
+    )
+    .expect("打开会话");
+
+    let (text, _, _) = collect(&mut agent, "读一个不存在的文件");
+    assert_eq!(text, "我换一种方式");
+
+    let bodies = server.bodies.lock();
+    let tool: &Value = bodies[1]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["role"] == "tool")
+        .expect("错误也要作为工具结果回给模型");
+    assert!(tool["content"].as_str().unwrap().starts_with("ERROR:"));
+}
+
+#[test]
+fn unknown_tool_name_is_reported_as_text() {
+    let server = start_server(vec![
+        tool_response(&[("call_1", "nope", serde_json::json!({}))]),
+        plain_response(&["好"]),
+    ]);
+    let home = temp_home("unknown-tool");
+    let workspace = temp_home("workspace-unknown");
+    let mut agent = Agent::new(
+        &config(server.port, &home, None),
+        &workspace.to_string_lossy(),
+        &session_path(&home),
+    )
+    .expect("打开会话");
+
+    let (text, _, _) = collect(&mut agent, "随便");
+    assert_eq!(text, "好");
+}
+
+#[test]
+fn event_stream_handles_empty_deltas() {
+    let server = start_server(vec![sse_response(
+        &[],
+        &[],
+        serde_json::json!({"prompt_tokens": 3, "completion_tokens": 0}),
+    )]);
+    let home = temp_home("empty");
+    let mut agent = Agent::new(
+        &config(server.port, &home, None),
+        "/tmp/proj",
+        &session_path(&home),
+    )
+    .expect("打开会话");
+    let (text, _, _) = collect(&mut agent, "hi");
+    assert!(text.is_empty());
 }

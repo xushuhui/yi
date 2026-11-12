@@ -6,6 +6,7 @@ pub mod agent;
 pub mod config;
 pub mod provider;
 pub mod session;
+pub mod tools;
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 

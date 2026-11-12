@@ -8,7 +8,7 @@ pub const DEFAULT_BASE_URL: &str = "https://api.deepseek.com";
 pub const DEFAULT_MODEL: &str = "deepseek-flash";
 /// `deepseek-flash` 的上下文窗口，用来算页脚里的占用百分比。
 pub const CONTEXT_WINDOW: u64 = 1_048_576;
-/// 默认系统提示词，编译进二进制；`~/.yi/SYSTEM.md` 存在时整份替换它。
+/// 默认系统提示词，编译期内嵌进二进制，是唯一来源。
 pub const DEFAULT_SYSTEM_PROMPT: &str = include_str!("../prompts/system.md");
 
 #[derive(Debug, Clone)]

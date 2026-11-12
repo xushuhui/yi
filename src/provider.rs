@@ -1,21 +1,30 @@
+use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader};
 use std::time::Duration;
 
 use serde_json::{Value, json};
 
 use crate::config::Config;
-use crate::session::{Message, Usage};
+use crate::session::{Message, ToolCall, Usage};
 use crate::{Error, Result};
 
 /// 流式过程中对外抛出的增量事件。
 pub enum Event {
     Text(String),
     Reasoning(String),
+    /// 开始执行某个工具，`summary` 是一行人类可读的简述。
+    ToolCall {
+        name: String,
+        summary: String,
+    },
+    /// 给用户看的一行提示（压缩完成、压缩失败等）。
+    Notice(String),
 }
 
 pub struct Reply {
     pub content: String,
     pub reasoning: Option<String>,
+    pub tool_calls: Vec<ToolCall>,
     pub usage: Usage,
 }
 
@@ -46,18 +55,41 @@ impl Provider {
         &self,
         system: &str,
         messages: &[Message],
+        tools: &Value,
         effort: Option<&str>,
         on: &mut dyn FnMut(Event),
     ) -> Result<Reply> {
-        let body = build_body(&self.model, system, messages, effort);
+        let body = build_body(&self.model, system, messages, tools, effort);
         let resp = self.send_with_retry(&body)?;
         read_stream(resp, on)
     }
 
+    /// 非流式的一次性补全，只用于生成压缩摘要。
+    pub fn complete(&self, system: &str, prompt: &str) -> Result<String> {
+        let body = json!({
+            "model": self.model,
+            "messages": [
+                { "role": "system", "content": system },
+                { "role": "user", "content": prompt },
+            ],
+            "stream": false,
+        });
+        let resp = self.send_with_retry(&body)?;
+        let text = resp
+            .into_body()
+            .read_to_string()
+            .map_err(|e| Error::Http(e.to_string()))?;
+        let value: Value = serde_json::from_str(&text)?;
+        value["choices"][0]["message"]["content"]
+            .as_str()
+            .map(str::to_string)
+            .ok_or_else(|| Error::Api(format!("压缩请求没有返回内容：{}", truncate(&text, 300))))
+    }
+
     /// 连接失败、5xx、429 退避重试三次；其余状态立即报错。
     fn send_with_retry(&self, body: &Value) -> Result<ureq::http::Response<ureq::Body>> {
-        let mut delay = Duration::from_secs(1);
-        for attempt in 0..3 {
+        let delays = [1u64, 2, 4];
+        for attempt in 0..=delays.len() {
             let sent = self
                 .agent
                 .post(&self.url)
@@ -76,37 +108,45 @@ impl Provider {
                         .read_to_string()
                         .unwrap_or_else(|_| String::new());
                     let retryable = code == 429 || (500..600).contains(&code);
-                    if retryable && attempt < 2 {
-                        std::thread::sleep(delay);
-                        delay *= 2;
+                    if retryable && attempt < delays.len() {
+                        std::thread::sleep(Duration::from_secs(delays[attempt]));
                         continue;
                     }
                     return Err(Error::Api(format!("HTTP {code}：{}", truncate(&text, 800))));
                 }
                 Err(e) => {
-                    if attempt < 2 {
-                        std::thread::sleep(delay);
-                        delay *= 2;
+                    if attempt < delays.len() {
+                        std::thread::sleep(Duration::from_secs(delays[attempt]));
                         continue;
                     }
                     return Err(Error::Http(e.to_string()));
                 }
             }
         }
-        unreachable!("循环最多三次，最后一次一定返回")
+        Err(Error::Http("重试三次仍失败".to_string()))
     }
 }
 
-fn build_body(model: &str, system: &str, messages: &[Message], effort: Option<&str>) -> Value {
+fn build_body(
+    model: &str,
+    system: &str,
+    messages: &[Message],
+    tools: &Value,
+    effort: Option<&str>,
+) -> Value {
     let mut wire = Vec::with_capacity(messages.len() + 1);
     wire.push(json!({ "role": "system", "content": system }));
+
     for message in messages {
         match message {
             Message::User { content } => {
                 wire.push(json!({ "role": "user", "content": content }));
             }
             Message::Assistant {
-                content, reasoning, ..
+                content,
+                reasoning,
+                tool_calls,
+                ..
             } => {
                 let mut value = json!({ "role": "assistant", "content": content });
                 if let Some(reasoning) = reasoning
@@ -114,7 +154,43 @@ fn build_body(model: &str, system: &str, messages: &[Message], effort: Option<&s
                 {
                     value["reasoning_content"] = json!(reasoning);
                 }
+                if !tool_calls.is_empty() {
+                    let calls: Vec<Value> = tool_calls
+                        .iter()
+                        .map(|call| {
+                            json!({
+                                "id": call.id,
+                                "type": "function",
+                                "function": { "name": call.name, "arguments": call.arguments },
+                            })
+                        })
+                        .collect();
+                    value["tool_calls"] = Value::Array(calls);
+                }
                 wire.push(value);
+            }
+            Message::Image { path } => match image_data_url(path) {
+                Some(url) => wire.push(json!({
+                    "role": "user",
+                    "content": [
+                        { "type": "text", "text": format!("[图片] {path}") },
+                        { "type": "image_url", "image_url": { "url": url } },
+                    ],
+                })),
+                None => wire.push(json!({
+                    "role": "user",
+                    "content": format!("[图片 {path} 读不到了]"),
+                })),
+            },
+            Message::Tool {
+                tool_call_id,
+                content,
+            } => {
+                wire.push(json!({
+                    "role": "tool",
+                    "tool_call_id": tool_call_id,
+                    "content": content,
+                }));
             }
         }
     }
@@ -125,6 +201,9 @@ fn build_body(model: &str, system: &str, messages: &[Message], effort: Option<&s
         "stream": true,
         "stream_options": { "include_usage": true },
     });
+    if tools.as_array().is_some_and(|list| !list.is_empty()) {
+        body["tools"] = tools.clone();
+    }
     if let Some(effort) = effort {
         body["reasoning_effort"] = json!(effort);
     }
@@ -135,6 +214,8 @@ fn read_stream(resp: ureq::http::Response<ureq::Body>, on: &mut dyn FnMut(Event)
     let mut content = String::new();
     let mut reasoning = String::new();
     let mut usage = Usage::default();
+    // 按 index 累积工具调用的 id / 名称 / 参数片段。
+    let mut partial: BTreeMap<u64, ToolCall> = BTreeMap::new();
 
     let mut reader = BufReader::new(resp.into_body().into_reader());
     let mut line = String::new();
@@ -178,12 +259,38 @@ fn read_stream(resp: ureq::http::Response<ureq::Body>, on: &mut dyn FnMut(Event)
                 reasoning.push_str(text);
                 on(Event::Reasoning(text.to_string()));
             }
+            if let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) {
+                for call in calls {
+                    let index = call.get("index").and_then(Value::as_u64).unwrap_or(0);
+                    let slot = partial.entry(index).or_insert_with(|| ToolCall {
+                        id: String::new(),
+                        name: String::new(),
+                        arguments: String::new(),
+                    });
+                    if let Some(id) = call.get("id").and_then(Value::as_str) {
+                        slot.id = id.to_string();
+                    }
+                    if let Some(function) = call.get("function") {
+                        if let Some(name) = function.get("name").and_then(Value::as_str) {
+                            slot.name.push_str(name);
+                        }
+                        if let Some(args) = function.get("arguments").and_then(Value::as_str) {
+                            slot.arguments.push_str(args);
+                        }
+                    }
+                }
+            }
         }
 
         if let Some(raw) = chunk.get("usage").filter(|u| !u.is_null()) {
             usage = parse_usage(raw);
         }
     }
+
+    let tool_calls: Vec<ToolCall> = partial
+        .into_values()
+        .filter(|call| !call.name.is_empty())
+        .collect();
 
     Ok(Reply {
         content,
@@ -192,6 +299,7 @@ fn read_stream(resp: ureq::http::Response<ureq::Body>, on: &mut dyn FnMut(Event)
         } else {
             Some(reasoning)
         },
+        tool_calls,
         usage,
     })
 }
@@ -226,6 +334,7 @@ fn parse_usage(raw: &Value) -> Usage {
             .and_then(|d| d.get("reasoning_tokens"))
             .and_then(Value::as_u64)
             .unwrap_or(0),
+        elapsed_ms: 0,
     }
 }
 
@@ -238,4 +347,49 @@ fn truncate(text: &str, max: usize) -> String {
         end -= 1;
     }
     format!("{}…", &text[..end])
+}
+
+/// 把本地图片读成 `data:` URL；读不到就返回 `None`，由调用方降级成文本。
+fn image_data_url(path: &str) -> Option<String> {
+    let bytes = std::fs::read(path).ok()?;
+    if bytes.len() > 20 * 1024 * 1024 {
+        return None;
+    }
+    let mime = match std::path::Path::new(path)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        _ => return None,
+    };
+    Some(format!("data:{mime};base64,{}", base64(&bytes)))
+}
+
+fn base64(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = *chunk.get(1).unwrap_or(&0);
+        let b2 = *chunk.get(2).unwrap_or(&0);
+        out.push(TABLE[(b0 >> 2) as usize] as char);
+        out.push(TABLE[(((b0 & 0b11) << 4) | (b1 >> 4)) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            TABLE[(((b1 & 0b1111) << 2) | (b2 >> 6)) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            TABLE[(b2 & 0b11_1111) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
 }

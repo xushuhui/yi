@@ -1,0 +1,503 @@
+//! 里程碑 ② 的工具行为测试：锚点、只改已读区间、bash 上限与超时、grep 之后能接着改。
+//!
+//! 每条用例都在**同一个 agent 实例**里连续跑多轮——快照表是进程内的，
+//! 换进程重新打开会话后必须重新 read，这是刻意的安全行为。
+
+mod common;
+
+use std::path::{Path, PathBuf};
+
+use common::*;
+use serde_json::{Value, json};
+use yi::agent::Agent;
+
+fn open_agent(port: u16, home: &Path, workspace: &Path) -> Agent {
+    Agent::new(
+        &config(port, home, None),
+        &workspace.to_string_lossy(),
+        &session_path(home),
+    )
+    .expect("打开会话")
+}
+
+fn tool_outputs(home: &Path) -> Vec<String> {
+    session_entries(home)
+        .iter()
+        .filter(|entry| entry["message"]["role"] == "tool")
+        .map(|entry| {
+            entry["message"]["content"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect()
+}
+
+fn last_tool_output(home: &Path) -> String {
+    tool_outputs(home).pop().unwrap_or_default()
+}
+
+/// 从 `[路径#TAG]` 头里取出锚点。
+fn anchor_of(output: &str) -> String {
+    output
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .trim_start_matches('[')
+        .rsplit_once('#')
+        .expect("头部应含 #TAG")
+        .1
+        .trim_end_matches(']')
+        .to_string()
+}
+
+#[test]
+fn read_returns_anchor_and_line_numbers() {
+    let home = temp_home("read-home");
+    let ws = temp_home("read-ws");
+    std::fs::write(ws.join("a.txt"), "one\ntwo\nthree\n").unwrap();
+
+    let server = start_server(vec![
+        tool_response(&[("c1", "read", json!({"path": "a.txt"}))]),
+        plain_response(&["ok"]),
+        // 文件在外部被改掉之后再读一次，锚点必须变化。
+        tool_response(&[("c2", "read", json!({"path": "a.txt"}))]),
+        plain_response(&["ok"]),
+    ]);
+    let mut agent = open_agent(server.port, &home, &ws);
+
+    collect(&mut agent, "读 a.txt");
+    let first = last_tool_output(&home);
+    assert!(first.starts_with("[a.txt#"), "缺少锚点头：{first}");
+    assert!(first.contains("1:one"), "{first}");
+    assert!(first.contains("3:three"), "{first}");
+    let first_tag = anchor_of(&first);
+
+    std::fs::write(ws.join("a.txt"), "changed\n").unwrap();
+    collect(&mut agent, "再读一次");
+    let second_tag = anchor_of(&last_tool_output(&home));
+    assert_ne!(first_tag, second_tag, "文件改动后锚点必须变化");
+}
+
+#[test]
+fn edit_applies_when_the_tag_matches() {
+    let home = temp_home("edit-home");
+    let ws = temp_home("edit-ws");
+    std::fs::write(ws.join("a.txt"), "one\ntwo\nthree\n").unwrap();
+    let tag = file_tag(ws.join("a.txt"));
+    let patch = format!("[a.txt#{tag}]\nPUT 2.=2:\n+TWO\n");
+
+    let server = start_server(vec![
+        tool_response(&[("c1", "read", json!({"path": "a.txt"}))]),
+        plain_response(&["ok"]),
+        tool_response(&[("c2", "edit", json!({ "input": patch }))]),
+        plain_response(&["ok"]),
+    ]);
+    let mut agent = open_agent(server.port, &home, &ws);
+    collect(&mut agent, "读");
+    collect(&mut agent, "改第二行");
+
+    assert_eq!(
+        std::fs::read_to_string(ws.join("a.txt")).unwrap(),
+        "one\nTWO\nthree\n"
+    );
+    assert!(last_tool_output(&home).starts_with("[a.txt#"));
+}
+
+#[test]
+fn edit_rejects_unseen_lines() {
+    let home = temp_home("unseen-home");
+    let ws = temp_home("unseen-ws");
+    std::fs::write(ws.join("a.txt"), "one\ntwo\nthree\n").unwrap();
+
+    // 同一个进程里：先只读第一行，再拿真锚点去改第二行。
+    let server = start_server(vec![
+        tool_response(&[("c1", "read", json!({"path": "a.txt", "limit": 1}))]),
+        plain_response(&["ok"]),
+    ]);
+    let mut agent = open_agent(server.port, &home, &ws);
+    collect(&mut agent, "读第一行");
+    let header = last_tool_output(&home);
+    assert!(header.contains("1:one"));
+    let tag = anchor_of(&header);
+
+    let patch = format!("[a.txt#{tag}]\nPUT 2.=2:\n+TWO\n");
+    let server2 = start_server(vec![
+        tool_response(&[("c2", "edit", json!({ "input": patch }))]),
+        plain_response(&["ok"]),
+    ]);
+    drop(agent);
+    // 注意：换进程后快照丢失，这里会先报「还没被读过」——同样是拒绝，文件不变。
+    let mut agent = open_agent(server2.port, &home, &ws);
+    collect(&mut agent, "改第二行");
+
+    let output = last_tool_output(&home);
+    assert!(output.starts_with("ERROR:"), "必须拒绝：{output}");
+    assert_eq!(
+        std::fs::read_to_string(ws.join("a.txt")).unwrap(),
+        "one\ntwo\nthree\n"
+    );
+}
+
+#[test]
+fn edit_rejects_unseen_line_in_the_same_process() {
+    let home = temp_home("unseen2-home");
+    let ws = temp_home("unseen2-ws");
+    std::fs::write(ws.join("a.txt"), "one\ntwo\nthree\n").unwrap();
+    let tag = file_tag(ws.join("a.txt"));
+    let patch = format!("[a.txt#{tag}]\nPUT 2.=2:\n+TWO\n");
+
+    let server = start_server(vec![
+        tool_response(&[("c1", "read", json!({"path": "a.txt", "limit": 1}))]),
+        plain_response(&["ok"]),
+        tool_response(&[("c2", "edit", json!({ "input": patch }))]),
+        plain_response(&["ok"]),
+    ]);
+    let mut agent = open_agent(server.port, &home, &ws);
+    collect(&mut agent, "读第一行");
+    collect(&mut agent, "改第二行");
+
+    let output = last_tool_output(&home);
+    assert!(output.contains("没有读过"), "必须拒绝：{output}");
+    assert_eq!(
+        std::fs::read_to_string(ws.join("a.txt")).unwrap(),
+        "one\ntwo\nthree\n"
+    );
+}
+
+#[test]
+fn edit_rejects_a_stale_anchor() {
+    let home = temp_home("stale-home");
+    let ws = temp_home("stale-ws");
+    std::fs::write(ws.join("a.txt"), "one\ntwo\n").unwrap();
+    let tag = file_tag(ws.join("a.txt"));
+    let patch = format!("[a.txt#{tag}]\nPUT 2.=2:\n+TWO\n");
+
+    let server = start_server(vec![
+        tool_response(&[("c1", "read", json!({"path": "a.txt"}))]),
+        plain_response(&["ok"]),
+        tool_response(&[("c2", "edit", json!({ "input": patch }))]),
+        plain_response(&["ok"]),
+    ]);
+    let mut agent = open_agent(server.port, &home, &ws);
+    collect(&mut agent, "读");
+    std::fs::write(ws.join("a.txt"), "one\nchanged\n").unwrap();
+    collect(&mut agent, "改");
+
+    assert!(last_tool_output(&home).contains("对不上"));
+    assert_eq!(
+        std::fs::read_to_string(ws.join("a.txt")).unwrap(),
+        "one\nchanged\n"
+    );
+}
+
+#[test]
+fn repeated_identical_patch_is_rejected() {
+    let home = temp_home("repeat-home");
+    let ws = temp_home("repeat-ws");
+    std::fs::write(ws.join("a.txt"), "one\n").unwrap();
+    let tag = file_tag(ws.join("a.txt"));
+    let patch = format!("[a.txt#{tag}]\nPUT 1.=1:\n+X\n");
+
+    let server = start_server(vec![
+        tool_response(&[("c1", "read", json!({"path": "a.txt"}))]),
+        plain_response(&["ok"]),
+        tool_response(&[("c2", "edit", json!({ "input": patch }))]),
+        plain_response(&["ok"]),
+        tool_response(&[("c3", "edit", json!({ "input": patch }))]),
+        plain_response(&["ok"]),
+    ]);
+    let mut agent = open_agent(server.port, &home, &ws);
+    collect(&mut agent, "读");
+    collect(&mut agent, "改一次");
+    collect(&mut agent, "再改一次");
+
+    let outputs = tool_outputs(&home);
+    assert!(
+        outputs[1].starts_with("[a.txt#"),
+        "第一次应成功：{}",
+        outputs[1]
+    );
+    assert!(
+        outputs[2].starts_with("ERROR:"),
+        "第二次应失败（锚点已过期）：{}",
+        outputs[2]
+    );
+    assert_eq!(std::fs::read_to_string(ws.join("a.txt")).unwrap(), "X\n");
+}
+
+#[test]
+fn write_creates_parents_and_returns_an_anchor() {
+    let home = temp_home("write-home");
+    let ws = temp_home("write-ws");
+    let server = start_server(vec![
+        tool_response(&[(
+            "c1",
+            "write",
+            json!({"path": "deep/new.txt", "content": "hi\n"}),
+        )]),
+        plain_response(&["ok"]),
+    ]);
+    let mut agent = open_agent(server.port, &home, &ws);
+    collect(&mut agent, "写个文件");
+
+    assert_eq!(
+        std::fs::read_to_string(ws.join("deep/new.txt")).unwrap(),
+        "hi\n"
+    );
+    assert!(last_tool_output(&home).starts_with("[deep/new.txt#"));
+}
+
+#[test]
+fn bash_truncates_to_the_tail_and_keeps_a_full_log() {
+    let home = temp_home("bash-home");
+    let ws = temp_home("bash-ws");
+    let server = start_server(vec![
+        tool_response(&[(
+            "c1",
+            "bash",
+            json!({"command": "yes xxxxxxxxxxxxxxxxxxxx | head -n 6000"}),
+        )]),
+        plain_response(&["ok"]),
+    ]);
+    let mut agent = open_agent(server.port, &home, &ws);
+    collect(&mut agent, "跑个长输出");
+
+    let output = last_tool_output(&home);
+    assert!(output.contains("只显示尾部 50 KB"), "{output}");
+    assert!(output.contains("完整输出："), "{output}");
+
+    let log_dir = session_path(&home).parent().unwrap().join("logs");
+    let log = std::fs::read_to_string(log_dir.join("1.log")).expect("完整日志应落盘");
+    assert!(
+        log.len() > 50 * 1024,
+        "日志应保存全部输出，实际 {} 字节",
+        log.len()
+    );
+}
+
+#[test]
+fn bash_timeout_is_reported() {
+    let home = temp_home("timeout-home");
+    let ws = temp_home("timeout-ws");
+    let server = start_server(vec![
+        tool_response(&[("c1", "bash", json!({"command": "sleep 5", "timeout": 1}))]),
+        plain_response(&["ok"]),
+    ]);
+    let mut agent = open_agent(server.port, &home, &ws);
+
+    let started = std::time::Instant::now();
+    collect(&mut agent, "跑个会卡住的命令");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(4),
+        "应当在 1 秒左右被终止"
+    );
+    assert!(last_tool_output(&home).contains("超过 1 秒"));
+}
+
+#[test]
+fn grep_results_can_be_edited_right_away() {
+    let home = temp_home("grep-home");
+    let ws = temp_home("grep-ws");
+    std::fs::write(ws.join("a.go"), "alpha\nbeta\ngamma\n").unwrap();
+    let tag = file_tag(ws.join("a.go"));
+    let patch = format!("[a.go#{tag}]\nPUT 2.=2:\n+BETA\n");
+
+    let server = start_server(vec![
+        tool_response(&[("c1", "grep", json!({"pattern": "^beta$"}))]),
+        plain_response(&["ok"]),
+        tool_response(&[("c2", "edit", json!({ "input": patch }))]),
+        plain_response(&["ok"]),
+    ]);
+    let mut agent = open_agent(server.port, &home, &ws);
+    collect(&mut agent, "搜一下 beta");
+    let output = last_tool_output(&home);
+    assert!(output.contains("a.go:2:beta"), "{output}");
+
+    collect(&mut agent, "改成大写");
+    assert_eq!(
+        std::fs::read_to_string(ws.join("a.go")).unwrap(),
+        "alpha\nBETA\ngamma\n"
+    );
+}
+
+#[test]
+fn glob_finds_files_by_pattern() {
+    let home = temp_home("glob-home");
+    let ws = temp_home("glob-ws");
+    std::fs::create_dir_all(ws.join("src")).unwrap();
+    std::fs::write(ws.join("src/a.go"), "package a\n").unwrap();
+    std::fs::write(ws.join("src/b.rs"), "fn main() {}\n").unwrap();
+
+    let server = start_server(vec![
+        tool_response(&[("c1", "glob", json!({"pattern": "**/*.go"}))]),
+        plain_response(&["ok"]),
+    ]);
+    let mut agent = open_agent(server.port, &home, &ws);
+    collect(&mut agent, "找 go 文件");
+
+    let output = last_tool_output(&home);
+    assert!(output.contains("src/a.go"), "{output}");
+    assert!(!output.contains("src/b.rs"), "{output}");
+}
+
+#[test]
+fn unknown_tool_name_is_reported_as_text() {
+    let home = temp_home("unknown-home");
+    let ws = temp_home("unknown-ws");
+    let server = start_server(vec![
+        tool_response(&[("c1", "nope", json!({}))]),
+        plain_response(&["好"]),
+    ]);
+    let mut agent = open_agent(server.port, &home, &ws);
+    let (text, _, _) = collect(&mut agent, "随便");
+
+    assert_eq!(text, "好");
+    assert!(last_tool_output(&home).contains("未知工具"));
+}
+
+#[test]
+fn tool_error_is_fed_back_instead_of_ending_the_turn() {
+    let home = temp_home("tool-error-home");
+    let ws = temp_home("tool-error-ws");
+    let server = start_server(vec![
+        tool_response(&[("c1", "read", json!({"path": "missing.txt"}))]),
+        plain_response(&["我换一种方式"]),
+    ]);
+    let mut agent = open_agent(server.port, &home, &ws);
+    let (text, _, _) = collect(&mut agent, "读一个不存在的文件");
+
+    assert_eq!(text, "我换一种方式");
+    let bodies = server.bodies.lock();
+    let tool: &Value = bodies[1]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["role"] == "tool")
+        .expect("错误也要作为工具结果回给模型");
+    assert!(tool["content"].as_str().unwrap().starts_with("ERROR:"));
+}
+
+/// 测试里自己算一次锚点，独立于实现。
+fn file_tag(path: PathBuf) -> String {
+    let text = std::fs::read_to_string(path).unwrap();
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in text.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{:04X}", (hash & 0xffff) as u16)
+}
+
+#[test]
+fn read_image_is_attached_to_the_conversation() {
+    let home = temp_home("image-home");
+    let ws = temp_home("image-ws");
+    std::fs::write(ws.join("pic.png"), b"not-really-a-png").unwrap();
+
+    let server = start_server(vec![
+        tool_response(&[("c1", "read", json!({"path": "pic.png"}))]),
+        plain_response(&["看到了"]),
+    ]);
+    let mut agent = open_agent(server.port, &home, &ws);
+    let (text, _, _) = collect(&mut agent, "看看这张图");
+    assert_eq!(text, "看到了");
+
+    let output = last_tool_output(&home);
+    assert!(output.contains("已附"), "{output}");
+
+    let bodies = server.bodies.lock();
+    let attached = bodies[1]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| {
+            m["content"]
+                .as_array()
+                .is_some_and(|parts| parts.iter().any(|p| p["type"] == "image_url"))
+        })
+        .expect("第二轮请求里应带图片内容块");
+    let url = attached["content"][1]["image_url"]["url"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        url.starts_with("data:image/png;base64,"),
+        "图片应以 data URL 发送：{url}"
+    );
+}
+
+#[test]
+fn patch_with_bare_body_rows_is_repaired() {
+    let home = temp_home("bare-home");
+    let ws = temp_home("bare-ws");
+    std::fs::write(ws.join("a.txt"), "one\ntwo\nthree\n").unwrap();
+    let tag = file_tag(ws.join("a.txt"));
+    // 模型漏了 `+`，按容错规则应当自动补上并提示。
+    let patch = format!("[a.txt#{tag}]\nPUT 2.=2:\nTWO\n");
+
+    let server = start_server(vec![
+        tool_response(&[("c1", "read", json!({"path": "a.txt"}))]),
+        plain_response(&["ok"]),
+        tool_response(&[("c2", "edit", json!({ "input": patch }))]),
+        plain_response(&["ok"]),
+    ]);
+    let mut agent = open_agent(server.port, &home, &ws);
+    collect(&mut agent, "读");
+    collect(&mut agent, "改");
+
+    let output = last_tool_output(&home);
+    assert!(output.contains("没有以 + 开头"), "{output}");
+    assert!(output.starts_with("（提醒"), "{output}");
+    assert!(output.contains("[a.txt#"), "容错后仍应返回新锚点：{output}");
+    assert_eq!(
+        std::fs::read_to_string(ws.join("a.txt")).unwrap(),
+        "one\nTWO\nthree\n"
+    );
+}
+
+#[test]
+fn patch_envelope_is_ignored() {
+    let home = temp_home("envelope-home");
+    let ws = temp_home("envelope-ws");
+    std::fs::write(ws.join("a.txt"), "one\ntwo\n").unwrap();
+    let tag = file_tag(ws.join("a.txt"));
+    let patch = format!("*** Begin Patch\n[a.txt#{tag}]\nPUT 2.=2:\n+TWO\n*** End Patch\n");
+
+    let server = start_server(vec![
+        tool_response(&[("c1", "read", json!({"path": "a.txt"}))]),
+        plain_response(&["ok"]),
+        tool_response(&[("c2", "edit", json!({ "input": patch }))]),
+        plain_response(&["ok"]),
+    ]);
+    let mut agent = open_agent(server.port, &home, &ws);
+    collect(&mut agent, "读");
+    collect(&mut agent, "改");
+
+    assert!(
+        last_tool_output(&home).contains("[a.txt#"),
+        "带信封的补丁应当成功：{}",
+        last_tool_output(&home)
+    );
+    assert_eq!(
+        std::fs::read_to_string(ws.join("a.txt")).unwrap(),
+        "one\nTWO\n"
+    );
+}
+
+#[test]
+fn a_patch_without_a_section_header_is_rejected() {
+    let home = temp_home("bogus-home");
+    let ws = temp_home("bogus-ws");
+    std::fs::write(ws.join("a.txt"), "one\n").unwrap();
+
+    let server = start_server(vec![
+        tool_response(&[("c1", "edit", json!({"input": "BOGUS 1"}))]),
+        plain_response(&["ok"]),
+    ]);
+    let mut agent = open_agent(server.port, &home, &ws);
+    collect(&mut agent, "乱写一个补丁");
+
+    let output = last_tool_output(&home);
+    assert!(output.starts_with("ERROR:"), "{output}");
+    assert_eq!(std::fs::read_to_string(ws.join("a.txt")).unwrap(), "one\n");
+}
