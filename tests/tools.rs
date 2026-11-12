@@ -380,7 +380,10 @@ fn tool_error_is_fed_back_instead_of_ending_the_turn() {
 
 /// 测试里自己算一次锚点，独立于实现。
 fn file_tag(path: PathBuf) -> String {
-    let text = std::fs::read_to_string(path).unwrap();
+    tag_of_str(&std::fs::read_to_string(path).unwrap())
+}
+
+fn tag_of_str(text: &str) -> String {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for byte in text.as_bytes() {
         hash ^= u64::from(*byte);
@@ -500,4 +503,237 @@ fn a_patch_without_a_section_header_is_rejected() {
     let output = last_tool_output(&home);
     assert!(output.starts_with("ERROR:"), "{output}");
     assert_eq!(std::fs::read_to_string(ws.join("a.txt")).unwrap(), "one\n");
+}
+
+#[test]
+fn reading_a_second_range_keeps_earlier_lines_editable() {
+    let home = temp_home("merge-home");
+    let ws = temp_home("merge-ws");
+    std::fs::write(ws.join("a.txt"), "one\ntwo\nthree\nfour\n").unwrap();
+    let tag = file_tag(ws.join("a.txt"));
+    let patch = format!("[a.txt#{tag}]\nPUT 1.=1:\n+ONE\n");
+
+    let server = start_server(vec![
+        tool_response(&[("c1", "read", json!({"path": "a.txt", "limit": 2}))]),
+        plain_response(&["ok"]),
+        tool_response(&[(
+            "c2",
+            "read",
+            json!({"path": "a.txt", "offset": 3, "limit": 2}),
+        )]),
+        plain_response(&["ok"]),
+        tool_response(&[("c3", "edit", json!({ "input": patch }))]),
+        plain_response(&["ok"]),
+    ]);
+    let mut agent = open_agent(server.port, &home, &ws);
+    collect(&mut agent, "读前两行");
+    collect(&mut agent, "读后两行");
+    collect(&mut agent, "改第一行");
+
+    assert!(
+        last_tool_output(&home).starts_with("[a.txt#"),
+        "第二次 read 不应抹掉第一次的已读行：{}",
+        last_tool_output(&home)
+    );
+    assert_eq!(
+        std::fs::read_to_string(ws.join("a.txt")).unwrap(),
+        "ONE\ntwo\nthree\nfour\n"
+    );
+}
+
+#[test]
+fn multi_file_patch_is_all_or_nothing() {
+    let home = temp_home("atomic-home");
+    let ws = temp_home("atomic-ws");
+    std::fs::write(ws.join("a.txt"), "one\n").unwrap();
+    std::fs::write(ws.join("b.txt"), "two\n").unwrap();
+    let tag_a = file_tag(ws.join("a.txt"));
+
+    let patch = format!("[a.txt#{tag_a}]\nPUT 1.=1:\n+ONE\n[b.txt#ZZZZ]\nPUT 1.=1:\n+TWO\n");
+    let server = start_server(vec![
+        tool_response(&[
+            ("c1", "read", json!({"path": "a.txt"})),
+            ("c2", "read", json!({"path": "b.txt"})),
+        ]),
+        plain_response(&["ok"]),
+        tool_response(&[("c3", "edit", json!({ "input": patch }))]),
+        plain_response(&["ok"]),
+    ]);
+    let mut agent = open_agent(server.port, &home, &ws);
+    collect(&mut agent, "读两个文件");
+    collect(&mut agent, "一起改");
+
+    assert!(
+        last_tool_output(&home).starts_with("ERROR:"),
+        "第二段锚点错误应让整份补丁失败：{}",
+        last_tool_output(&home)
+    );
+    assert_eq!(
+        std::fs::read_to_string(ws.join("a.txt")).unwrap(),
+        "one\n",
+        "校验失败时第一个文件也不能写"
+    );
+}
+
+#[test]
+fn bash_does_not_clobber_user_redirection() {
+    let home = temp_home("redir-home");
+    let ws = temp_home("redir-ws");
+    let server = start_server(vec![
+        tool_response(&[(
+            "c1",
+            "bash",
+            json!({"command": "echo out; echo err 1>&2; echo side > side.txt"}),
+        )]),
+        plain_response(&["ok"]),
+    ]);
+    let mut agent = open_agent(server.port, &home, &ws);
+    collect(&mut agent, "跑命令");
+
+    let output = last_tool_output(&home);
+    assert!(output.contains("out"), "{output}");
+    assert!(output.contains("err"), "stderr 也要合并进来：{output}");
+    assert_eq!(
+        std::fs::read_to_string(ws.join("side.txt")).unwrap().trim(),
+        "side",
+        "用户自己的重定向不能被覆盖"
+    );
+}
+
+#[test]
+fn grep_accepts_a_file_path() {
+    let home = temp_home("grep-file-home");
+    let ws = temp_home("grep-file-ws");
+    std::fs::write(ws.join("a.go"), "alpha\nbeta\n").unwrap();
+    let server = start_server(vec![
+        tool_response(&[("c1", "grep", json!({"pattern": "beta", "path": "a.go"}))]),
+        plain_response(&["ok"]),
+    ]);
+    let mut agent = open_agent(server.port, &home, &ws);
+    collect(&mut agent, "搜单个文件");
+
+    assert!(
+        last_tool_output(&home).contains("a.go:2:beta"),
+        "path 指向文件时也应命中：{}",
+        last_tool_output(&home)
+    );
+}
+
+#[test]
+fn glob_matches_relative_to_the_given_path() {
+    let home = temp_home("glob-base-home");
+    let ws = temp_home("glob-base-ws");
+    std::fs::create_dir_all(ws.join("src")).unwrap();
+    std::fs::write(ws.join("src/a.go"), "package a\n").unwrap();
+    std::fs::write(ws.join("root.go"), "package root\n").unwrap();
+
+    let server = start_server(vec![
+        tool_response(&[("c1", "glob", json!({"pattern": "*.go", "path": "src"}))]),
+        plain_response(&["ok"]),
+    ]);
+    let mut agent = open_agent(server.port, &home, &ws);
+    collect(&mut agent, "在 src 下找 go 文件");
+
+    let output = last_tool_output(&home);
+    assert!(output.contains("src/a.go"), "{output}");
+    assert!(
+        !output.contains("root.go"),
+        "不应越过给定的搜索根：{output}"
+    );
+}
+
+#[test]
+fn bash_timeout_returns_even_with_grandchildren() {
+    let home = temp_home("grandchild-home");
+    let ws = temp_home("grandchild-ws");
+    let server = start_server(vec![
+        tool_response(&[(
+            "c1",
+            "bash",
+            json!({"command": "(sleep 30) & sleep 30", "timeout": 1}),
+        )]),
+        plain_response(&["ok"]),
+    ]);
+    let mut agent = open_agent(server.port, &home, &ws);
+
+    let started = std::time::Instant::now();
+    collect(&mut agent, "跑会派生子进程的命令");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(4),
+        "孙进程不能把超时拖成无限等待"
+    );
+    assert!(last_tool_output(&home).contains("超过 1 秒"));
+}
+
+#[test]
+fn read_hints_the_next_offset_when_truncated() {
+    let home = temp_home("hint-home");
+    let ws = temp_home("hint-ws");
+    std::fs::write(ws.join("a.txt"), "1\n2\n3\n4\n5\n").unwrap();
+    let server = start_server(vec![
+        tool_response(&[("c1", "read", json!({"path": "a.txt", "limit": 2}))]),
+        plain_response(&["ok"]),
+    ]);
+    let mut agent = open_agent(server.port, &home, &ws);
+    collect(&mut agent, "只读两行");
+
+    let output = last_tool_output(&home);
+    assert!(output.contains("共 5 行"), "{output}");
+    assert!(
+        output.contains("offset=3"),
+        "应告诉模型怎么继续读：{output}"
+    );
+}
+
+#[test]
+fn edit_keeps_earlier_read_lines_editable_after_shift() {
+    let home = temp_home("shift-home");
+    let ws = temp_home("shift-ws");
+    std::fs::write(ws.join("a.txt"), "l1\nl2\nl3\nl4\nl5\nl6\n").unwrap();
+    let tag0 = tag_of_str("l1\nl2\nl3\nl4\nl5\nl6\n");
+    let tag1 = tag_of_str("l1\na\nb\nl3\nl4\nl5\nl6\n");
+
+    let shift_patch = format!("[a.txt#{tag0}]\nPUT 2.=2:\n+a\n+b\n");
+    let unread_patch = format!("[a.txt#{tag1}]\nPUT 6.=6:\n+L5\n");
+    let read_patch = format!("[a.txt#{tag1}]\nPUT 4.=4:\n+L3\n");
+
+    let server = start_server(vec![
+        tool_response(&[("c1", "read", json!({"path": "a.txt", "limit": 3}))]),
+        plain_response(&["ok"]),
+        tool_response(&[("c2", "edit", json!({ "input": shift_patch }))]),
+        plain_response(&["ok"]),
+        // 第 6 行从没读过：必须拒绝。
+        tool_response(&[("c3", "edit", json!({ "input": unread_patch }))]),
+        plain_response(&["ok"]),
+        // 原来的第 3 行被挤到第 4 行；它读过，改它应当允许。
+        tool_response(&[("c4", "edit", json!({ "input": read_patch }))]),
+        plain_response(&["ok"]),
+    ]);
+    let mut agent = open_agent(server.port, &home, &ws);
+    collect(&mut agent, "读前三行");
+    collect(&mut agent, "插入两行");
+    collect(&mut agent, "改没读过的第六行");
+    collect(&mut agent, "改读过、被挤到第四行的那一行");
+
+    let outputs = tool_outputs(&home);
+    assert!(
+        outputs[1].starts_with("[a.txt#"),
+        "插入应成功：{}",
+        outputs[1]
+    );
+    assert!(
+        outputs[2].starts_with("ERROR:"),
+        "没读过的行必须拒绝：{}",
+        outputs[2]
+    );
+    assert!(outputs[2].contains("没有读过"), "{}", outputs[2]);
+    assert!(
+        outputs[3].starts_with("[a.txt#"),
+        "读过的行应仍然可改：{}",
+        outputs[3]
+    );
+    assert_eq!(
+        std::fs::read_to_string(ws.join("a.txt")).unwrap(),
+        "l1\na\nb\nL3\nl4\nl5\nl6\n"
+    );
 }

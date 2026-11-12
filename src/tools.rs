@@ -240,30 +240,37 @@ impl Tools {
             .clamp(1, MAX_READ_LINES);
 
         let tag = tag_of(&text);
+        let total = lines.len();
         let mut body = String::new();
         let mut seen = BTreeSet::new();
         let mut shown = 0usize;
+        let mut cut_by_bytes = false;
         for (index, line) in lines.iter().enumerate().skip(offset).take(limit) {
             let row = format!("{}:{line}\n", index + 1);
             if body.len() + row.len() > MAX_READ_BYTES {
-                body.push_str("… 输出已截断，用 offset/limit 继续读\n");
+                cut_by_bytes = true;
                 break;
             }
             body.push_str(&row);
             seen.insert(index + 1);
             shown += 1;
         }
+        if offset + shown < total {
+            let reason = if cut_by_bytes {
+                "输出过大"
+            } else {
+                "这一段先到这里"
+            };
+            body.push_str(&format!(
+                "… {reason}，共 {total} 行；用 offset={} 继续读\n",
+                offset + shown + 1
+            ));
+        }
         if shown == 0 && !lines.is_empty() {
             body.push_str("（该范围没有内容）\n");
         }
 
-        self.snapshots.insert(
-            full.clone(),
-            Snapshot {
-                tag: tag.clone(),
-                seen,
-            },
-        );
+        self.record_snapshot(full.clone(), tag.clone(), seen);
         Outcome::Text(format!("[{path}#{tag}]\n{body}"))
     }
 
@@ -318,67 +325,109 @@ impl Tools {
             return "ERROR: 补丁里没有任何改动".to_string();
         }
 
+        // 同一个文件的多个段落先合并，保证它们共用同一个锚点、一次校验。
+        let mut groups: Vec<(PathBuf, String, String, Vec<Op>)> = Vec::new();
+        for section in sections {
+            let full = self.resolve(&section.path);
+            match groups.iter_mut().find(|group| group.0 == full) {
+                Some(group) => {
+                    if group.2 != section.tag {
+                        return format!(
+                            "ERROR: {} 在同一份补丁里用了两个不同的锚点（{} 和 {}）",
+                            section.path, group.2, section.tag
+                        );
+                    }
+                    group.3.extend(section.ops);
+                }
+                None => groups.push((full, section.path.clone(), section.tag.clone(), section.ops)),
+            }
+        }
+
+        // 第一阶段：全部校验、算出结果。任何一处失败都不写盘。
+        let mut prepared = Vec::with_capacity(groups.len());
+        for (full, shown, tag, ops) in groups {
+            match self.prepare_file(&full, &shown, &tag, ops) {
+                Ok(item) => prepared.push(item),
+                Err(err) => return format!("ERROR: {err}"),
+            }
+        }
+
+        // 第二阶段：统一落盘，然后更新快照。
         let mut report = String::new();
         if bare_rows > 0 {
             report.push_str(&format!(
                 "（提醒：有 {bare_rows} 行正文没有以 + 开头，已自动补上；正文请统一写成 +内容）\n"
             ));
         }
-        for section in sections {
-            match self.apply_section(&section) {
-                Ok(line) => report.push_str(&line),
-                Err(err) => return format!("ERROR: {err}"),
+        let mut written: Vec<String> = Vec::new();
+        for item in prepared {
+            if let Err(err) = fs::write(&item.path, &item.content) {
+                let done = if written.is_empty() {
+                    "无".to_string()
+                } else {
+                    written.join("、")
+                };
+                return format!("ERROR: 写入 {} 失败：{err}；已写入：{done}", item.shown);
             }
+            let count = item.content.lines().count();
+            self.record_snapshot(item.path, item.tag.clone(), item.seen);
+            report.push_str(&format!(
+                "[{}#{}] 改完共 {count} 行\n",
+                item.shown, item.tag
+            ));
+            written.push(item.shown);
         }
         report
     }
 
-    fn apply_section(&mut self, section: &Section) -> std::result::Result<String, String> {
-        let full = self.resolve(&section.path);
-        let content =
-            fs::read_to_string(&full).map_err(|err| format!("读不了 {}：{err}", section.path))?;
+    /// 校验一个文件的全部操作并算出新内容；不写盘。
+    fn prepare_file(
+        &self,
+        full: &Path,
+        shown: &str,
+        tag: &str,
+        ops: Vec<Op>,
+    ) -> std::result::Result<Prepared, String> {
+        let content = fs::read_to_string(full).map_err(|err| format!("读不了 {shown}：{err}"))?;
         let current_tag = tag_of(&content);
-        if current_tag != section.tag {
+        if current_tag != tag {
             return Err(format!(
-                "{} 的内容和锚点对不上（补丁写的是 {}，文件现在是 {}）。重新 read 之后再改。",
-                section.path, section.tag, current_tag
+                "{shown} 的内容和锚点对不上（补丁写的是 {tag}，文件现在是 {current_tag}）。重新 read 之后再改。"
             ));
         }
         let snapshot = self
             .snapshots
-            .get(&full)
-            .ok_or_else(|| format!("{} 还没被读过，先 read 再改", section.path))?;
-        if snapshot.tag != section.tag {
-            return Err(format!("{} 的快照已过期，重新 read 之后再改", section.path));
+            .get(full)
+            .ok_or_else(|| format!("{shown} 还没被读过，先 read 再改"))?;
+        if snapshot.tag != tag {
+            return Err(format!("{shown} 的快照已过期，重新 read 之后再改"));
         }
 
-        let mut lines: Vec<String> = content.lines().map(str::to_string).collect();
+        let lines: Vec<String> = content.lines().map(str::to_string).collect();
         let line_count = lines.len();
 
-        // 校验：区间合法、行都在已读区间内、互不重叠。
         let mut taken: Vec<(usize, usize)> = Vec::new();
-        for op in &section.ops {
+        for op in &ops {
             match op.kind {
                 OpKind::Replace | OpKind::Cut => {
                     if op.start == 0 || op.end < op.start || op.end > line_count {
                         return Err(format!(
-                            "{}:{}-{} 超出文件范围（共 {} 行）",
-                            section.path, op.start, op.end, line_count
+                            "{shown}:{}-{} 超出文件范围（共 {} 行）",
+                            op.start, op.end, line_count
                         ));
                     }
                     for line in op.start..=op.end {
                         if !snapshot.seen.contains(&line) {
                             return Err(format!(
-                                "{} 第 {} 行没有读过，不能改。先 read 这一段。",
-                                section.path, line
+                                "{shown} 第 {line} 行没有读过，不能改。先 read 这一段。"
                             ));
                         }
                     }
                     for (start, end) in &taken {
                         if op.start <= *end && op.end >= *start {
                             return Err(format!(
-                                "{} 的 {}:{}-{} 与另一段改动重叠",
-                                section.path, op.start, op.start, op.end
+                                "{shown} 的 {}:{}-{} 与另一段改动重叠",
+                                op.start, op.start, op.end
                             ));
                         }
                     }
@@ -387,61 +436,116 @@ impl Tools {
                 OpKind::InsertBefore | OpKind::InsertAfter => {
                     if op.start == 0 || op.start > line_count {
                         return Err(format!(
-                            "{}:{} 超出文件范围（共 {} 行）",
-                            section.path, op.start, line_count
+                            "{shown}:{} 超出文件范围（共 {} 行）",
+                            op.start, line_count
                         ));
                     }
                     if !snapshot.seen.contains(&op.start) {
                         return Err(format!(
-                            "{} 第 {} 行没有读过，不能在这里插入。先 read 这一段。",
-                            section.path, op.start
+                            "{shown} 第 {} 行没有读过，不能在这里插入。先 read 这一段。",
+                            op.start
                         ));
                     }
                 }
             }
         }
 
-        // 从后往前改，前面的行号才不会失效。
-        let mut ordered = section.ops.clone();
-        ordered.sort_by(|a, b| b.start.cmp(&a.start).then(b.end.cmp(&a.end)));
-        for op in ordered {
+        let mut ordered = ops;
+        ordered.sort_by_key(|op| (op.start, op.end));
+
+        // 升序单遍：一边产出新内容，一边把旧的已读行映射到新行号。
+        let total = lines.len();
+        let mut out: Vec<String> = Vec::with_capacity(total + 8);
+        let mut seen_out: BTreeSet<usize> = BTreeSet::new();
+        let mut cursor = 0usize;
+        for op in &ordered {
             match op.kind {
-                OpKind::Replace => {
-                    lines.splice(op.start - 1..op.end, op.body);
-                }
-                OpKind::Cut => {
-                    lines.drain(op.start - 1..op.end);
+                OpKind::Replace | OpKind::Cut => {
+                    copy_seen(
+                        &lines,
+                        &snapshot.seen,
+                        cursor,
+                        op.start - 1,
+                        &mut out,
+                        &mut seen_out,
+                    );
+                    if op.kind == OpKind::Replace {
+                        for line in &op.body {
+                            out.push(line.clone());
+                            seen_out.insert(out.len());
+                        }
+                    }
+                    cursor = op.end;
                 }
                 OpKind::InsertBefore => {
-                    for (offset, line) in op.body.into_iter().enumerate() {
-                        lines.insert(op.start - 1 + offset, line);
+                    copy_seen(
+                        &lines,
+                        &snapshot.seen,
+                        cursor,
+                        op.start - 1,
+                        &mut out,
+                        &mut seen_out,
+                    );
+                    cursor = op.start - 1;
+                    for line in &op.body {
+                        out.push(line.clone());
+                        seen_out.insert(out.len());
                     }
                 }
                 OpKind::InsertAfter => {
-                    for (offset, line) in op.body.into_iter().enumerate() {
-                        lines.insert(op.start + offset, line);
+                    copy_seen(
+                        &lines,
+                        &snapshot.seen,
+                        cursor,
+                        op.start,
+                        &mut out,
+                        &mut seen_out,
+                    );
+                    cursor = op.start;
+                    for line in &op.body {
+                        out.push(line.clone());
+                        seen_out.insert(out.len());
                     }
                 }
             }
         }
+        copy_seen(
+            &lines,
+            &snapshot.seen,
+            cursor,
+            total,
+            &mut out,
+            &mut seen_out,
+        );
 
+        let lines = out;
         let mut next = lines.join("\n");
         next.push('\n');
         if next == content {
-            return Err(format!("{} 的改动没有产生任何变化", section.path));
+            return Err(format!("{shown} 的改动没有产生任何变化"));
         }
-        fs::write(&full, &next).map_err(|err| format!("写入 {} 失败：{err}", section.path))?;
+        Ok(Prepared {
+            path: full.to_path_buf(),
+            shown: shown.to_string(),
+            tag: tag_of(&next),
+            content: next,
+            seen: seen_out,
+        })
+    }
 
-        let tag = tag_of(&next);
-        let count = next.lines().count();
-        self.snapshots.insert(
-            full,
-            Snapshot {
-                tag: tag.clone(),
-                seen: (1..=count).collect(),
-            },
-        );
-        Ok(format!("[{}#{tag}] 改完共 {count} 行\n", section.path))
+    /// 记录快照：同一份内容（锚点相同）时把新看到的行并进去，不同才替换。
+    fn record_snapshot(&mut self, path: PathBuf, tag: String, seen: BTreeSet<usize>) {
+        let merged = self
+            .snapshots
+            .get(&path)
+            .filter(|existing| existing.tag == tag)
+            .map(|existing| {
+                let mut merged = existing.seen.clone();
+                merged.extend(seen.iter().copied());
+                merged
+            });
+        let seen = merged.unwrap_or(seen);
+        self.snapshots.insert(path, Snapshot { tag, seen });
     }
 
     fn bash(&mut self, args: &Value) -> String {
@@ -456,11 +560,11 @@ impl Tools {
 
         let mut child = match Command::new("/bin/sh")
             .arg("-c")
-            .arg(format!("{command} 2>&1"))
+            .arg(command)
             .current_dir(&self.root)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .process_group(0)
             .spawn()
         {
@@ -468,16 +572,16 @@ impl Tools {
             Err(err) => return format!("ERROR: 起不了进程：{err}"),
         };
         let pid = child.id();
-        let mut stdout = match child.stdout.take() {
+        let stdout = match child.stdout.take() {
             Some(stdout) => stdout,
             None => return "ERROR: 拿不到命令输出".to_string(),
         };
-        let collector = std::thread::spawn(move || {
-            let mut buffer = Vec::new();
-            // 读失败（管道被关掉）时返回已读到的部分，不中断这一轮。
-            let _ = stdout.read_to_end(&mut buffer);
-            buffer
-        });
+        let collector = std::thread::spawn(move || read_all(stdout));
+        let stderr = match child.stderr.take() {
+            Some(stderr) => stderr,
+            None => return "ERROR: 拿不到命令错误输出".to_string(),
+        };
+        let err_collector = std::thread::spawn(move || read_all(stderr));
 
         let deadline = Instant::now() + Duration::from_secs(timeout);
         let mut timed_out = false;
@@ -494,6 +598,12 @@ impl Tools {
                     .arg("-TERM")
                     .arg(format!("-{pid}"))
                     .status();
+                std::thread::sleep(Duration::from_millis(300));
+                // 孙进程可能忽略 TERM；补一次 KILL，管道才会关闭，收集线程才不会一直等。
+                let _ = Command::new("kill")
+                    .arg("-KILL")
+                    .arg(format!("-{pid}"))
+                    .status();
                 let _ = child.kill();
                 let _ = child.wait();
                 break;
@@ -502,7 +612,12 @@ impl Tools {
         }
         drop(child);
 
-        let bytes = collector.join().unwrap_or_default();
+        let mut bytes = collector.join().unwrap_or_default();
+        let err_bytes = err_collector.join().unwrap_or_default();
+        if !err_bytes.is_empty() {
+            bytes.push(b'\n');
+            bytes.extend_from_slice(&err_bytes);
+        }
         let text = String::from_utf8_lossy(&bytes).to_string();
         let log_path = self.write_log(&text);
 
@@ -558,7 +673,11 @@ impl Tools {
         let file_filter = args.get("glob").and_then(Value::as_str);
 
         let mut files = Vec::new();
-        collect_files(&base, &mut files);
+        if base.is_file() {
+            files.push(base.clone());
+        } else {
+            collect_files(&base, &mut files);
+        }
         files.sort();
 
         let mut out = String::new();
@@ -594,7 +713,7 @@ impl Tools {
                 }
             }
             if !seen.is_empty() {
-                self.snapshots.insert(file, Snapshot { tag, seen });
+                self.record_snapshot(file, tag, seen);
             }
             if total >= GREP_TOTAL {
                 out.push_str("… 结果过多，只显示前 200 条\n");
@@ -622,11 +741,21 @@ impl Tools {
         let mut files = Vec::new();
         collect_files(&base, &mut files);
 
+        let base_is_file = base.is_file();
         let mut matched: Vec<(u128, String)> = files
             .into_iter()
             .filter_map(|file| {
                 let relative = self.relative(&file);
-                if !glob_match(pattern, &relative) {
+                let target = if base_is_file {
+                    file.file_name()
+                        .map(|name| name.to_string_lossy().to_string())
+                        .unwrap_or_else(|| relative.clone())
+                } else {
+                    file.strip_prefix(&base)
+                        .map(|rest| rest.display().to_string())
+                        .unwrap_or_else(|_| relative.clone())
+                };
+                if !glob_match(pattern, &target) {
                     return None;
                 }
                 let modified = fs::metadata(&file)
@@ -672,14 +801,17 @@ impl Tools {
 
     fn mark_all_seen(&mut self, full: &Path, tag: &str, content: &str) {
         let count = content.lines().count();
-        self.snapshots.insert(
-            full.to_path_buf(),
-            Snapshot {
-                tag: tag.to_string(),
-                seen: (1..=count).collect(),
-            },
-        );
+        self.record_snapshot(full.to_path_buf(), tag.to_string(), (1..=count).collect());
     }
+}
+
+/// 已校验、待写盘的一个文件。
+struct Prepared {
+    path: PathBuf,
+    shown: String,
+    tag: String,
+    content: String,
+    seen: BTreeSet<usize>,
 }
 
 struct Section {
@@ -946,4 +1078,28 @@ fn image_mime(path: &Path) -> Option<&'static str> {
         "webp" => Some("image/webp"),
         _ => None,
     }
+}
+
+/// 原样拷贝 [from, to) 区间的旧行，并保留它们原来的"已读"状态。
+fn copy_seen(
+    lines: &[String],
+    seen: &BTreeSet<usize>,
+    from: usize,
+    to: usize,
+    out: &mut Vec<String>,
+    seen_out: &mut BTreeSet<usize>,
+) {
+    for (index, line) in lines.iter().enumerate().take(to).skip(from) {
+        out.push(line.clone());
+        if seen.contains(&(index + 1)) {
+            seen_out.insert(out.len());
+        }
+    }
+}
+
+fn read_all(mut source: impl Read) -> Vec<u8> {
+    let mut buffer = Vec::new();
+    // 读失败（管道被关掉）时返回已读到的部分，不中断这一轮。
+    let _ = source.read_to_end(&mut buffer);
+    buffer
 }
