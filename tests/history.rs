@@ -51,6 +51,28 @@ fn prompt_history_keeps_only_the_newest_entries() {
 }
 
 #[test]
+fn an_old_session_without_prompt_entries_falls_back_to_user_messages() {
+    let home = temp_home("hist-legacy");
+    std::fs::create_dir_all(session_path(&home).parent().expect("目录")).expect("建目录");
+    let rows = [
+        serde_json::json!({"type": "session", "version": 1, "id": "x", "timestamp": 1, "cwd": "/tmp/proj", "model": "deepseek-flash", "effort": "auto"}),
+        serde_json::json!({"type": "message", "seq": 1, "timestamp": 2, "message": {"role": "user", "content": "改一下 README"}}),
+        serde_json::json!({"type": "message", "seq": 2, "timestamp": 3, "message": {"role": "assistant", "content": "好", "reasoning": null, "tool_calls": [], "usage": null}}),
+        serde_json::json!({"type": "message", "seq": 3, "timestamp": 4, "message": {"role": "user", "content": "[技能 code-review]\n正文"}}),
+        serde_json::json!({"type": "message", "seq": 4, "timestamp": 5, "message": {"role": "user", "content": "/effort high"}}),
+    ];
+    let text: Vec<String> = rows.iter().map(|row| row.to_string()).collect();
+    std::fs::write(session_path(&home), text.join("\n") + "\n").expect("写会话");
+
+    let agent = open(&home);
+    assert_eq!(
+        agent.prompt_history(),
+        vec!["改一下 README", "/effort high"],
+        "老会话回填，但跳过技能展开的正文"
+    );
+}
+
+#[test]
 fn prompt_history_never_reaches_the_model() {
     let server = start_server(vec![plain_response(&["ok"])]);
     let home = temp_home("hist-model");

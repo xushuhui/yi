@@ -634,6 +634,16 @@ impl Tools {
         let mut status = None;
         let mut timed_out = false;
         loop {
+            if crate::cancel::requested() {
+                // 用户要中断：按进程组杀，避免只杀掉 sh 留下子进程。
+                let _ = Command::new("kill")
+                    .arg("-TERM")
+                    .arg(format!("-{pid}"))
+                    .status();
+                let _ = child.kill();
+                let _ = child.wait();
+                return "ERROR: 已取消这条命令".to_string();
+            }
             match child.try_wait() {
                 Ok(Some(finished)) => {
                     status = Some(finished);

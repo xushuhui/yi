@@ -228,6 +228,9 @@ fn read_stream(resp: ureq::http::Response<ureq::Body>, on: &mut dyn FnMut(Event)
     let mut reader = BufReader::new(resp.into_body().into_reader());
     let mut line = String::new();
     loop {
+        if crate::cancel::requested() {
+            return Err(Error::Cancelled);
+        }
         line.clear();
         let read = reader
             .read_line(&mut line)
@@ -343,6 +346,7 @@ fn parse_usage(raw: &Value) -> Usage {
             .and_then(Value::as_u64)
             .unwrap_or(0),
         elapsed_ms: 0,
+        context_prompt: prompt_total,
     }
 }
 

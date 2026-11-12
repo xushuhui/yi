@@ -22,6 +22,10 @@ pub struct Usage {
     /// 这一轮从发请求到收完流的毫秒数。
     #[serde(default)]
     pub elapsed_ms: u64,
+    /// 这一轮最后一次请求的输入 token 数，也就是「上下文此刻有多大」。
+    /// 其余字段都是整轮累加，只有这个不是。
+    #[serde(default)]
+    pub context_prompt: u64,
 }
 
 impl Usage {
@@ -401,16 +405,32 @@ impl Session {
     }
 
     /// 最近 [`HISTORY_LIMIT`] 条用户原文，按时间顺序返回；连续重复只留一条。
+    /// 老会话没有 `prompt` 条目，退回用用户消息本身；`/skill:` 展开过的消息
+    /// 以 `[技能 ` 开头，回填时跳过——那不是用户敲的原话。
     pub fn prompts(&self) -> Vec<String> {
         let mut kept: Vec<String> = Vec::new();
+        let mut has_prompts = false;
         for entry in &self.entries {
-            let Entry::Prompt { text, .. } = entry else {
-                continue;
-            };
-            if kept.last() == Some(text) {
-                continue;
+            match entry {
+                Entry::Prompt { text, .. } => {
+                    has_prompts = true;
+                    if kept.last() != Some(text) {
+                        kept.push(text.clone());
+                    }
+                }
+                // 回填只发生在老会话：一旦本会话写过 `prompt`，就不再猜。
+                // `/skill:` 展开过的消息以 `[技能 ` 开头，那不是用户敲的原话。
+                Entry::Message {
+                    message: Message::User { content },
+                    ..
+                } if !has_prompts
+                    && !content.starts_with("[技能 ")
+                    && kept.last() != Some(content) =>
+                {
+                    kept.push(content.clone());
+                }
+                _ => {}
             }
-            kept.push(text.clone());
         }
         let start = kept.len().saturating_sub(HISTORY_LIMIT);
         kept.split_off(start)

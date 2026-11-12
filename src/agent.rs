@@ -72,7 +72,11 @@ impl Agent {
     /// 一轮对话的入口：失败原因写进会话文件再返回，事后才查得到。
     pub fn submit(&mut self, prompt: &str, on: &mut dyn FnMut(Event)) -> Result<Usage> {
         let result = self.run_turn(prompt, on);
-        if let Err(err) = &result {
+        if let Err(crate::Error::Cancelled) = &result {
+            let _ = self
+                .session
+                .append_notice("用户按 Ctrl-C 取消了这一轮，会话保留");
+        } else if let Err(err) = &result {
             // 写不进去也不能盖住真正的错误，屏幕上那份照样打印。
             let _ = self.session.append_notice(&format!("这一轮失败：{err}"));
         }
@@ -108,6 +112,7 @@ impl Agent {
             total.output += reply.usage.output;
             total.reasoning += reply.usage.reasoning;
             total.elapsed_ms += reply.usage.elapsed_ms;
+            total.context_prompt = reply.usage.prompt_tokens();
 
             let turn_usage = reply.usage.clone();
             self.session.append_assistant(
@@ -123,6 +128,9 @@ impl Agent {
             }
 
             for call in reply.tool_calls {
+                if crate::cancel::requested() {
+                    return Err(crate::Error::Cancelled);
+                }
                 on(Event::ToolCall {
                     name: call.name.clone(),
                     summary: Tools::describe(&call),
@@ -185,6 +193,7 @@ impl Agent {
         total.cache_hit += reply.usage.cache_hit;
         total.output += reply.usage.output;
         total.reasoning += reply.usage.reasoning;
+        total.context_prompt = reply.usage.prompt_tokens();
         self.session
             .append_assistant(reply.content, reply.reasoning, Vec::new(), reply.usage)?;
         Ok(total)

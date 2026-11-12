@@ -68,6 +68,8 @@ fn run() -> Result<()> {
         };
 
         let mut thinking_shown = false;
+        yi::cancel::reset();
+        yi::cancel::arm();
         let result = agent.submit(&message, &mut |event| match event {
             Event::Text(text) => {
                 print!("{text}");
@@ -93,6 +95,7 @@ fn run() -> Result<()> {
             }
         });
 
+        yi::cancel::disarm();
         match result {
             Ok(usage) => {
                 println!();
@@ -206,7 +209,9 @@ fn print_help() {
 
 fn footer(usage: &Usage) -> String {
     let prompt = usage.prompt_tokens();
-    let percent = prompt * 100 / CONTEXT_WINDOW;
+    // 百分比用最后一次请求的输入量：那才是「上下文现在多大」。
+    // 整轮累加的 prompt 会随步数增长，和多轮工具调用的实际上下文无关。
+    let percent = usage.context_prompt * 100 / CONTEXT_WINDOW;
     let rate = (usage.cache_hit * 100).checked_div(prompt).unwrap_or(0);
     format!(
         "[上下文 {percent}% · 缓存命中 {rate}%（{} / {}）· 本轮 {} in / {} out]",
@@ -222,5 +227,36 @@ fn human(tokens: u64) -> String {
         format!("{:.1}k", tokens as f64 / 1_000.0)
     } else {
         tokens.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn usage(context_prompt: u64, input_uncached: u64, cache_hit: u64) -> Usage {
+        Usage {
+            input_uncached,
+            cache_hit,
+            output: 0,
+            reasoning: 0,
+            elapsed_ms: 0,
+            context_prompt,
+        }
+    }
+
+    #[test]
+    fn footer_percent_uses_the_last_request_not_the_whole_turn() {
+        // 这一轮累计输入 1,000,000，但最后一次请求只有 524,288（窗口的一半）。
+        let line = footer(&usage(524_288, 500_000, 500_000));
+        assert!(line.contains("上下文 50%"), "{line}");
+        assert!(line.contains("1000.0k in"), "整轮累加值照常显示：{line}");
+    }
+
+    #[test]
+    fn footer_handles_an_empty_turn() {
+        let line = footer(&usage(0, 0, 0));
+        assert!(line.contains("上下文 0%"), "{line}");
+        assert!(line.contains("缓存命中 0%"), "{line}");
     }
 }

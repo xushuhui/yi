@@ -3,6 +3,7 @@
 //! 二进制只是一层薄壳；这里的一切都可以被集成测试直接驱动。
 
 pub mod agent;
+pub mod cancel;
 pub mod config;
 pub mod lsp;
 pub mod provider;
@@ -19,6 +20,8 @@ pub enum Error {
     Http(String),
     Api(String),
     Config(String),
+    /// 用户按 Ctrl-C 要求中断本轮。
+    Cancelled,
 }
 
 impl std::fmt::Display for Error {
@@ -29,6 +32,7 @@ impl std::fmt::Display for Error {
             Error::Http(e) => write!(f, "网络错误：{e}"),
             Error::Api(e) => write!(f, "接口返回错误：{e}"),
             Error::Config(e) => write!(f, "{e}"),
+            Error::Cancelled => write!(f, "已取消这一轮"),
         }
     }
 }
