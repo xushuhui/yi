@@ -5,6 +5,7 @@
 pub mod agent;
 pub mod cancel;
 pub mod crash;
+pub mod complete;
 pub mod config;
 pub mod lsp;
 pub mod provider;

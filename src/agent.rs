@@ -49,11 +49,6 @@ impl Agent {
         })
     }
 
-    /// 取第一行，给界面用。
-fn first_line(text: &str) -> &str {
-    text.lines().next().unwrap_or("")
-}
-
 /// 工具结果算不算失败：显式的 `ERROR`，或 bash 的非零退出码。
     /// 只看末尾的退出码行，避免命令输出里恰好出现「退出码：」被误判。
     fn looks_failed(text: &str) -> bool {
@@ -160,13 +155,13 @@ fn first_line(text: &str) -> &str {
                             on(Event::ToolResult {
                                 name: call.name.clone(),
                                 failed: true,
-                                note: Self::first_line(&text).to_string(),
+                                note: failure_note(&text).to_string(),
                             });
                         } else if call.name == "edit" {
                             on(Event::ToolResult {
                                 name: call.name.clone(),
                                 failed: false,
-                                note: Self::first_line(&text).to_string(),
+                                note: failure_note(&text).to_string(),
                             });
                         }
                         self.session.append_tool_result(&call.id, text)?;
@@ -308,4 +303,35 @@ fn truncate_chars(text: &str, max: usize) -> String {
     let mut out: String = text.chars().take(max).collect();
     out.push('…');
     out
+}
+
+/// 取第一行，给界面用。
+fn first_line(text: &str) -> &str {
+    text.lines().next().unwrap_or("")
+}
+
+/// 失败时给人看的那一行：优先退出码，其次第一行。
+/// 命令输出很多时，第一行往往只是普通输出，未必是失败原因。
+fn failure_note(text: &str) -> &str {
+    text.lines()
+        .rev()
+        .find(|line| line.starts_with("退出码："))
+        .unwrap_or_else(|| first_line(text))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::failure_note;
+
+    #[test]
+    fn a_non_zero_exit_reports_the_exit_code_not_the_first_output_line() {
+        let text = "import sys\n\n退出码：1\n完整输出：/tmp/log";
+        assert_eq!(failure_note(text), "退出码：1");
+    }
+
+    #[test]
+    fn an_error_line_is_reported_as_is() {
+        let text = "ERROR: 第 398 行没有读过，不能改。先 read 这一段。";
+        assert!(failure_note(text).starts_with("ERROR: 第 398 行"));
+    }
 }

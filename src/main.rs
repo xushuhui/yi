@@ -1,6 +1,9 @@
 use std::io::{self, IsTerminal, Write};
 
+use std::path::Path;
+
 use yi::agent::Agent;
+use yi::complete::Helper;
 use yi::config::{self, CONTEXT_WINDOW, Config};
 use yi::provider::Event;
 use yi::render::{self, Renderer};
@@ -42,7 +45,14 @@ fn run() -> Result<()> {
         .join(config::encode_project(&cwd))
         .join("session.jsonl");
     let mut agent = Agent::new(&cfg, &cwd, &session_path)?;
-    let mut editor = make_editor(&agent)?;
+    let skills: Vec<(String, String)> = yi::skills::discover(&yi::skills::roots(
+        &cfg.home,
+        Path::new(&cwd),
+    ))
+    .into_iter()
+    .map(|skill| (skill.name, skill.description))
+    .collect();
+    let mut editor = make_editor(&agent, skills)?;
     // 只在真终端里上色；管道输出、NO_COLOR 时保持原样。
     let color = io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
     let mut renderer = Renderer::new(color);
@@ -102,7 +112,7 @@ fn run() -> Result<()> {
                 // 命令按 shell 的样子显示（`$ 命令`），其余工具用箭头加名字。
                 if name == "bash" {
                     if color {
-                        println!("\x1b[32m$\x1b[0m {summary}");
+                        println!("\x1b[32m$\x1b[0m {}", render::shell_line(&summary, true));
                     } else {
                         println!("$ {summary}");
                     }
@@ -149,7 +159,9 @@ fn run() -> Result<()> {
 }
 
 /// 真终端才接管按键；管道输入保持逐行读取，脚本和冒烟测试都靠它。
-fn make_editor(agent: &Agent) -> Result<Option<rustyline::DefaultEditor>> {
+type Editor = rustyline::Editor<Helper, rustyline::history::DefaultHistory>;
+
+fn make_editor(agent: &Agent, skills: Vec<(String, String)>) -> Result<Option<Editor>> {
     if !io::stdin().is_terminal() {
         return Ok(None);
     }
@@ -157,9 +169,14 @@ fn make_editor(agent: &Agent) -> Result<Option<rustyline::DefaultEditor>> {
         .max_history_size(HISTORY_LIMIT)
         .and_then(|builder| builder.history_ignore_dups(true))
         .map_err(|err| Error::Config(format!("配置输入行失败：{err}")))?;
-    let config = builder.auto_add_history(true).build();
-    let mut editor = rustyline::DefaultEditor::with_config(config)
+    // 候选按列表展示（带描述），不是在输入行里循环替换。
+    let config = builder
+        .completion_type(rustyline::config::CompletionType::List)
+        .auto_add_history(true)
+        .build();
+    let mut editor = Editor::with_config(config)
         .map_err(|err| Error::Config(format!("初始化输入行失败：{err}")))?;
+    editor.set_helper(Some(Helper::new(skills)));
     for line in agent.prompt_history() {
         // 历史只用来召回：某一条加不进去不影响输入。
         let _ = editor.add_history_entry(line);
@@ -168,7 +185,7 @@ fn make_editor(agent: &Agent) -> Result<Option<rustyline::DefaultEditor>> {
 }
 
 /// 读一行输入；返回 `None` 表示该退出了（Ctrl-D 或标准输入结束）。
-fn read_input(editor: &mut Option<rustyline::DefaultEditor>) -> Result<Option<String>> {
+fn read_input(editor: &mut Option<Editor>) -> Result<Option<String>> {
     let Some(editor) = editor else {
         print!("> ");
         io::stdout().flush()?;
@@ -242,27 +259,12 @@ fn print_help() {
     );
 }
 
+/// 页脚只报上下文占比：缓存和本轮用量是内部数据，不占屏幕。
 fn footer(usage: &Usage) -> String {
-    let prompt = usage.prompt_tokens();
     // 百分比用最后一次请求的输入量：那才是「上下文现在多大」。
     // 整轮累加的 prompt 会随步数增长，和多轮工具调用的实际上下文无关。
     let percent = usage.context_prompt * 100 / CONTEXT_WINDOW;
-    let rate = (usage.cache_hit * 100).checked_div(prompt).unwrap_or(0);
-    format!(
-        "[上下文 {percent}% · 缓存命中 {rate}%（{} / {}）· 本轮 {} in / {} out]",
-        human(usage.cache_hit),
-        human(prompt),
-        human(prompt),
-        human(usage.output)
-    )
-}
-
-fn human(tokens: u64) -> String {
-    if tokens >= 1_000 {
-        format!("{:.1}k", tokens as f64 / 1_000.0)
-    } else {
-        tokens.to_string()
-    }
+    format!("[上下文 {percent}%]")
 }
 
 #[cfg(test)]
@@ -285,13 +287,11 @@ mod tests {
         // 这一轮累计输入 1,000,000，但最后一次请求只有 524,288（窗口的一半）。
         let line = footer(&usage(524_288, 500_000, 500_000));
         assert!(line.contains("上下文 50%"), "{line}");
-        assert!(line.contains("1000.0k in"), "整轮累加值照常显示：{line}");
+        assert_eq!(line, "[上下文 50%]");
     }
 
     #[test]
     fn footer_handles_an_empty_turn() {
-        let line = footer(&usage(0, 0, 0));
-        assert!(line.contains("上下文 0%"), "{line}");
-        assert!(line.contains("缓存命中 0%"), "{line}");
+        assert_eq!(footer(&usage(0, 0, 0)), "[上下文 0%]");
     }
 }

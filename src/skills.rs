@@ -91,7 +91,8 @@ pub fn render(skills: &[Skill]) -> String {
 
 /// `/skill:<名字> [要求]` 展开成一条普通消息，作为用户输入提交。
 pub fn expand(input: &str, home: &Path, cwd: &Path) -> Result<String> {
-    let mut parts = input.splitn(2, char::is_whitespace);
+    // `/skill: name` 和 `/skill:name` 等价：冒号后面允许空格。
+    let mut parts = input.trim_start().splitn(2, char::is_whitespace);
     let name = parts.next().unwrap_or("").trim();
     let request = parts.next().unwrap_or("").trim();
     if name.is_empty() {
@@ -223,4 +224,23 @@ mod tests {
         let err = expand("nope", &home, Path::new("/nonexistent")).unwrap_err();
         assert!(err.to_string().contains("没有叫 nope 的技能"));
     }
+
+    #[test]
+    fn a_space_after_the_colon_is_allowed() {
+        let home = temp_dir("space");
+        let root = home.join("skills");
+        std::fs::create_dir_all(root.join("go-rules")).unwrap();
+        std::fs::write(
+            root.join("go-rules/SKILL.md"),
+            "---\nname: go-rules\ndescription: 规范\n---\n正文内容\n",
+        )
+        .unwrap();
+
+        for input in ["go-rules 看一下", " go-rules 看一下"] {
+            let text = expand(input, &home, Path::new("/nonexistent")).expect("应当找到技能");
+            assert!(text.contains("[技能 go-rules]"), "{text}");
+            assert!(text.contains("正文内容"), "{text}");
+        }
+    }
 }
+

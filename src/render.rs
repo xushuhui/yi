@@ -15,6 +15,7 @@ const RED: &str = "\x1b[31m";
 const GREEN: &str = "\x1b[32m";
 const CYAN: &str = "\x1b[36m";
 const YELLOW: &str = "\x1b[33m";
+const GREEN_BRIGHT: &str = "\x1b[92m";
 
 /// 终端够不够宽、能不能着色，由调用方判断一次，之后固定。
 pub struct Renderer {
@@ -337,6 +338,181 @@ fn highlight(code: &str, lang: &str) -> Option<String> {
     Some(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
+/// 命令本身的着色：命令词绿色、`-` 开头的参数青色、引号里的内容黄色、
+/// 管道和分号调暗。只用于显示，命令怎么执行完全不变。
+pub fn shell_line(command: &str, color: bool) -> String {
+    if !color {
+        return command.to_string();
+    }
+    let mut out = String::new();
+    // heredoc 正文要攒到结束标记，再整段交给 bat。
+    let mut pending: Option<(String, String)> = None;
+    let mut body = String::new();
+
+    for segment in command.split_inclusive('\n') {
+        let (line, had_newline) = match segment.strip_suffix('\n') {
+            Some(text) => (text, true),
+            None => (segment, false),
+        };
+
+        if let Some((label, lang)) = pending.clone() {
+            if line.trim() == label {
+                out.push_str(&highlight(&body, &lang).unwrap_or_else(|| body.clone()));
+                body.clear();
+                out.push_str(line);
+                if had_newline {
+                    out.push('\n');
+                }
+                pending = None;
+                continue;
+            }
+            body.push_str(line);
+            body.push('\n');
+            continue;
+        }
+
+        out.push_str(&color_shell_line(line));
+        if had_newline {
+            out.push('\n');
+        }
+        if let Some(found) = heredoc(line) {
+            pending = Some(found);
+        }
+    }
+
+    // 没有结束标记：正文照样输出，不能吞掉命令内容。
+    if let Some((_, lang)) = pending {
+        out.push_str(&highlight(&body, &lang).unwrap_or(body));
+    }
+    out
+}
+
+/// 单行 shell 着色：命令词绿色、`-` 选项青色、引号内容黄色、`;`/`|` 调暗。
+fn color_shell_line(command: &str) -> String {
+    let chars: Vec<char> = command.chars().collect();
+    let mut out = String::new();
+    let mut index = 0;
+    let mut expect_command = true;
+    while index < chars.len() {
+        let ch = chars[index];
+        if ch.is_whitespace() {
+            out.push(ch);
+            index += 1;
+            continue;
+        }
+        if ch == '"' || ch == '\'' {
+            let quote = ch;
+            let mut end = index + 1;
+            while end < chars.len() && chars[end] != quote {
+                end += 1;
+            }
+            let text: String = chars[index..(end + 1).min(chars.len())].iter().collect();
+            out.push_str(&format!("{YELLOW}{text}{RESET}"));
+            index = end + 1;
+            expect_command = false;
+            continue;
+        }
+        if matches!(ch, ';' | '|' | '&') {
+            out.push_str(&format!("{DIM}{ch}{RESET}"));
+            expect_command = true;
+            index += 1;
+            continue;
+        }
+        let mut end = index;
+        while end < chars.len()
+            && !chars[end].is_whitespace()
+            && !matches!(chars[end], ';' | '|' | '&')
+        {
+            end += 1;
+        }
+        let word: String = chars[index..end].iter().collect();
+        if expect_command && !word.contains('=') {
+            out.push_str(&format!("{GREEN_BRIGHT}{word}{RESET}"));
+            expect_command = false;
+        } else if word.starts_with('-') {
+            out.push_str(&format!("{CYAN}{word}{RESET}"));
+        } else {
+            out.push_str(&word);
+        }
+        index = end;
+    }
+    out
+}
+
+/// 找出 heredoc 的结束标记和正文该用什么语言高亮。
+fn heredoc(line: &str) -> Option<(String, String)> {
+    let at = line.find("<<")?;
+    let mut rest = line[at + 2..].trim_start();
+    // `<<-` 只影响缩进，标记解析相同。
+    if let Some(stripped) = rest.strip_prefix('-') {
+        rest = stripped.trim_start();
+    }
+    let quote = rest.chars().next().filter(|c| *c == '"' || *c == '\'');
+    if quote.is_some() {
+        rest = &rest[1..];
+    }
+    let end = rest
+        .find(|c: char| c.is_whitespace() || matches!(c, ';' | '|' | '&' | '>'))
+        .unwrap_or(rest.len());
+    let label = rest[..end].trim_end_matches(['"', '\'']).to_string();
+    if label.is_empty() {
+        return None;
+    }
+    let lang = language_hint(line, &label)?;
+    Some((label, lang))
+}
+
+/// 语言提示的优先级：解释器 → 目标文件后缀 → 结束标记本身。
+fn language_hint(line: &str, label: &str) -> Option<String> {
+    let mut words = line.split_whitespace();
+    if let Some(first) = words.next() {
+        let name = first.rsplit('/').next().unwrap_or(first);
+        if let Some(lang) = interpreter(name) {
+            return Some(lang.to_string());
+        }
+    }
+    for word in line.split_whitespace() {
+        let token = word.trim_matches(|c: char| matches!(c, '>' | '"' | '\'' | ';'));
+        if let Some(ext) = token.rsplit('.').next()
+            && token.contains('.')
+            && let Some(lang) = extension(ext)
+        {
+            return Some(lang.to_string());
+        }
+    }
+    extension(&label.to_lowercase()).map(str::to_string)
+}
+
+fn interpreter(name: &str) -> Option<&'static str> {
+    let name = name.trim_end_matches(|c: char| c.is_ascii_digit());
+    match name {
+        "python" | "python3" | "py" => Some("python"),
+        "node" | "nodejs" => Some("javascript"),
+        "bash" | "sh" | "zsh" | "fish" => Some("bash"),
+        "ruby" | "rb" => Some("ruby"),
+        "php" => Some("php"),
+        "go" => Some("go"),
+        _ => None,
+    }
+}
+
+fn extension(ext: &str) -> Option<&'static str> {
+    match ext {
+        "py" => Some("python"),
+        "js" | "mjs" | "cjs" | "jsx" => Some("javascript"),
+        "ts" | "tsx" => Some("typescript"),
+        "go" => Some("go"),
+        "sh" | "bash" => Some("bash"),
+        "rb" => Some("ruby"),
+        "php" => Some("php"),
+        "sql" => Some("sql"),
+        "json" => Some("json"),
+        "yaml" | "yml" => Some("yaml"),
+        "rs" => Some("rust"),
+        _ => None,
+    }
+}
+
 /// 工具结果的一行提示：失败给红色，`edit` 成功给绿色摘要。
 pub fn tool_line(name: &str, failed: bool, note: &str, color: bool) -> String {
     if !color {
@@ -421,6 +597,67 @@ mod tests {
         assert!(lines[0].contains("go"), "{out:?}");
         assert_eq!(lines[1], "fmt.Println(1)", "{out:?}");
         assert_eq!(lines[2], "", "代码后只留一个换行：{out:?}");
+    }
+
+    fn strip_ansi(text: &str) -> String {
+        let mut out = String::new();
+        let mut in_escape = false;
+        for ch in text.chars() {
+            if in_escape {
+                if ch.is_ascii_alphabetic() {
+                    in_escape = false;
+                }
+            } else if ch == '\x1b' {
+                in_escape = true;
+            } else {
+                out.push(ch);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn heredoc_language_comes_from_the_interpreter_file_or_label() {
+        assert_eq!(heredoc("python3 - <<'PY'").unwrap().1, "python");
+        assert_eq!(heredoc("cat /tmp/srv.py <<'EOF'").unwrap().1, "python");
+        assert_eq!(heredoc("cat > run.go <<-EOF").unwrap().1, "go");
+        assert_eq!(heredoc("node <<'JS'").unwrap().1, "javascript");
+        assert!(heredoc("echo hi").is_none());
+    }
+
+    #[test]
+    fn a_heredoc_body_is_kept_verbatim() {
+        let command = "python3 - <<'PY'\nimport os\nprint('x')\nPY";
+        let out = shell_line(command, true);
+        assert_eq!(strip_ansi(&out), command, "着色不能改动原文");
+    }
+
+    #[test]
+    fn a_python_heredoc_body_gets_colored() {
+        if !bat_available() {
+            return;
+        }
+        let out = shell_line("python3 - <<'PY'\nimport os\nPY", true);
+        let body = out.split('\n').nth(1).unwrap_or("");
+        assert!(body.contains('\x1b'), "正文应当有语法颜色：{body:?}");
+    }
+
+    #[test]
+    fn an_unterminated_heredoc_still_prints_its_body() {
+        let out = shell_line("cat <<'EOF'\nhello", true);
+        assert!(strip_ansi(&out).contains("hello"), "{out}");
+    }
+
+    #[test]
+    fn shell_line_separates_command_flags_and_strings() {
+        let out = shell_line("git status --short; echo \"done\" | sed -n '1p'", true);
+        assert!(out.contains(&format!("{GREEN_BRIGHT}git{RESET}")), "{out}");
+        assert!(out.contains(&format!("{CYAN}--short{RESET}")), "{out}");
+        assert!(out.contains(&format!("{YELLOW}\"done\"{RESET}")), "{out}");
+        assert!(out.contains(&format!("{GREEN_BRIGHT}echo{RESET}")), "分号后是新命令：{out}");
+        assert!(out.contains(&format!("{DIM};{RESET}")), "{out}");
+        // 关闭颜色时原样返回。
+        assert_eq!(shell_line("git status", false), "git status");
     }
 
     #[test]
