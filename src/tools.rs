@@ -8,6 +8,7 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 use serde_json::{Value, json};
 use std::os::unix::process::CommandExt;
 
+use crate::lsp::Lsp;
 use crate::session::ToolCall;
 
 const DEFAULT_READ_LINES: usize = 300;
@@ -35,15 +36,17 @@ pub struct Tools {
     log_dir: PathBuf,
     snapshots: HashMap<PathBuf, Snapshot>,
     log_seq: u64,
+    lsp: Lsp,
 }
 
 impl Tools {
-    pub fn new(root: PathBuf, log_dir: PathBuf) -> Tools {
+    pub fn new(root: PathBuf, log_dir: PathBuf, gopls: String, phpantom: String) -> Tools {
         Tools {
             root,
             log_dir,
             snapshots: HashMap::new(),
             log_seq: 0,
+            lsp: Lsp::new(gopls, phpantom),
         }
     }
 
@@ -130,6 +133,30 @@ impl Tools {
             {
                 "type": "function",
                 "function": {
+                    "name": "lsp",
+                    "description": "查询 Go/PHP 代码的语言服务：跳定义、找引用、看诊断。需要服务器已安装（gopls / phpantom_lsp）。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "action": {
+                                "type": "string",
+                                "enum": ["definition", "references", "diagnostics"],
+                                "description": "要做什么"
+                            },
+                            "path": { "type": "string", "description": "相对项目根的 .go 或 .php 文件" },
+                            "line": {
+                                "type": "integer",
+                                "description": "行号，从 1 开始；definition 和 references 必填"
+                            },
+                            "symbol": { "type": "string", "description": "这一行里的符号名；省略则用第一个非空白字符" }
+                        },
+                        "required": ["action", "path"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
                     "name": "glob",
                     "description": "按通配符找文件，按修改时间倒序，最多 200 条。",
                     "parameters": {
@@ -168,6 +195,7 @@ impl Tools {
             }
             "grep" => format!("grep {}", pick("pattern")),
             "glob" => format!("glob {}", pick("pattern")),
+            "lsp" => format!("lsp {} {}", pick("action"), pick("path")),
             other => other.to_string(),
         }
     }
@@ -185,6 +213,7 @@ impl Tools {
             "bash" => self.bash(&args),
             "grep" => self.grep(&args),
             "glob" => self.glob(&args),
+            "lsp" => return Outcome::Text(self.lsp_call(&args)),
             other => format!("ERROR: 未知工具 {other}"),
         };
         Outcome::Text(text)
@@ -865,6 +894,25 @@ impl Tools {
                 .map(|(_, path)| path)
                 .collect::<Vec<_>>()
                 .join("\n")
+        }
+    }
+
+    fn lsp_call(&mut self, args: &Value) -> String {
+        let Some(action) = args.get("action").and_then(Value::as_str) else {
+            return "ERROR: 缺少 action".to_string();
+        };
+        let Some(path) = args.get("path").and_then(Value::as_str) else {
+            return "ERROR: 缺少 path".to_string();
+        };
+        let line = args
+            .get("line")
+            .and_then(Value::as_u64)
+            .map(|value| value as usize);
+        let symbol = args.get("symbol").and_then(Value::as_str);
+        let full = self.resolve(path);
+        match self.lsp.call(action, &full, line, symbol) {
+            Ok(text) => text,
+            Err(err) => format!("ERROR: {err}"),
         }
     }
 

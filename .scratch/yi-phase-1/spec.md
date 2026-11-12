@@ -111,7 +111,7 @@ Status: ready-for-agent
 
 ### 工具
 
-六个工具，输入都是扁平 JSON 对象。返回值对模型可见，长度统一截断为 2,000 行或 50 KB（先到者为准）。
+七个工具，输入都是扁平 JSON 对象。返回值对模型可见，长度统一截断为 2,000 行或 50 KB（先到者为准）。
 
 **`read { path, offset?, limit? }`**
 - 文本：返回头部 `[相对路径#TAG]`，随后每行 `行号:内容`。`TAG` 是文件内容摘要的 4 位大写十六进制。默认 300 行，单次上限 3,000 行；没读完时在末尾给一行「共 N 行，用 offset=X 继续读」。
@@ -147,6 +147,13 @@ Status: ready-for-agent
 **`glob { pattern, path? }`**
 - 通配符相对**给定的搜索根**匹配（`path=src` 配 `*.go` 命中 `src/a.go`），跳过同上的目录，按修改时间倒序，最多 200 条。
 
+**`lsp { action, path, line?, symbol? }`**
+- `action` 三选一：`definition`、`references`、`diagnostics`；其余动作直接报错，且**在校验通过前不启动服务器**。
+- `definition` / `references` 必须给 `line`（从 1 开始），`symbol` 省略时用该行第一个非空白字符的列；`diagnostics` 不需要 `line`。
+- 只接受 `.go` 和 `.php`；其余扩展名报错。
+- 输出：`文件:行:列  代码片段`，每条一行。`definition` 最多 10 条、`references` 最多 50 条、诊断最多 50 条；超出时在末尾写"还有 N 条未显示"。
+- URI 按百分号编码传输并解码，中文、空格、`#`、`%` 等路径必须能正确往返。
+
 ### 终端界面
 
 - **行式模式**，不做全屏。输出直接打印到终端，一轮结束后等一行输入。终端的滚动、搜索、选中复制全部照常可用，不用自己实现。否决 `ratatui` 全屏：为了常驻一行状态栏，就要自己重做滚动、翻页、缩放、复制，还要接管终端原生能力（见 ADR-0002）。
@@ -170,10 +177,11 @@ Status: ready-for-agent
 - 只用机器上已有的服务器，**不安装新的**。实测：Go 用 `gopls`（v0.21.1，`/opt/homebrew/opt/gopath/bin/gopls`），PHP 用 `phpantom_lsp`（0.8.0，`/opt/homebrew/bin/phpantom_lsp`）；后者的 `initialize` 返回支持 definition / references / hover。
 - **不支持 TypeScript**：机器上没有独立的 TypeScript LSP；VS Code 自带的 `tsserver` 在应用包内、走私有协议，要包一层才算 LSP，属于安装新东西，不做。
 - 工具面只开三个动作：`definition`、`references`、`diagnostics`。悬停、重命名、格式化不做。
-- 懒启动：第一次调用才起进程，按项目根缓存；yi 退出时一并终止。
+- 懒启动：第一次调用才起进程，按 (语言, 项目根) 缓存；后台线程每 60 秒清一次，空闲超过 10 分钟的服务器自动终止，yi 退出时一并终止。服务器自己崩了，下次调用自动重起。
+- 服务器命令可被 `~/.yi/config.json` 的 `gopls` / `phpantom` 覆盖，默认取 PATH 里的同名命令。
 - 超时：`initialize` 15 秒，单次请求 15 秒；超时以 `ERROR:` 文本返回，不卡住整轮。
 - 项目根：Go 找最近的 `go.mod`，PHP 找最近的 `composer.json`；找不到就用当前目录。
-- 诊断优先用服务器主动推送的 `publishDiagnostics`（打开文件后短暂等待），拿不到就回"没有诊断"。
+- 诊断优先用服务器主动推送的 `publishDiagnostics`；每次打开/变更文件都先清掉旧诊断，避免把过期结果当成"干净"。等待 1.2 秒仍没收到就回"暂时没有诊断（服务器可能还没完成索引）"，不谎称没有错误。
 
 ### 提示词与上下文文件
 
@@ -208,6 +216,8 @@ Status: ready-for-agent
 10. `/effort` 设为 `low` → 请求体含 `"reasoning_effort":"low"`；`auto` → 请求体不含该键。
 11. 假服务器返回带大 `prompt_tokens` 的用量，超过 524,288 → 会话文件追加 `compaction` 条目；下一次请求只含摘要与 `firstKeptSeq` 之后的消息。
 12. 同一目录启动第二个实例 → 非零退出，提示已存在运行中的会话。
+
+LSP 另有独立用例：Go/PHP 各一条跳定义、嵌套目录里的找引用、中文路径下的定位与代码片段、带类型错误的诊断、服务器不回话时 15 秒超时、未知动作不启动服务器、配置覆盖 `gopls`/`phpantom`。缺少服务器时用例打印 `SKIP` 并返回，不算失败。
 
 界面层不写自动化测试，每个里程碑用一份手工检查单验收（能输入、能流式、能中断、页脚数字正确）。
 

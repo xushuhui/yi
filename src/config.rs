@@ -19,6 +19,9 @@ pub struct Config {
     /// `None` = `auto`，请求里不发送 `reasoning_effort`。
     pub effort: Option<String>,
     pub home: PathBuf,
+    /// 语言服务器命令，默认取 PATH 里的 gopls / phpantom_lsp。
+    pub gopls: String,
+    pub phpantom: String,
 }
 
 impl Config {
@@ -39,24 +42,15 @@ impl Config {
             model: DEFAULT_MODEL.to_string(),
             effort: None,
             home: home.clone(),
+            gopls: "gopls".to_string(),
+            phpantom: "phpantom_lsp".to_string(),
         };
 
         let path = home.join("config.json");
         if path.exists() {
             let text = std::fs::read_to_string(&path)?;
-            let v: Value = serde_json::from_str(&text)?;
-            if let Some(s) = v.get("api_key").and_then(Value::as_str) {
-                cfg.api_key = s.to_string();
-            }
-            if let Some(s) = v.get("base_url").and_then(Value::as_str) {
-                cfg.base_url = s.to_string();
-            }
-            if let Some(s) = v.get("model").and_then(Value::as_str) {
-                cfg.model = s.to_string();
-            }
-            if let Some(s) = v.get("effort").and_then(Value::as_str) {
-                cfg.effort = parse_effort(s)?;
-            }
+            let value: Value = serde_json::from_str(&text)?;
+            apply_json(&mut cfg, &value)?;
         }
 
         if let Ok(s) = std::env::var("DEEPSEEK_API_KEY")
@@ -97,6 +91,25 @@ impl Config {
 
         out
     }
+}
+
+/// 把配置文件里的字段覆盖到默认值上；缺的字段保持默认。
+fn apply_json(cfg: &mut Config, value: &Value) -> Result<()> {
+    for key in ["api_key", "base_url", "model", "gopls", "phpantom"] {
+        if let Some(text) = value.get(key).and_then(Value::as_str) {
+            match key {
+                "api_key" => cfg.api_key = text.to_string(),
+                "base_url" => cfg.base_url = text.to_string(),
+                "model" => cfg.model = text.to_string(),
+                "gopls" => cfg.gopls = text.to_string(),
+                _ => cfg.phpantom = text.to_string(),
+            }
+        }
+    }
+    if let Some(text) = value.get("effort").and_then(Value::as_str) {
+        cfg.effort = parse_effort(text)?;
+    }
+    Ok(())
 }
 
 fn append_context_file(out: &mut String, path: &std::path::Path) {
@@ -149,6 +162,29 @@ mod tests {
         assert_eq!(parse_effort("auto").unwrap(), None);
         assert_eq!(parse_effort("low").unwrap().as_deref(), Some("low"));
         assert!(parse_effort("medium").is_err());
+    }
+
+    #[test]
+    fn config_json_can_override_the_language_servers() {
+        let mut cfg = Config {
+            api_key: "k".into(),
+            base_url: DEFAULT_BASE_URL.into(),
+            model: DEFAULT_MODEL.into(),
+            effort: None,
+            home: PathBuf::from("/tmp"),
+            gopls: "gopls".into(),
+            phpantom: "phpantom_lsp".into(),
+        };
+        apply_json(
+            &mut cfg,
+            &serde_json::json!({"gopls": "/opt/homebrew/bin/gopls", "phpantom": "/usr/local/bin/phpantom_lsp"}),
+        )
+        .unwrap();
+        assert_eq!(cfg.gopls, "/opt/homebrew/bin/gopls");
+        assert_eq!(cfg.phpantom, "/usr/local/bin/phpantom_lsp");
+
+        apply_json(&mut cfg, &serde_json::json!({})).unwrap();
+        assert_eq!(cfg.gopls, "/opt/homebrew/bin/gopls", "缺字段时保持原值");
     }
 
     #[test]

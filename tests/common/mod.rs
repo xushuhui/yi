@@ -154,6 +154,8 @@ pub fn config(port: u16, home: &Path, effort: Option<&str>) -> Config {
         model: "deepseek-flash".to_string(),
         effort: effort.map(str::to_string),
         home: home.to_path_buf(),
+        gopls: "gopls".to_string(),
+        phpantom: "phpantom_lsp".to_string(),
     }
 }
 

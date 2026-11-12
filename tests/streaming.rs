@@ -28,7 +28,10 @@ fn streams_text_and_records_the_session() {
     assert_eq!(request["model"], "deepseek-flash");
     assert_eq!(request["messages"][0]["role"], "system");
     assert_eq!(request["messages"][1]["content"], "hi");
-    assert!(request["tools"].as_array().is_some_and(|t| t.len() == 6));
+    assert!(
+        request["tools"].as_array().is_some_and(|t| t.len() == 7),
+        "七个工具：read/write/edit/bash/grep/glob/lsp"
+    );
 
     let entries = session_entries(&home);
     assert_eq!(entries.len(), 3, "头 + 用户 + 助手：{entries:?}");

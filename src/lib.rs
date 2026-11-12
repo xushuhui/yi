@@ -4,6 +4,7 @@
 
 pub mod agent;
 pub mod config;
+pub mod lsp;
 pub mod provider;
 pub mod session;
 pub mod skills;

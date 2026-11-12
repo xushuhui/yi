@@ -36,7 +36,12 @@ impl Agent {
         Ok(Agent {
             provider: Provider::new(cfg),
             session,
-            tools: Tools::new(PathBuf::from(cwd), log_dir),
+            tools: Tools::new(
+                PathBuf::from(cwd),
+                log_dir,
+                cfg.gopls.clone(),
+                cfg.phpantom.clone(),
+            ),
             system: cfg.system_prompt(cwd),
             effort,
         })
