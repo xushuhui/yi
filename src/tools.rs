@@ -1,11 +1,10 @@
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
-use std::io::Read;
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
-use regex::Regex;
 use serde_json::{Value, json};
 use std::os::unix::process::CommandExt;
 
@@ -18,7 +17,6 @@ const GREP_PER_FILE: usize = 20;
 const GREP_TOTAL: usize = 200;
 const GREP_LINE_CHARS: usize = 512;
 const GLOB_LIMIT: usize = 200;
-const SKIP_DIRS: [&str; 4] = [".git", "node_modules", "target", "vendor"];
 
 /// 工具执行的结果；图片要作为消息附带，不能塞进文本结果里。
 pub enum Outcome {
@@ -557,11 +555,28 @@ impl Tools {
             .and_then(Value::as_u64)
             .unwrap_or(300)
             .clamp(1, 3600);
+        let working_dir = args
+            .get("cwd")
+            .and_then(Value::as_str)
+            .map(|dir| self.resolve(dir))
+            .unwrap_or_else(|| self.root.clone());
+        if !working_dir.is_dir() {
+            return format!("ERROR: cwd 不是目录：{}", working_dir.display());
+        }
+
+        let log_path = match self.next_log_path() {
+            Ok(path) => path,
+            Err(err) => return format!("ERROR: 建日志失败：{err}"),
+        };
+        let log_file = match fs::File::create(&log_path) {
+            Ok(file) => file,
+            Err(err) => return format!("ERROR: 建日志失败：{err}"),
+        };
 
         let mut child = match Command::new("/bin/sh")
             .arg("-c")
             .arg(command)
-            .current_dir(&self.root)
+            .current_dir(&working_dir)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -572,28 +587,30 @@ impl Tools {
             Err(err) => return format!("ERROR: 起不了进程：{err}"),
         };
         let pid = child.id();
-        let stdout = match child.stdout.take() {
-            Some(stdout) => stdout,
-            None => return "ERROR: 拿不到命令输出".to_string(),
+        let Some(stdout) = child.stdout.take() else {
+            return "ERROR: 拿不到命令输出".to_string();
         };
-        let collector = std::thread::spawn(move || read_all(stdout));
-        let stderr = match child.stderr.take() {
-            Some(stderr) => stderr,
-            None => return "ERROR: 拿不到命令错误输出".to_string(),
+        let Some(stderr) = child.stderr.take() else {
+            return "ERROR: 拿不到命令错误输出".to_string();
         };
-        let err_collector = std::thread::spawn(move || read_all(stderr));
+        // 输出边读边写进日志，内存里只留最后 50 KB，避免大输出撑爆内存。
+        let stdout_thread = std::thread::spawn(move || stream_into_log(log_file, stdout));
+        let stderr_thread = std::thread::spawn(move || read_tail(stderr));
 
         let deadline = Instant::now() + Duration::from_secs(timeout);
+        let mut status = None;
         let mut timed_out = false;
         loop {
             match child.try_wait() {
-                Ok(Some(_)) => break,
+                Ok(Some(finished)) => {
+                    status = Some(finished);
+                    break;
+                }
                 Ok(None) => {}
                 Err(err) => return format!("ERROR: 等待进程失败：{err}"),
             }
             if Instant::now() >= deadline {
                 timed_out = true;
-                // 进程可能已经自己退出，这里的失败没有补救动作。
                 let _ = Command::new("kill")
                     .arg("-TERM")
                     .arg(format!("-{pid}"))
@@ -612,42 +629,52 @@ impl Tools {
         }
         drop(child);
 
-        let mut bytes = collector.join().unwrap_or_default();
-        let err_bytes = err_collector.join().unwrap_or_default();
-        if !err_bytes.is_empty() {
+        let (stdout_tail, stdout_total) = stdout_thread.join().unwrap_or_default();
+        let stderr_tail = stderr_thread.join().unwrap_or_default();
+        if !stderr_tail.is_empty() {
+            // stderr 补进日志末尾；写失败不影响本轮的返回值。
+            if let Ok(mut file) = fs::OpenOptions::new().append(true).open(&log_path) {
+                let _ = file.write_all(b"\n[stderr]\n");
+                let _ = file.write_all(&stderr_tail);
+            }
+        }
+
+        let mut bytes = stdout_tail;
+        if !stderr_tail.is_empty() {
             bytes.push(b'\n');
-            bytes.extend_from_slice(&err_bytes);
+            bytes.extend_from_slice(&stderr_tail);
         }
         let text = String::from_utf8_lossy(&bytes).to_string();
-        let log_path = self.write_log(&text);
 
-        let tail_limit = 50 * 1024;
-        let body = if text.len() > tail_limit {
-            let mut start = text.len() - tail_limit;
-            while !text.is_char_boundary(start) {
-                start += 1;
-            }
-            format!("…（只显示尾部 50 KB）\n{}", &text[start..])
+        const TAIL: usize = 50 * 1024;
+        let body = if stdout_total as usize > TAIL {
+            format!("…（只显示尾部 50 KB）\n{text}")
         } else {
-            text.clone()
+            text
+        };
+
+        let code = match &status {
+            Some(finished) => match finished.code() {
+                Some(code) => format!("退出码：{code}"),
+                None => "退出码：被信号终止".to_string(),
+            },
+            None => "退出码：被信号终止".to_string(),
         };
 
         if timed_out {
-            format!("ERROR: 超过 {timeout} 秒，已终止\n{body}\n完整输出：{log_path}")
+            format!(
+                "ERROR: 超过 {timeout} 秒，已终止\n{body}\n{code}\n完整输出：{}",
+                log_path.display()
+            )
         } else {
-            format!("{body}\n完整输出：{log_path}")
+            format!("{body}\n{code}\n完整输出：{}", log_path.display())
         }
     }
 
-    fn write_log(&mut self, text: &str) -> String {
+    fn next_log_path(&mut self) -> std::io::Result<PathBuf> {
         self.log_seq += 1;
-        // 目录建不出来时下面的写文件会失败，结果里会带上原因。
-        let _ = fs::create_dir_all(&self.log_dir);
-        let path = self.log_dir.join(format!("{}.log", self.log_seq));
-        match fs::write(&path, text) {
-            Ok(()) => path.display().to_string(),
-            Err(err) => format!("（日志写入失败：{err}）"),
-        }
+        fs::create_dir_all(&self.log_dir)?;
+        Ok(self.log_dir.join(format!("{}.log", self.log_seq)))
     }
 
     fn grep(&mut self, args: &Value) -> String {
@@ -655,70 +682,109 @@ impl Tools {
             return "ERROR: 缺少 pattern".to_string();
         };
         let case_sensitive = args.get("case").and_then(Value::as_bool).unwrap_or(true);
-        let expression = if case_sensitive {
-            pattern.to_string()
-        } else {
-            format!("(?i){pattern}")
-        };
-        let re = match Regex::new(&expression) {
-            Ok(re) => re,
-            Err(err) => return format!("ERROR: 正则不合法：{err}"),
-        };
-
         let base = args
             .get("path")
             .and_then(Value::as_str)
             .map(|p| self.resolve(p))
             .unwrap_or_else(|| self.root.clone());
-        let file_filter = args.get("glob").and_then(Value::as_str);
 
-        let mut files = Vec::new();
-        if base.is_file() {
-            files.push(base.clone());
-        } else {
-            collect_files(&base, &mut files);
+        let mut command = Command::new("rg");
+        command
+            .arg("--json")
+            .arg("--line-number")
+            .current_dir(&self.root)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        if !case_sensitive {
+            command.arg("--ignore-case");
         }
-        files.sort();
+        if let Some(filter) = args.get("glob").and_then(Value::as_str) {
+            command.arg("--glob").arg(filter);
+        }
+        command.arg("--").arg(pattern).arg(self.rg_target(&base));
+
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(err) => {
+                return format!("ERROR: 起不了 rg（需要安装 ripgrep）：{err}");
+            }
+        };
+        let Some(stdout) = child.stdout.take() else {
+            return "ERROR: 拿不到 rg 的输出".to_string();
+        };
 
         let mut out = String::new();
         let mut total = 0usize;
-        for file in files {
-            let relative = self.relative(&file);
-            if let Some(filter) = file_filter
-                && !glob_match(filter, &relative)
-            {
-                continue;
+        let mut per_file: HashMap<String, usize> = HashMap::new();
+        let mut snapshots: Vec<(PathBuf, String, BTreeSet<usize>)> = Vec::new();
+        let mut reader = BufReader::new(stdout);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                break;
             }
-            let Ok(text) = fs::read_to_string(&file) else {
+            let Ok(event) = serde_json::from_str::<Value>(&line) else {
                 continue;
             };
-            let tag = tag_of(&text);
-            let mut per_file = 0usize;
-            let mut seen = BTreeSet::new();
-            for (index, line) in text.lines().enumerate() {
-                if !re.is_match(line) {
-                    continue;
+            if event.get("type").and_then(Value::as_str) != Some("match") {
+                continue;
+            }
+            let Some(path) = event["data"]["path"]["text"].as_str() else {
+                continue;
+            };
+            let Some(number) = event["data"]["line_number"].as_u64() else {
+                continue;
+            };
+            let text = event["data"]["lines"]["text"]
+                .as_str()
+                .unwrap_or("")
+                .trim_end_matches('\n');
+
+            let count = per_file.entry(path.to_string()).or_insert(0);
+            if *count >= GREP_PER_FILE {
+                continue;
+            }
+            *count += 1;
+            total += 1;
+            out.push_str(&format!(
+                "{path}:{number}:{}\n",
+                truncate_chars(text, GREP_LINE_CHARS)
+            ));
+
+            match snapshots
+                .iter_mut()
+                .find(|entry| entry.0 == self.root.join(path))
+            {
+                Some(entry) => {
+                    entry.2.insert(number as usize);
                 }
-                let mut trimmed = line.to_string();
-                if trimmed.chars().count() > GREP_LINE_CHARS {
-                    trimmed = trimmed.chars().take(GREP_LINE_CHARS).collect();
-                    trimmed.push('…');
-                }
-                out.push_str(&format!("{relative}:{}:{trimmed}\n", index + 1));
-                seen.insert(index + 1);
-                per_file += 1;
-                total += 1;
-                if per_file >= GREP_PER_FILE || total >= GREP_TOTAL {
-                    break;
+                None => {
+                    let full = self.root.join(path);
+                    // 大文件不记快照：读它只为算锚点，代价太高；改它之前重新 read 即可。
+                    let too_big = fs::metadata(&full)
+                        .map(|meta| meta.len() > 4 * 1024 * 1024)
+                        .unwrap_or(true);
+                    if !too_big && let Ok(content) = fs::read_to_string(&full) {
+                        let mut seen = BTreeSet::new();
+                        seen.insert(number as usize);
+                        snapshots.push((full, tag_of(&content), seen));
+                    }
                 }
             }
-            if !seen.is_empty() {
-                self.record_snapshot(file, tag, seen);
-            }
+
             if total >= GREP_TOTAL {
                 out.push_str("… 结果过多，只显示前 200 条\n");
                 break;
             }
+        }
+        // 提前收工时把 rg 收掉，避免它继续扫整个仓库。
+        let _ = child.kill();
+        let _ = child.wait();
+
+        for (path, tag, seen) in snapshots {
+            self.record_snapshot(path, tag, seen);
         }
 
         if out.is_empty() {
@@ -737,38 +803,58 @@ impl Tools {
             .and_then(Value::as_str)
             .map(|p| self.resolve(p))
             .unwrap_or_else(|| self.root.clone());
-
-        let mut files = Vec::new();
-        collect_files(&base, &mut files);
-
         let base_is_file = base.is_file();
-        let mut matched: Vec<(u128, String)> = files
-            .into_iter()
-            .filter_map(|file| {
-                let relative = self.relative(&file);
-                let target = if base_is_file {
-                    file.file_name()
-                        .map(|name| name.to_string_lossy().to_string())
-                        .unwrap_or_else(|| relative.clone())
-                } else {
-                    file.strip_prefix(&base)
-                        .map(|rest| rest.display().to_string())
-                        .unwrap_or_else(|_| relative.clone())
-                };
-                if !glob_match(pattern, &target) {
-                    return None;
+
+        // `rg --files` 只列未被 .gitignore 忽略的文件，比我们自己遍历快两个数量级。
+        let mut command = Command::new("rg");
+        command.arg("--files").current_dir(&self.root);
+        if !base_is_file {
+            command.arg(self.rg_target(&base));
+        }
+        let output = match command.stdin(Stdio::null()).stderr(Stdio::null()).output() {
+            Ok(output) => output,
+            Err(err) => return format!("ERROR: 起不了 rg（需要安装 ripgrep）：{err}"),
+        };
+
+        let mut candidates: Vec<String> = Vec::new();
+        if base_is_file {
+            if let Some(name) = base.file_name().map(|n| n.to_string_lossy().to_string())
+                && glob_match(pattern, &name)
+            {
+                candidates.push(self.relative(&base));
+            }
+        } else {
+            for line in String::from_utf8_lossy(&output.stdout).lines() {
+                let relative = line.trim();
+                if relative.is_empty() {
+                    continue;
                 }
-                let modified = fs::metadata(&file)
+                let target = self
+                    .root
+                    .join(relative)
+                    .strip_prefix(&base)
+                    .map(|rest| rest.display().to_string())
+                    .unwrap_or_else(|_| relative.to_string());
+                if glob_match(pattern, &target) {
+                    candidates.push(relative.to_string());
+                }
+            }
+        }
+
+        let mut matched: Vec<(u128, String)> = candidates
+            .into_iter()
+            .map(|relative| {
+                let modified = fs::metadata(self.root.join(&relative))
                     .and_then(|m| m.modified())
                     .ok()
                     .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
                     .map(|d| d.as_millis())
                     .unwrap_or(0);
-                Some((modified, relative))
+                (modified, relative)
             })
             .collect();
 
-        matched.sort_by_key(|a| std::cmp::Reverse(a.0));
+        matched.sort_by_key(|entry| std::cmp::Reverse(entry.0));
         matched.truncate(GLOB_LIMIT);
 
         if matched.is_empty() {
@@ -779,6 +865,13 @@ impl Tools {
                 .map(|(_, path)| path)
                 .collect::<Vec<_>>()
                 .join("\n")
+        }
+    }
+
+    fn rg_target(&self, base: &Path) -> String {
+        match base.strip_prefix(&self.root) {
+            Ok(rest) if !rest.as_os_str().is_empty() => rest.display().to_string(),
+            _ => ".".to_string(),
         }
     }
 
@@ -988,27 +1081,6 @@ fn normalize(path: &Path) -> PathBuf {
     out
 }
 
-fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let Ok(file_type) = entry.file_type() else {
-            continue;
-        };
-        if file_type.is_dir() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if SKIP_DIRS.contains(&name.as_str()) {
-                continue;
-            }
-            collect_files(&path, out);
-        } else if file_type.is_file() {
-            out.push(path);
-        }
-    }
-}
-
 /// 只支持 `*` 和 `**` 的最小通配符匹配。
 fn glob_match(pattern: &str, path: &str) -> bool {
     let pattern_parts: Vec<&str> = pattern.split('/').collect();
@@ -1097,9 +1169,59 @@ fn copy_seen(
     }
 }
 
-fn read_all(mut source: impl Read) -> Vec<u8> {
-    let mut buffer = Vec::new();
-    // 读失败（管道被关掉）时返回已读到的部分，不中断这一轮。
-    let _ = source.read_to_end(&mut buffer);
-    buffer
+/// 边读边写日志，返回（最后 50 KB，总字节数）。
+fn stream_into_log(file: fs::File, mut source: impl Read) -> (Vec<u8>, u64) {
+    const TAIL: usize = 50 * 1024;
+    let mut file = std::io::BufWriter::with_capacity(64 * 1024, file);
+    let mut tail: Vec<u8> = Vec::with_capacity(TAIL);
+    let mut total = 0u64;
+    let mut buffer = [0u8; 8192];
+    loop {
+        match source.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => {
+                total += read as u64;
+                // 日志写入失败不中断命令：返回值里仍然带上已经读到的内容。
+                let _ = file.write_all(&buffer[..read]);
+                tail.extend_from_slice(&buffer[..read]);
+                if tail.len() > TAIL {
+                    let excess = tail.len() - TAIL;
+                    tail.drain(..excess);
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    let _ = file.flush();
+    (tail, total)
+}
+
+/// 只保留最后 50 KB，用于 stderr。
+fn read_tail(mut source: impl Read) -> Vec<u8> {
+    const TAIL: usize = 50 * 1024;
+    let mut tail: Vec<u8> = Vec::with_capacity(TAIL);
+    let mut buffer = [0u8; 8192];
+    loop {
+        match source.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => {
+                tail.extend_from_slice(&buffer[..read]);
+                if tail.len() > TAIL {
+                    let excess = tail.len() - TAIL;
+                    tail.drain(..excess);
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    tail
+}
+
+fn truncate_chars(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let mut out: String = text.chars().take(max).collect();
+    out.push('…');
+    out
 }

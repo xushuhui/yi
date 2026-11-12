@@ -196,12 +196,13 @@ impl Session {
         effort
     }
 
-    /// 重建发给模型的对话：最近一次压缩的摘要放在最前，其后只带它保留的消息。
-    pub fn messages(&self) -> Vec<Message> {
-        let mut out = Vec::new();
+    /// 重建发给模型的对话：最近一次压缩的摘要 + 它保留的消息。
+    /// 返回借用，避免每次工具步都克隆整段历史。
+    pub fn context(&self) -> Context<'_> {
+        let mut summary = None;
         let mut boundary = 0u64;
         if let Some(Entry::Compaction {
-            summary,
+            summary: text,
             first_kept_seq,
             ..
         }) = self
@@ -210,19 +211,19 @@ impl Session {
             .rev()
             .find(|entry| matches!(entry, Entry::Compaction { .. }))
         {
-            out.push(Message::User {
-                content: format!("<compaction-summary>\n{summary}\n</compaction-summary>"),
-            });
+            summary = Some(text.as_str());
             boundary = *first_kept_seq;
         }
-        for entry in &self.entries {
-            if entry.seq() > boundary
-                && let Entry::Message { message, .. } = entry
-            {
-                out.push(message.clone());
-            }
-        }
-        out
+        let messages = self
+            .entries
+            .iter()
+            .filter(|entry| entry.seq() > boundary)
+            .filter_map(|entry| match entry {
+                Entry::Message { message, .. } => Some(message),
+                _ => None,
+            })
+            .collect();
+        Context { summary, messages }
     }
 
     /// 规划一次压缩：算出要摘要的消息、保留起点、压缩前的大致用量。
@@ -468,4 +469,10 @@ pub fn estimate_message(message: &Message) -> u64 {
         Message::Image { path } => path.len(),
     };
     (bytes as u64) / 3 + 4
+}
+
+/// 一次请求要用的上下文：可选的压缩摘要，加上保留的消息（借用）。
+pub struct Context<'a> {
+    pub summary: Option<&'a str>,
+    pub messages: Vec<&'a Message>,
 }

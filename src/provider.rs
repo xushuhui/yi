@@ -54,12 +54,13 @@ impl Provider {
     pub fn stream(
         &self,
         system: &str,
-        messages: &[Message],
+        summary: Option<&str>,
+        messages: &[&Message],
         tools: &Value,
         effort: Option<&str>,
         on: &mut dyn FnMut(Event),
     ) -> Result<Reply> {
-        let body = build_body(&self.model, system, messages, tools, effort);
+        let body = build_body(&self.model, system, summary, messages, tools, effort);
         let resp = self.send_with_retry(&body)?;
         read_stream(resp, on)
     }
@@ -130,15 +131,22 @@ impl Provider {
 fn build_body(
     model: &str,
     system: &str,
-    messages: &[Message],
+    summary: Option<&str>,
+    messages: &[&Message],
     tools: &Value,
     effort: Option<&str>,
 ) -> Value {
-    let mut wire = Vec::with_capacity(messages.len() + 1);
+    let mut wire = Vec::with_capacity(messages.len() + 2);
     wire.push(json!({ "role": "system", "content": system }));
+    if let Some(summary) = summary {
+        wire.push(json!({
+            "role": "user",
+            "content": format!("<compaction-summary>\n{summary}\n</compaction-summary>"),
+        }));
+    }
 
     for message in messages {
-        match message {
+        match *message {
             Message::User { content } => {
                 wire.push(json!({ "role": "user", "content": content }));
             }

@@ -737,3 +737,83 @@ fn edit_keeps_earlier_read_lines_editable_after_shift() {
         "l1\na\nb\nL3\nl4\nl5\nl6\n"
     );
 }
+
+#[test]
+fn bash_reports_the_exit_code() {
+    let home = temp_home("exit-home");
+    let ws = temp_home("exit-ws");
+    let server = start_server(vec![
+        tool_response(&[("c1", "bash", json!({"command": "exit 3"}))]),
+        plain_response(&["ok"]),
+    ]);
+    let mut agent = open_agent(server.port, &home, &ws);
+    collect(&mut agent, "跑一个失败的命令");
+
+    assert!(
+        last_tool_output(&home).contains("退出码：3"),
+        "必须把退出码告诉模型：{}",
+        last_tool_output(&home)
+    );
+}
+
+#[test]
+fn bash_runs_in_the_given_cwd() {
+    let home = temp_home("cwd-home");
+    let ws = temp_home("cwd-ws");
+    std::fs::create_dir_all(ws.join("sub")).unwrap();
+    let server = start_server(vec![
+        tool_response(&[("c1", "bash", json!({"command": "pwd", "cwd": "sub"}))]),
+        plain_response(&["ok"]),
+    ]);
+    let mut agent = open_agent(server.port, &home, &ws);
+    collect(&mut agent, "在子目录里跑 pwd");
+
+    let output = last_tool_output(&home);
+    assert!(output.contains("/sub"), "应在指定目录执行：{output}");
+}
+
+#[test]
+fn bash_rejects_a_cwd_that_is_not_a_directory() {
+    let home = temp_home("badcwd-home");
+    let ws = temp_home("badcwd-ws");
+    let server = start_server(vec![
+        tool_response(&[("c1", "bash", json!({"command": "pwd", "cwd": "missing"}))]),
+        plain_response(&["ok"]),
+    ]);
+    let mut agent = open_agent(server.port, &home, &ws);
+    collect(&mut agent, "在不存在的目录跑");
+
+    assert!(last_tool_output(&home).starts_with("ERROR:"));
+}
+
+#[test]
+fn grep_skips_snapshots_for_huge_files() {
+    let home = temp_home("huge-home");
+    let ws = temp_home("huge-ws");
+    let mut content = String::from("first\nneedle\n");
+    content.push_str(&"x".repeat(4 * 1024 * 1024));
+    std::fs::write(ws.join("big.log"), &content).unwrap();
+    let tag = tag_of_str(&content);
+
+    let patch = format!("[big.log#{tag}]\nPUT 2.=2:\n+NEEDLE\n");
+    let server = start_server(vec![
+        tool_response(&[("c1", "grep", json!({"pattern": "needle"}))]),
+        plain_response(&["ok"]),
+        tool_response(&[("c2", "edit", json!({ "input": patch }))]),
+        plain_response(&["ok"]),
+    ]);
+    let mut agent = open_agent(server.port, &home, &ws);
+    collect(&mut agent, "搜大文件");
+    assert!(
+        last_tool_output(&home).contains("big.log:2:needle"),
+        "{}",
+        last_tool_output(&home)
+    );
+
+    collect(&mut agent, "直接改它");
+    assert!(
+        last_tool_output(&home).contains("还没被读过"),
+        "超过 4 MB 的文件不记快照，改之前必须重读：{}",
+        last_tool_output(&home)
+    );
+}

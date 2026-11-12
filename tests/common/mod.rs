@@ -135,11 +135,14 @@ pub fn tool_response(calls: &[(&str, &str, Value)]) -> String {
 }
 
 pub fn temp_home(tag: &str) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or_default();
-    let dir = std::env::temp_dir().join(format!("yi-{tag}-{nanos}"));
+    let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("yi-{tag}-{nanos}-{unique}"));
     std::fs::create_dir_all(&dir).expect("建临时目录");
     dir
 }

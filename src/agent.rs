@@ -49,11 +49,12 @@ impl Agent {
         let mut total = Usage::default();
 
         for _ in 0..=MAX_TOOL_STEPS {
-            let messages = self.session.messages();
+            let context = self.session.context();
             let started = std::time::Instant::now();
             let mut reply = self.provider.stream(
                 &self.system,
-                &messages,
+                context.summary,
+                &context.messages,
                 &definitions,
                 self.effort.as_deref(),
                 on,

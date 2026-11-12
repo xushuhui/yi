@@ -133,14 +133,16 @@ Status: ready-for-agent
 **`write { path, content }`**：建父目录、覆盖写、返回新的 `[路径#TAG]`。
 
 **`bash { command, timeout? }`**
-- 工作目录固定为项目根；默认超时 300 秒，上限 3,600 秒。
-- 返回合并后的 stdout/stderr 尾部 50 KB；完整输出写到 `<会话目录>/logs/<序号>.log` 并在结果里给出路径。stderr 单独收集后再拼接，**不**在命令串里追加 `2>&1`——那样会覆盖用户自己的重定向。
+- 工作目录默认项目根；可用 `cwd` 指定（相对项目根，必须是已存在的目录）。默认超时 300 秒，上限 3,600 秒。
+- 输出边读边写日志、内存里只留最后 50 KB（stderr 同样最多 50 KB），完整日志在 `<会话目录>/logs/<序号>.log`，结果里给出路径。stderr 单独收集后再拼接，**不**在命令串里追加 `2>&1`——那样会覆盖用户自己的重定向。
+- 结果末尾必须带 `退出码：N`；被信号终止时写“被信号终止”，不能留空。
 - 超时先向整个进程组发 TERM，300 毫秒后补 KILL，保证孙进程也退出、管道关闭（否则收集线程会一直等）。
 
 **`grep { pattern, path?, glob?, case? }`**
 - 用 `regex` 在 Rust 内匹配，遍历时跳过 `.git`、`node_modules`、`target`、`vendor`。
 - 命中行按 `相对路径:行号:内容` 返回，单文件最多 20 条、总量最多 200 条，每行截断到 512 字符。
 - 输出里的行号和文件内容同样进入快照表，可以直接拿去 `edit`；同一锚点下再次 `read`/`grep` 会把新看到的行**并入**旧记录，不是覆盖。
+- 命中文件超过 **4 MB** 时不为它记快照（读整份文件只为算锚点，代价太高）；要改这种文件，先 `read`。
 
 **`glob { pattern, path? }`**
 - 通配符相对**给定的搜索根**匹配（`path=src` 配 `*.go` 命中 `src/a.go`），跳过同上的目录，按修改时间倒序，最多 200 条。
@@ -154,6 +156,24 @@ Status: ready-for-agent
 - 中断：里程碑 ① 里 `Ctrl-C` 直接退出进程；「取消当前轮但不退出」需要信号处理，等工具进来后一起做。
 - 斜杠命令只有三个：`/new`、`/effort <auto|low|high|max>`、`/help`。
 - 多行输入第一期不做：需要时用 shell 的 heredoc 管道或后续再加。
+
+### 技能
+
+- 一个技能 = 一个装 `SKILL.md` 的目录。只扫一层，不递归。
+- 查找顺序（先找到的同名优先）：项目 `.yi/skills` → 数据目录 `skills` → 数据目录同级的 `.agents/skills`。最后一条是为了复用既有的共享技能目录，不搬动它们。
+- 系统提示词里只放 `名字：描述（正文路径）`，正文由模型需要时自己 `read`。会话开始时算一次，保证前缀稳定。
+- `disable-model-invocation: true` 的技能不进提示词，只能由用户用 `/skill:<名字> [要求]` 调用；这条命令把正文注入成一条用户消息。
+- 缺 `description` 的目录直接跳过（描述是唯一的路由依据）。frontmatter 只解析一层的 `键: 值`，带引号的值去引号。
+
+### LSP（第二期，仅 Go 与 PHP）
+
+- 只用机器上已有的服务器，**不安装新的**。实测：Go 用 `gopls`（v0.21.1，`/opt/homebrew/opt/gopath/bin/gopls`），PHP 用 `phpantom_lsp`（0.8.0，`/opt/homebrew/bin/phpantom_lsp`）；后者的 `initialize` 返回支持 definition / references / hover。
+- **不支持 TypeScript**：机器上没有独立的 TypeScript LSP；VS Code 自带的 `tsserver` 在应用包内、走私有协议，要包一层才算 LSP，属于安装新东西，不做。
+- 工具面只开三个动作：`definition`、`references`、`diagnostics`。悬停、重命名、格式化不做。
+- 懒启动：第一次调用才起进程，按项目根缓存；yi 退出时一并终止。
+- 超时：`initialize` 15 秒，单次请求 15 秒；超时以 `ERROR:` 文本返回，不卡住整轮。
+- 项目根：Go 找最近的 `go.mod`，PHP 找最近的 `composer.json`；找不到就用当前目录。
+- 诊断优先用服务器主动推送的 `publishDiagnostics`（打开文件后短暂等待），拿不到就回"没有诊断"。
 
 ### 提示词与上下文文件
 
@@ -196,7 +216,8 @@ Status: ready-for-agent
 - 记忆与自学习、任何形式的跨会话知识沉淀。
 - 多供应商、多模型、模型角色划分。
 - 子 agent、并行任务、MCP、扩展与钩子系统。
-- `web_search`、LSP、skill、`todo`——分别属于第二、三期。
+- `web_search`——属于第二期；`todo` 暂不做。
+- TypeScript 的 LSP：机器上没有独立服务器，按“不安装新 LSP”的决定不做。
 - 会话列表、分支、fork、会话树、跨项目恢复。
 - 终端里粘贴或拖拽图片（第一期只支持图片路径）。
 - 产品化相关：安装器、配置向导、遥测、自动更新、Windows 支持、多用户。
