@@ -3,6 +3,8 @@ use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use serde_json::{Value, json};
@@ -644,8 +646,25 @@ impl Tools {
             return "ERROR: 拿不到命令错误输出".to_string();
         };
         // 输出边读边写进日志，内存里只留最后 50 KB，避免大输出撑爆内存。
-        let stdout_thread = std::thread::spawn(move || stream_into_log(log_file, stdout));
-        let stderr_thread = std::thread::spawn(move || read_tail(stderr));
+        // 后台进程（`cmd &`）会一直占着管道写端，所以读线程只负责往里灌数据，
+        // 主流程用「有限等待」取快照，绝不能无限 join。
+        let stdout_tail: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        let stderr_tail: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        let stdout_total = Arc::new(AtomicU64::new(0));
+        let (done_tx, done_rx) = mpsc::channel();
+
+        let tail = Arc::clone(&stdout_tail);
+        let total = Arc::clone(&stdout_total);
+        let tx = done_tx.clone();
+        std::thread::spawn(move || {
+            stream_into_log(log_file, stdout, &tail, &total);
+            let _ = tx.send(());
+        });
+        let tail = Arc::clone(&stderr_tail);
+        std::thread::spawn(move || {
+            read_tail(stderr, &tail);
+            let _ = done_tx.send(());
+        });
 
         let deadline = Instant::now() + Duration::from_secs(timeout);
         let mut status = None;
@@ -689,8 +708,21 @@ impl Tools {
         }
         drop(child);
 
-        let (stdout_tail, stdout_total) = stdout_thread.join().unwrap_or_default();
-        let stderr_tail = stderr_thread.join().unwrap_or_default();
+        // shell 退了不代表管道关了：后台进程还拿着写端。最多再等 300 毫秒收尾巴。
+        let grace = Instant::now() + Duration::from_millis(300);
+        let mut finished = 0;
+        while finished < 2 {
+            let left = grace.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            if done_rx.recv_timeout(left).is_ok() {
+                finished += 1;
+            }
+        }
+        let stdout_tail = lock_copy(&stdout_tail);
+        let stderr_tail = lock_copy(&stderr_tail);
+        let stdout_total = stdout_total.load(Ordering::Relaxed);
         if !stderr_tail.is_empty() {
             // stderr 补进日志末尾；写失败不影响本轮的返回值。
             if let Ok(mut file) = fs::OpenOptions::new().append(true).open(&log_path) {
@@ -1249,51 +1281,57 @@ fn copy_seen(
 }
 
 /// 边读边写日志，返回（最后 50 KB，总字节数）。
-fn stream_into_log(file: fs::File, mut source: impl Read) -> (Vec<u8>, u64) {
-    const TAIL: usize = 50 * 1024;
+fn stream_into_log(
+    file: fs::File,
+    mut source: impl Read,
+    tail: &Arc<Mutex<Vec<u8>>>,
+    total: &Arc<AtomicU64>,
+) {
     let mut file = std::io::BufWriter::with_capacity(64 * 1024, file);
-    let mut tail: Vec<u8> = Vec::with_capacity(TAIL);
-    let mut total = 0u64;
     let mut buffer = [0u8; 8192];
     loop {
         match source.read(&mut buffer) {
             Ok(0) => break,
             Ok(read) => {
-                total += read as u64;
+                total.fetch_add(read as u64, Ordering::Relaxed);
                 // 日志写入失败不中断命令：返回值里仍然带上已经读到的内容。
                 let _ = file.write_all(&buffer[..read]);
-                tail.extend_from_slice(&buffer[..read]);
-                if tail.len() > TAIL {
-                    let excess = tail.len() - TAIL;
-                    tail.drain(..excess);
-                }
+                push_tail(tail, &buffer[..read]);
             }
             Err(_) => break,
         }
     }
     let _ = file.flush();
-    (tail, total)
+}
+
+/// 往「只留最后 50 KB」的共享缓冲里追加。
+fn push_tail(tail: &Arc<Mutex<Vec<u8>>>, data: &[u8]) {
+    const TAIL: usize = 50 * 1024;
+    let Ok(mut guard) = tail.lock() else {
+        return;
+    };
+    guard.extend_from_slice(data);
+    if guard.len() > TAIL {
+        let excess = guard.len() - TAIL;
+        guard.drain(..excess);
+    }
+}
+
+/// 取共享缓冲的快照；锁中毒时给空值，崩溃路径上不 panic。
+fn lock_copy(tail: &Arc<Mutex<Vec<u8>>>) -> Vec<u8> {
+    tail.lock().map(|guard| guard.clone()).unwrap_or_default()
 }
 
 /// 只保留最后 50 KB，用于 stderr。
-fn read_tail(mut source: impl Read) -> Vec<u8> {
-    const TAIL: usize = 50 * 1024;
-    let mut tail: Vec<u8> = Vec::with_capacity(TAIL);
+fn read_tail(mut source: impl Read, tail: &Arc<Mutex<Vec<u8>>>) {
     let mut buffer = [0u8; 8192];
     loop {
         match source.read(&mut buffer) {
             Ok(0) => break,
-            Ok(read) => {
-                tail.extend_from_slice(&buffer[..read]);
-                if tail.len() > TAIL {
-                    let excess = tail.len() - TAIL;
-                    tail.drain(..excess);
-                }
-            }
+            Ok(read) => push_tail(tail, &buffer[..read]),
             Err(_) => break,
         }
     }
-    tail
 }
 
 fn truncate_chars(text: &str, max: usize) -> String {
@@ -1354,6 +1392,22 @@ mod tests {
         assert_eq!(tools.strip_redundant_cd(&quoted), "ls");
         // 别的目录、或者只是长得像，都不能动。
         assert_eq!(tools.strip_redundant_cd("cd /tmp && ls"), "cd /tmp && ls");
+    }
+
+    #[test]
+    fn a_background_process_does_not_hang_the_bash_tool() {
+        let root = std::env::temp_dir().join("yi-bg-hang");
+        std::fs::create_dir_all(&root).expect("建目录");
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut tools = tools(&root);
+            let out = tools.bash(&json!({ "command": "sleep 30 & echo ok" }));
+            let _ = tx.send(out);
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(3)) {
+            Ok(out) => assert!(out.contains("ok"), "{out}"),
+            Err(_) => panic!("后台进程占着管道，bash 工具卡住了"),
+        }
     }
 
     #[test]
