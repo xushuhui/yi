@@ -102,6 +102,7 @@ func main() { ... }
 
 - 在项目根启动 → 一条会话；在它的子目录启动 → **另一条**会话。
 - 进程崩溃（panic）时，崩溃原因和代码位置会作为一条 `notice` 写进会话文件，事后直接 grep 就能看到。
+- 中断或崩溃留下的半截工具调用会自动修：尾巴上的补一条「没有执行」，中间的整条回合丢弃，不会让下一次请求被供应商以 400 拒绝。
 - 会话文件固定在 `~/.yi/sessions/<目录编码>/session.jsonl`，一条会话就是这一个文件，追加写、不分叉。
 - `yi` 永远续写同一个文件，所以不需要"结束会话"。想从头开始就 `/new`，旧文件会改名归档。
 
@@ -181,5 +182,6 @@ cargo fmt
 - `src/tools.rs` 是七个工具的实现；`src/lsp.rs` 是语言服务器客户端。
 - `src/session.rs` 负责 JSONL 会话文件的追加与重建。
 - 第一期规格与验收用例在 [.scratch/yi-phase-1/spec.md](.scratch/yi-phase-1/spec.md)。
+- 当初为什么这么设计、开发中踩过哪些坑，见 [docs/dev-notes.md](docs/dev-notes.md)。
 
 LSP 的集成测试需要本机装了 `gopls` / `phpantom_lsp`；缺哪个就打印 `SKIP` 并返回，不算失败。

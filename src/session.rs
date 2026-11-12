@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -235,7 +236,7 @@ impl Session {
             summary = Some(text.as_str());
             boundary = *first_kept_seq;
         }
-        let messages = self
+        let messages: Vec<&Message> = self
             .entries
             .iter()
             .filter(|entry| entry.seq() > boundary)
@@ -244,7 +245,45 @@ impl Session {
                 _ => None,
             })
             .collect();
-        Context { summary, messages }
+
+        // 供应商要求：带 tool_calls 的助手消息后面必须跟着每个 id 的工具结果。
+        // 中断留下的半截消息（以及它那几条孤立的工具结果）整条丢掉，
+        // 否则下一次请求会直接 400。
+        let mut cleaned = Vec::with_capacity(messages.len());
+        let mut index = 0;
+        while index < messages.len() {
+            if let Message::Assistant { tool_calls, .. } = messages[index]
+                && !tool_calls.is_empty()
+            {
+                let mut answered: HashSet<&str> = HashSet::new();
+                let mut look = index + 1;
+                while look < messages.len() {
+                    if let Message::Tool { tool_call_id, .. } = messages[look] {
+                        answered.insert(tool_call_id.as_str());
+                        look += 1;
+                    } else {
+                        break;
+                    }
+                }
+                if tool_calls
+                    .iter()
+                    .all(|call| answered.contains(call.id.as_str()))
+                {
+                    cleaned.push(messages[index]);
+                } else {
+                    index = look;
+                    continue;
+                }
+                index += 1;
+                continue;
+            }
+            cleaned.push(messages[index]);
+            index += 1;
+        }
+        Context {
+            summary,
+            messages: cleaned,
+        }
     }
 
     /// 规划一次压缩：算出要摘要的消息、保留起点、压缩前的大致用量。
@@ -477,6 +516,41 @@ impl Session {
         Ok(())
     }
 
+    /// 修掉「有 tool_calls、却没有对应工具结果」的尾巴。
+    /// 中断或崩溃会留下这种半截记录，原样发给供应商会被 400 拒绝。
+    pub fn repair_interrupted(&mut self) -> Result<()> {
+        // 只修尾巴：最后一条带 tool_calls 的助手消息后面如果直接是工具结果，
+        // 缺的那几条可以在末尾补上（顺序仍然合法）。中途断开的交给 context() 丢弃。
+        let mut answered: HashSet<String> = HashSet::new();
+        let mut missing: Vec<String> = Vec::new();
+        for entry in self.entries.iter().rev() {
+            let Entry::Message { message, .. } = entry else {
+                continue;
+            };
+            match message {
+                Message::Tool { tool_call_id, .. } => {
+                    answered.insert(tool_call_id.clone());
+                }
+                Message::Assistant { tool_calls, .. } if !tool_calls.is_empty() => {
+                    missing = tool_calls
+                        .iter()
+                        .filter(|call| !answered.contains(&call.id))
+                        .map(|call| call.id.clone())
+                        .collect();
+                    break;
+                }
+                _ => break,
+            }
+        }
+        for id in missing {
+            self.append_tool_result(
+                &id,
+                "ERROR: 上一轮被中断，这个工具调用没有执行。".to_string(),
+            )?;
+        }
+        Ok(())
+    }
+
     /// 当前最后一条记录的序号，交给崩溃钩子接续。
     pub fn last_seq(&self) -> u64 {
         self.next_seq.saturating_sub(1)
@@ -553,4 +627,86 @@ pub fn estimate_message(message: &Message) -> u64 {
 pub struct Context<'a> {
     pub summary: Option<&'a str>,
     pub messages: Vec<&'a Message>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_session(tag: &str) -> Session {
+        let dir = std::env::temp_dir().join(format!("yi-session-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("建目录");
+        Session::open(&dir.join("session.jsonl"), "/tmp/proj", "m", "auto").expect("开会话")
+    }
+
+    fn call(id: &str) -> ToolCall {
+        ToolCall {
+            id: id.to_string(),
+            name: "read".to_string(),
+            arguments: "{}".to_string(),
+        }
+    }
+
+    fn answered(ctx: &Context<'_>) -> Vec<String> {
+        ctx.messages
+            .iter()
+            .filter_map(|message| match message {
+                Message::Tool { tool_call_id, .. } => Some(tool_call_id.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn repair_appends_results_for_unanswered_calls() {
+        let mut session = temp_session("repair");
+        session
+            .append_assistant("".into(), None, vec![call("a"), call("b")], Usage::default())
+            .expect("助手");
+        session.append_tool_result("a", "ok".into()).expect("工具结果");
+
+        session.repair_interrupted().expect("修复");
+
+        assert_eq!(answered(&session.context()), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn repair_leaves_a_mid_history_gap_to_the_context_filter() {
+        let mut session = temp_session("midway");
+        session
+            .append_assistant("".into(), None, vec![call("a")], Usage::default())
+            .expect("助手");
+        session.append_user("后来的一句").expect("用户");
+
+        session.repair_interrupted().expect("修复");
+
+        let ctx = session.context();
+        assert_eq!(ctx.messages.len(), 1, "中途的缺口不补，交给过滤");
+        assert!(matches!(ctx.messages[0], Message::User { .. }));
+    }
+
+    #[test]
+    fn context_drops_an_assistant_turn_that_is_missing_tool_results() {
+        let mut session = temp_session("drop");
+        session.append_user("第一句").expect("用户");
+        session
+            .append_assistant("".into(), None, vec![call("a"), call("b")], Usage::default())
+            .expect("助手");
+        session.append_tool_result("a", "ok".into()).expect("半截结果");
+        session.append_user("第二句").expect("用户");
+
+        let ctx = session.context();
+        assert!(
+            !ctx.messages
+                .iter()
+                .any(|message| matches!(message, Message::Assistant { .. })),
+            "半截助手消息必须丢掉"
+        );
+        assert!(
+            answered(&ctx).is_empty(),
+            "孤立的工具结果也要丢掉"
+        );
+        assert_eq!(ctx.messages.len(), 2, "只留两句用户消息");
+    }
 }

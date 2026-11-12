@@ -30,6 +30,9 @@ impl Agent {
             &cfg.model,
             cfg.effort.as_deref().unwrap_or("auto"),
         )?;
+        let mut session = session;
+        // 上次被中断可能留下没配对的工具调用，先补平再发请求。
+        session.repair_interrupted()?;
         // panic 时会话文件要靠这两个信息才能接一条 notice。
         crate::crash::install(session_path, session.last_seq());
         let effort = session.current_effort().or(cfg.effort.clone());
@@ -129,17 +132,24 @@ impl Agent {
                 return Ok(total);
             }
 
-            for call in reply.tool_calls {
+            for (index, call) in reply.tool_calls.iter().enumerate() {
                 if crate::cancel::requested() {
+                    // 这一批里还没跑的调用要补上结果，否则下次请求会被供应商拒绝。
+                    for skipped in &reply.tool_calls[index..] {
+                        self.session.append_tool_result(
+                            &skipped.id,
+                            "ERROR: 这一轮被 Ctrl-C 取消，这个工具调用没有执行。".to_string(),
+                        )?;
+                    }
                     return Err(crate::Error::Cancelled);
                 }
                 on(Event::ToolCall {
                     name: call.name.clone(),
-                    summary: self.tools.describe(&call),
+                    summary: self.tools.describe(call),
                 });
                 let signature = (call.name.clone(), call.arguments.clone());
-                last_summary = self.tools.describe(&call);
-                match self.tools.execute(&call) {
+                last_summary = self.tools.describe(call);
+                match self.tools.execute(call) {
                     Outcome::Text(text) => {
                         let failed = Self::looks_failed(&text);
                         if failed && last_call.as_ref() == Some(&signature) {
