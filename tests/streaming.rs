@@ -264,3 +264,113 @@ fn event_stream_handles_empty_deltas() {
     let (text, _, _) = collect(&mut agent, "hi");
     assert!(text.is_empty());
 }
+
+#[test]
+fn a_failed_turn_is_also_written_to_the_session_file() {
+    let bad = "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"error\":{\"message\":\"bad request\"}}".to_string();
+    let server = start_server(vec![bad]);
+    let home = temp_home("err-home");
+    let mut agent = Agent::new(
+        &config(server.port, &home, None),
+        "/tmp/proj",
+        &session_path(&home),
+    )
+    .expect("打开会话");
+
+    let result = agent.submit("hi", &mut |_| {});
+    assert!(result.is_err(), "400 应当让这一轮失败");
+
+    let entries = session_entries(&home);
+    let last = entries.last().expect("至少有一条");
+    assert_eq!(last["type"], "notice", "失败原因要落盘：{entries:?}");
+    let text = last["text"].as_str().unwrap_or("");
+    assert!(text.contains("这一轮失败"), "{text}");
+    assert!(text.contains("400"), "错误文本要带上状态码：{text}");
+}
+
+#[test]
+fn repeated_failures_end_with_a_summary_instead_of_a_truncated_turn() {
+    let failing = || tool_response(&[("c1", "read", serde_json::json!({"path": "missing.txt"}))]);
+    let server = start_server(vec![
+        failing(),
+        failing(),
+        failing(),
+        plain_response(&["收尾总结"]),
+    ]);
+    let home = temp_home("repeat-home");
+    let mut agent = Agent::new(
+        &config(server.port, &home, None),
+        "/tmp/proj",
+        &session_path(&home),
+    )
+    .expect("打开会话");
+
+    let (text, _, tools) = collect(&mut agent, "一直读不存在的文件");
+    assert_eq!(text, "收尾总结");
+    assert_eq!(tools.len(), 3, "同一个失败调用第三次就停");
+
+    let bodies = server.bodies.lock();
+    let last_request = bodies.last().expect("有请求");
+    assert!(
+        last_request.get("tools").is_none(),
+        "收尾那次不能带工具：{last_request}"
+    );
+
+    let entries = session_entries(&home);
+    let notice = entries
+        .iter()
+        .rev()
+        .find(|entry| entry["type"] == "notice")
+        .expect("要有停止提示");
+    assert!(
+        notice["text"].as_str().unwrap_or("").contains("连续失败"),
+        "{notice}"
+    );
+    let last = entries.last().expect("至少有一条");
+    assert_eq!(last["message"]["role"], "assistant", "最后一条是收尾回答");
+    assert_eq!(last["message"]["content"], "收尾总结");
+}
+
+#[test]
+fn a_command_that_keeps_failing_counts_as_a_failure() {
+    let failing = || tool_response(&[("c1", "bash", serde_json::json!({"command": "exit 7"}))]);
+    let server = start_server(vec![
+        failing(),
+        failing(),
+        failing(),
+        plain_response(&["卡住了"]),
+    ]);
+    let home = temp_home("bash-fail-home");
+    let mut agent = Agent::new(
+        &config(server.port, &home, None),
+        "/tmp/proj",
+        &session_path(&home),
+    )
+    .expect("打开会话");
+
+    let (text, _, tools) = collect(&mut agent, "反复执行失败命令");
+    assert_eq!(text, "卡住了");
+    assert_eq!(tools.len(), 3, "非零退出码也要算失败");
+}
+
+#[test]
+fn a_failure_followed_by_different_calls_does_not_stop_the_turn() {
+    let missing = tool_response(&[("c1", "read", serde_json::json!({"path": "missing.txt"}))]);
+    let server = start_server(vec![
+        missing.clone(),
+        missing.clone(),
+        tool_response(&[("c2", "bash", serde_json::json!({"command": "true"}))]),
+        plain_response(&["继续做完了"]),
+    ]);
+    let home = temp_home("repeat-ok-home");
+    let mut agent = Agent::new(
+        &config(server.port, &home, None),
+        "/tmp/proj",
+        &session_path(&home),
+    )
+    .expect("打开会话");
+
+    let (text, _, tools) = collect(&mut agent, "先失败两次再换个办法");
+    assert_eq!(text, "继续做完了");
+    assert_eq!(tools.len(), 3, "换调用就重新计数，不该被拦");
+}

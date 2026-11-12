@@ -98,6 +98,18 @@ pub enum Entry {
         #[serde(rename = "tokensBefore")]
         tokens_before: u64,
     },
+    /// 用户敲进终端的原文（技能展开前的样子），只用来做上键历史。
+    Prompt {
+        seq: u64,
+        timestamp: u64,
+        text: String,
+    },
+    /// 运行时事件（失败原因、请求次数上限）：只给人看，不进入模型上下文。
+    Notice {
+        seq: u64,
+        timestamp: u64,
+        text: String,
+    },
 }
 
 impl Entry {
@@ -105,10 +117,15 @@ impl Entry {
         match self {
             Entry::Message { seq, .. }
             | Entry::EffortChange { seq, .. }
-            | Entry::Compaction { seq, .. } => *seq,
+            | Entry::Compaction { seq, .. }
+            | Entry::Prompt { seq, .. }
+            | Entry::Notice { seq, .. } => *seq,
         }
     }
 }
+
+/// 上键能翻多少条历史。
+pub const HISTORY_LIMIT: usize = 200;
 
 /// 一条会话 = 一个追加写的 JSONL 文件 + 进程持有的排他锁。
 pub struct Session {
@@ -371,6 +388,40 @@ impl Session {
             seq: self.next_seq,
             timestamp: now_ms(),
             effort: effort.to_string(),
+        })
+    }
+
+    /// 记下用户敲的原文：技能展开后原文就没了，历史要靠它。
+    pub fn append_prompt(&mut self, text: &str) -> Result<()> {
+        self.append(Entry::Prompt {
+            seq: self.next_seq,
+            timestamp: now_ms(),
+            text: text.to_string(),
+        })
+    }
+
+    /// 最近 [`HISTORY_LIMIT`] 条用户原文，按时间顺序返回；连续重复只留一条。
+    pub fn prompts(&self) -> Vec<String> {
+        let mut kept: Vec<String> = Vec::new();
+        for entry in &self.entries {
+            let Entry::Prompt { text, .. } = entry else {
+                continue;
+            };
+            if kept.last() == Some(text) {
+                continue;
+            }
+            kept.push(text.clone());
+        }
+        let start = kept.len().saturating_sub(HISTORY_LIMIT);
+        kept.split_off(start)
+    }
+
+    /// 记一条只给人看的事件；不参与上下文重建，压缩也不会把它带走。
+    pub fn append_notice(&mut self, text: &str) -> Result<()> {
+        self.append(Entry::Notice {
+            seq: self.next_seq,
+            timestamp: now_ms(),
+            text: text.to_string(),
         })
     }
 

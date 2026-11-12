@@ -102,11 +102,15 @@ impl Tools {
                 "type": "function",
                 "function": {
                     "name": "bash",
-                    "description": "在项目根执行 shell 命令，返回合并后的输出尾部。",
+                    "description": "执行 shell 命令，返回合并后的输出尾部。命令默认已在项目根，不要在开头写 cd；要去子目录或别处就设 cwd。",
                     "parameters": {
                         "type": "object",
                         "properties": {
                             "command": { "type": "string" },
+                            "cwd": {
+                                "type": "string",
+                                "description": "在哪个目录执行；相对路径按项目根解析，绝对路径原样使用；默认项目根"
+                            },
                             "timeout": { "type": "integer", "description": "秒，默认 300" }
                         },
                         "required": ["command"]

@@ -1,9 +1,9 @@
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 
 use yi::agent::Agent;
 use yi::config::{self, CONTEXT_WINDOW, Config};
 use yi::provider::Event;
-use yi::session::Usage;
+use yi::session::{HISTORY_LIMIT, Usage};
 use yi::{Error, Result};
 
 fn main() {
@@ -40,23 +40,18 @@ fn run() -> Result<()> {
         .join(config::encode_project(&cwd))
         .join("session.jsonl");
     let mut agent = Agent::new(&cfg, &cwd, &session_path)?;
+    let mut editor = make_editor(&agent)?;
 
     println!("yi · {} · {cwd}", cfg.model);
     println!("会话：{}", session_path.display());
     println!("输入 /help 查看命令，Ctrl-D 退出。\n");
 
-    loop {
-        print!("> ");
-        io::stdout().flush()?;
-
-        let mut line = String::new();
-        if io::stdin().read_line(&mut line)? == 0 {
-            break;
-        }
+    while let Some(line) = read_input(&mut editor)? {
         let prompt = line.trim();
         if prompt.is_empty() {
             continue;
         }
+        agent.note_prompt(prompt)?;
         let message = if let Some(rest) = prompt.strip_prefix("/skill:") {
             match yi::skills::expand(rest, &cfg.home, std::path::Path::new(&cwd)) {
                 Ok(text) => text,
@@ -113,6 +108,51 @@ fn run() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// 真终端才接管按键；管道输入保持逐行读取，脚本和冒烟测试都靠它。
+fn make_editor(agent: &Agent) -> Result<Option<rustyline::DefaultEditor>> {
+    if !io::stdin().is_terminal() {
+        return Ok(None);
+    }
+    let builder = rustyline::Config::builder()
+        .max_history_size(HISTORY_LIMIT)
+        .and_then(|builder| builder.history_ignore_dups(true))
+        .map_err(|err| Error::Config(format!("配置输入行失败：{err}")))?;
+    let config = builder.auto_add_history(true).build();
+    let mut editor = rustyline::DefaultEditor::with_config(config)
+        .map_err(|err| Error::Config(format!("初始化输入行失败：{err}")))?;
+    for line in agent.prompt_history() {
+        // 历史只用来召回：某一条加不进去不影响输入。
+        let _ = editor.add_history_entry(line);
+    }
+    Ok(Some(editor))
+}
+
+/// 读一行输入；返回 `None` 表示该退出了（Ctrl-D 或标准输入结束）。
+fn read_input(editor: &mut Option<rustyline::DefaultEditor>) -> Result<Option<String>> {
+    let Some(editor) = editor else {
+        print!("> ");
+        io::stdout().flush()?;
+        let mut line = String::new();
+        if io::stdin().read_line(&mut line)? == 0 {
+            return Ok(None);
+        }
+        return Ok(Some(line));
+    };
+    match editor.readline("> ") {
+        Ok(line) => Ok(Some(line)),
+        // Ctrl-C 只放弃这一行；rustyline 不给出缓冲区内容，所以无法区分空行。
+        Err(rustyline::error::ReadlineError::Interrupted) => {
+            println!();
+            Ok(Some(String::new()))
+        }
+        Err(rustyline::error::ReadlineError::Eof) => {
+            println!();
+            Ok(None)
+        }
+        Err(err) => Err(Error::Config(format!("读输入失败：{err}"))),
+    }
 }
 
 fn handle_command(line: &str, agent: &mut Agent) {
