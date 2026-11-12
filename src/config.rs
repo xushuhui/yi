@@ -90,6 +90,11 @@ impl Config {
             std::path::Path::new(cwd).join("AGENTS.md").as_path(),
         );
 
+        // 技能只列名字和描述，正文按需读取；会话开始时算一次，保证前缀稳定。
+        let discovered =
+            crate::skills::discover(&crate::skills::roots(&self.home, std::path::Path::new(cwd)));
+        out.push_str(&crate::skills::render(&discovered));
+
         out
     }
 }

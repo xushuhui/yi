@@ -57,13 +57,23 @@ fn run() -> Result<()> {
         if prompt.is_empty() {
             continue;
         }
-        if prompt.starts_with('/') {
+        let message = if let Some(rest) = prompt.strip_prefix("/skill:") {
+            match yi::skills::expand(rest, &cfg.home, std::path::Path::new(&cwd)) {
+                Ok(text) => text,
+                Err(err) => {
+                    println!("{err}\n");
+                    continue;
+                }
+            }
+        } else if prompt.starts_with('/') {
             handle_command(prompt, &mut agent);
             continue;
-        }
+        } else {
+            prompt.to_string()
+        };
 
         let mut thinking_shown = false;
-        let result = agent.submit(prompt, &mut |event| match event {
+        let result = agent.submit(&message, &mut |event| match event {
             Event::Text(text) => {
                 print!("{text}");
                 let _ = io::stdout().flush();
@@ -142,6 +152,7 @@ fn print_help() {
 斜杠命令：
   /new                      归档当前会话，开始新的一条
   /effort <档位>            设置推理强度：auto / low / high / max
+  /skill:<名字> [要求]      把某个技能的正文注入这一轮
   /help                     显示这份帮助
 
 环境变量：

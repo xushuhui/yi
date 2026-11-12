@@ -44,6 +44,10 @@ _Avoid_: 思考等级, thinking level, 思考预算
 供应商前缀缓存直接复用的输入 token，计费是未命中部分的五十分之一。
 _Avoid_: 命中率（除非同时给出分子分母）, cache read
 
+**技能**：
+一个装 `SKILL.md` 的目录，描述放在 frontmatter 里；系统提示词只列名字和描述，正文按需读取。
+_Avoid_: skill 包, 插件, 扩展
+
 **归档**：
 把当前 `session.jsonl` 改名成带时间戳的文件、再从空白开始的动作，由 `/new` 触发，不删除任何内容。
 _Avoid_: 结束会话, 关闭, 清理
