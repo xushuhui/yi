@@ -670,7 +670,7 @@ impl Tools {
         let mut status = None;
         let mut timed_out = false;
         loop {
-            if crate::cancel::requested() {
+            if crate::cancel::check() {
                 // 用户要中断：按进程组杀，避免只杀掉 sh 留下子进程。
                 let _ = Command::new("kill")
                     .arg("-TERM")

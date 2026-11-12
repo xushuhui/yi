@@ -662,9 +662,16 @@ mod tests {
     fn repair_appends_results_for_unanswered_calls() {
         let mut session = temp_session("repair");
         session
-            .append_assistant("".into(), None, vec![call("a"), call("b")], Usage::default())
+            .append_assistant(
+                "".into(),
+                None,
+                vec![call("a"), call("b")],
+                Usage::default(),
+            )
             .expect("助手");
-        session.append_tool_result("a", "ok".into()).expect("工具结果");
+        session
+            .append_tool_result("a", "ok".into())
+            .expect("工具结果");
 
         session.repair_interrupted().expect("修复");
 
@@ -691,9 +698,16 @@ mod tests {
         let mut session = temp_session("drop");
         session.append_user("第一句").expect("用户");
         session
-            .append_assistant("".into(), None, vec![call("a"), call("b")], Usage::default())
+            .append_assistant(
+                "".into(),
+                None,
+                vec![call("a"), call("b")],
+                Usage::default(),
+            )
             .expect("助手");
-        session.append_tool_result("a", "ok".into()).expect("半截结果");
+        session
+            .append_tool_result("a", "ok".into())
+            .expect("半截结果");
         session.append_user("第二句").expect("用户");
 
         let ctx = session.context();
@@ -703,10 +717,7 @@ mod tests {
                 .any(|message| matches!(message, Message::Assistant { .. })),
             "半截助手消息必须丢掉"
         );
-        assert!(
-            answered(&ctx).is_empty(),
-            "孤立的工具结果也要丢掉"
-        );
+        assert!(answered(&ctx).is_empty(), "孤立的工具结果也要丢掉");
         assert_eq!(ctx.messages.len(), 2, "只留两句用户消息");
     }
 }

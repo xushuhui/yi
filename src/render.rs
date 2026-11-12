@@ -118,7 +118,11 @@ impl Renderer {
 
         // 标题：去掉井号，前两级上色。
         if let Some((level, text)) = heading(trimmed) {
-            let style = if level <= 2 { format!("{BOLD}{CYAN}") } else { BOLD.to_string() };
+            let style = if level <= 2 {
+                format!("{BOLD}{CYAN}")
+            } else {
+                BOLD.to_string()
+            };
             return Some(format!("{style}{}{RESET}", inline(text, self.color)));
         }
         // 分隔线：整行调暗。
@@ -136,11 +140,17 @@ impl Renderer {
         }
         // 列表：项目符号换成圆点。
         if let Some((indent, rest)) = bullet(line) {
-            return Some(format!("{indent}{CYAN}•{RESET} {}", inline(rest, self.color)));
+            return Some(format!(
+                "{indent}{CYAN}•{RESET} {}",
+                inline(rest, self.color)
+            ));
         }
         // 有序列表：序号上色，内容照常。
         if let Some((indent, marker, rest)) = ordered(line) {
-            return Some(format!("{indent}{CYAN}{marker}{RESET} {}", inline(rest, self.color)));
+            return Some(format!(
+                "{indent}{CYAN}{marker}{RESET} {}",
+                inline(rest, self.color)
+            ));
         }
         Some(inline(line, self.color))
     }
@@ -164,7 +174,9 @@ impl Renderer {
 
 /// 三个反引号或三个波浪线开头，返回围栏后面的语言名。
 fn fence(line: &str) -> Option<&str> {
-    let rest = line.strip_prefix("```").or_else(|| line.strip_prefix("~~~"))?;
+    let rest = line
+        .strip_prefix("```")
+        .or_else(|| line.strip_prefix("~~~"))?;
     Some(rest.trim())
 }
 
@@ -191,9 +203,7 @@ fn is_rule(line: &str) -> bool {
 fn is_table_rule(line: &str) -> bool {
     line.starts_with('|')
         && line.chars().any(|c| c == '-')
-        && line
-            .chars()
-            .all(|c| matches!(c, '|' | '-' | ':' | ' '))
+        && line.chars().all(|c| matches!(c, '|' | '-' | ':' | ' '))
 }
 
 /// `- 内容` / `* 内容` / `+ 内容`，返回缩进和内容。
@@ -219,7 +229,11 @@ fn ordered(line: &str) -> Option<(&str, &str, &str)> {
         return None;
     }
     let after = &rest[digits..];
-    let marker_end = if after.starts_with('.') || after.starts_with(')') { 1 } else { 0 };
+    let marker_end = if after.starts_with('.') || after.starts_with(')') {
+        1
+    } else {
+        0
+    };
     if marker_end == 0 {
         return None;
     }
@@ -654,7 +668,10 @@ mod tests {
         assert!(out.contains(&format!("{GREEN_BRIGHT}git{RESET}")), "{out}");
         assert!(out.contains(&format!("{CYAN}--short{RESET}")), "{out}");
         assert!(out.contains(&format!("{YELLOW}\"done\"{RESET}")), "{out}");
-        assert!(out.contains(&format!("{GREEN_BRIGHT}echo{RESET}")), "分号后是新命令：{out}");
+        assert!(
+            out.contains(&format!("{GREEN_BRIGHT}echo{RESET}")),
+            "分号后是新命令：{out}"
+        );
         assert!(out.contains(&format!("{DIM};{RESET}")), "{out}");
         // 关闭颜色时原样返回。
         assert_eq!(shell_line("git status", false), "git status");

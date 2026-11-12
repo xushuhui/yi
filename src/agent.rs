@@ -52,7 +52,7 @@ impl Agent {
         })
     }
 
-/// 工具结果算不算失败：显式的 `ERROR`，或 bash 的非零退出码。
+    /// 工具结果算不算失败：显式的 `ERROR`，或 bash 的非零退出码。
     /// 只看末尾的退出码行，避免命令输出里恰好出现「退出码：」被误判。
     fn looks_failed(text: &str) -> bool {
         if text.starts_with("ERROR") {

@@ -27,7 +27,46 @@ extern "C" fn handler(_signal: libc::c_int) {
     CANCELLED.store(true, Ordering::Relaxed);
 }
 
+/// 检查是否该中断：先看信号标志，再尝试从终端读一个字节。
+///
+/// 行编辑器会把终端留在 raw 模式，这时 Ctrl-C 不产生信号，只是字节 0x03。
+/// 流式输出期间没有别的读者，直接把这类字节当成取消请求；其他字节按「打字残留」
+/// 丢弃——这一轮结束前它们本来也不会被任何人消费。
+pub fn check() -> bool {
+    poll_terminal();
+    requested()
+}
+
+fn poll_terminal() {
+    unsafe {
+        if libc::isatty(libc::STDIN_FILENO) != 1 {
+            return;
+        }
+        let mut fd = libc::pollfd {
+            fd: libc::STDIN_FILENO,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        if libc::poll(&mut fd, 1, 0) <= 0 {
+            return;
+        }
+        let mut byte: u8 = 0;
+        if libc::read(
+            libc::STDIN_FILENO,
+            (&mut byte as *mut u8).cast(),
+            1,
+        ) == 1
+            && byte == 0x03
+        {
+            request();
+        }
+    }
+}
+
 /// 接管 SIGINT：置位标志，不打断系统调用（`SA_RESTART` 不设，让阻塞读能返回）。
+///
+/// 终端把 ISIG 打开时，Ctrl-C 走这里；关着时（行编辑器留下的 raw 模式）
+/// 走 [`check`] 里的字节路径。两条路同一个标志。
 pub fn arm() {
     let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
     action.sa_sigaction = handler as *const () as libc::sighandler_t;
@@ -38,7 +77,7 @@ pub fn arm() {
     }
 }
 
-/// 恢复默认处理：读输入时按 Ctrl-C 由行编辑器负责。
+/// 恢复默认处理与终端设置：读输入时按 Ctrl-C 仍交给行编辑器自己处理。
 pub fn disarm() {
     unsafe {
         libc::signal(libc::SIGINT, libc::SIG_DFL);

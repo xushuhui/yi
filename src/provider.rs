@@ -6,6 +6,8 @@ use serde_json::{Value, json};
 
 use crate::config::Config;
 use crate::session::{Message, ToolCall, Usage};
+use std::sync::mpsc::{self, RecvTimeoutError};
+
 use crate::{Error, Result};
 
 /// 流式过程中对外抛出的增量事件。
@@ -67,8 +69,41 @@ impl Provider {
         on: &mut dyn FnMut(Event),
     ) -> Result<Reply> {
         let body = build_body(&self.model, system, summary, messages, tools, effort);
-        let resp = self.send_with_retry(&body)?;
-        read_stream(resp, on)
+        if crate::cancel::requested() {
+            return Err(Error::Cancelled);
+        }
+
+        // 请求和读响应都在工作线程里：等响应头、等正文都可能持续几十秒，
+        // 主线程每 100 毫秒轮询一次取消标志，模型「思考中」也能立刻停下。
+        let agent = self.agent.clone();
+        let url = self.url.clone();
+        let api_key = self.api_key.clone();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let result = send_with_retry(&agent, &url, &api_key, &body)
+                .and_then(|resp| read_stream(resp, &tx));
+            let item = match result {
+                Ok(reply) => StreamItem::Done(reply),
+                Err(err) => StreamItem::Failed(err),
+            };
+            let _ = tx.send(item);
+        });
+
+        loop {
+            if crate::cancel::check() {
+                return Err(Error::Cancelled);
+            }
+            match rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(StreamItem::Event(event)) => on(event),
+                Ok(StreamItem::Done(reply)) => return Ok(reply),
+                Ok(StreamItem::Failed(err)) => return Err(err),
+                Err(RecvTimeoutError::Timeout) => continue,
+                // 读线程没了却没给结果，只可能是它自己 panic 了。
+                Err(RecvTimeoutError::Disconnected) => {
+                    return Err(Error::Http("流式响应中断".to_string()));
+                }
+            }
+        }
     }
 
     /// 非流式的一次性补全，只用于生成压缩摘要。
@@ -81,7 +116,7 @@ impl Provider {
             ],
             "stream": false,
         });
-        let resp = self.send_with_retry(&body)?;
+        let resp = send_with_retry(&self.agent, &self.url, &self.api_key, &body)?;
         let text = resp
             .into_body()
             .read_to_string()
@@ -92,46 +127,49 @@ impl Provider {
             .map(str::to_string)
             .ok_or_else(|| Error::Api(format!("压缩请求没有返回内容：{}", truncate(&text, 300))))
     }
+}
 
-    /// 连接失败、5xx、429 退避重试三次；其余状态立即报错。
-    fn send_with_retry(&self, body: &Value) -> Result<ureq::http::Response<ureq::Body>> {
-        let delays = [1u64, 2, 4];
-        for attempt in 0..=delays.len() {
-            let sent = self
-                .agent
-                .post(&self.url)
-                .header("Authorization", &format!("Bearer {}", self.api_key))
-                .header("Content-Type", "application/json")
-                .send_json(body);
+fn send_with_retry(
+    agent: &ureq::Agent,
+    url: &str,
+    api_key: &str,
+    body: &Value,
+) -> Result<ureq::http::Response<ureq::Body>> {
+    let delays = [1u64, 2, 4];
+    for attempt in 0..=delays.len() {
+        let sent = agent
+            .post(url)
+            .header("Authorization", &format!("Bearer {api_key}"))
+            .header("Content-Type", "application/json")
+            .send_json(body);
 
-            match sent {
-                Ok(resp) => {
-                    let code = resp.status().as_u16();
-                    if (200..300).contains(&code) {
-                        return Ok(resp);
-                    }
-                    let text = resp
-                        .into_body()
-                        .read_to_string()
-                        .unwrap_or_else(|_| String::new());
-                    let retryable = code == 429 || (500..600).contains(&code);
-                    if retryable && attempt < delays.len() {
-                        std::thread::sleep(Duration::from_secs(delays[attempt]));
-                        continue;
-                    }
-                    return Err(Error::Api(format!("HTTP {code}：{}", truncate(&text, 800))));
+        match sent {
+            Ok(resp) => {
+                let code = resp.status().as_u16();
+                if (200..300).contains(&code) {
+                    return Ok(resp);
                 }
-                Err(e) => {
-                    if attempt < delays.len() {
-                        std::thread::sleep(Duration::from_secs(delays[attempt]));
-                        continue;
-                    }
-                    return Err(Error::Http(e.to_string()));
+                let text = resp
+                    .into_body()
+                    .read_to_string()
+                    .unwrap_or_else(|_| String::new());
+                let retryable = code == 429 || (500..600).contains(&code);
+                if retryable && attempt < delays.len() {
+                    std::thread::sleep(Duration::from_secs(delays[attempt]));
+                    continue;
                 }
+                return Err(Error::Api(format!("HTTP {code}：{}", truncate(&text, 800))));
+            }
+            Err(e) => {
+                if attempt < delays.len() {
+                    std::thread::sleep(Duration::from_secs(delays[attempt]));
+                    continue;
+                }
+                return Err(Error::Http(e.to_string()));
             }
         }
-        Err(Error::Http("重试三次仍失败".to_string()))
     }
+    Err(Error::Http("重试三次仍失败".to_string()))
 }
 
 fn build_body(
@@ -224,7 +262,16 @@ fn build_body(
     body
 }
 
-fn read_stream(resp: ureq::http::Response<ureq::Body>, on: &mut dyn FnMut(Event)) -> Result<Reply> {
+enum StreamItem {
+    Event(Event),
+    Done(Reply),
+    Failed(Error),
+}
+
+fn read_stream(
+    resp: ureq::http::Response<ureq::Body>,
+    tx: &mpsc::Sender<StreamItem>,
+) -> Result<Reply> {
     let mut content = String::new();
     let mut reasoning = String::new();
     let mut usage = Usage::default();
@@ -268,13 +315,24 @@ fn read_stream(resp: ureq::http::Response<ureq::Body>, on: &mut dyn FnMut(Event)
                 && !text.is_empty()
             {
                 content.push_str(text);
-                on(Event::Text(text.to_string()));
+                if tx
+                    .send(StreamItem::Event(Event::Text(text.to_string())))
+                    .is_err()
+                {
+                    // 主线程已经取消，读线程没有继续读的必要。
+                    return Err(Error::Cancelled);
+                }
             }
             if let Some(text) = delta.get("reasoning_content").and_then(Value::as_str)
                 && !text.is_empty()
             {
                 reasoning.push_str(text);
-                on(Event::Reasoning(text.to_string()));
+                if tx
+                    .send(StreamItem::Event(Event::Reasoning(text.to_string())))
+                    .is_err()
+                {
+                    return Err(Error::Cancelled);
+                }
             }
             if let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) {
                 for call in calls {

@@ -73,8 +73,7 @@ pub fn complete(line: &str, pos: usize, skills: &[(String, String)]) -> Option<(
         let mut pairs: Vec<(i32, Pair)> = EFFORTS
             .iter()
             .filter_map(|effort| {
-                fuzzy(partial, effort)
-                    .map(|score| (score, pair(*effort, *effort)))
+                fuzzy(partial, effort).map(|score| (score, pair(*effort, *effort)))
             })
             .collect();
         return Some((start, finish(&mut pairs, partial)));
@@ -90,12 +89,8 @@ pub fn complete(line: &str, pos: usize, skills: &[(String, String)]) -> Option<(
             let mut pairs: Vec<(i32, Pair)> = skills
                 .iter()
                 .filter_map(|(name, description)| {
-                    fuzzy(partial, name).map(|score| {
-                        (
-                            score,
-                            pair(format!("{name} — {description}"), name.clone()),
-                        )
-                    })
+                    fuzzy(partial, name)
+                        .map(|score| (score, pair(format!("{name} — {description}"), name.clone())))
                 })
                 .collect();
             return Some((start, finish(&mut pairs, partial)));
@@ -115,10 +110,7 @@ pub fn complete(line: &str, pos: usize, skills: &[(String, String)]) -> Option<(
                 };
                 Some((
                     score,
-                    pair(
-                        format!("{command} — {description}"),
-                        replacement,
-                    ),
+                    pair(format!("{command} — {description}"), replacement),
                 ))
             })
             .collect();
@@ -140,12 +132,13 @@ fn pair(display: impl Into<String>, replacement: impl Into<String>) -> Pair {
 /// 没有候选以已输入内容开头时只返回最佳一条：rustyline 的列表模式对
 /// 「无法延长公共前缀」的输入会先响铃，模糊匹配就会显得没反应。
 fn finish(scored: &mut [(i32, Pair)], typed: &str) -> Vec<Pair> {
-    scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.replacement.len().cmp(&b.1.replacement.len())));
+    scored.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then_with(|| a.1.replacement.len().cmp(&b.1.replacement.len()))
+    });
     let total = scored.len();
     let mut pairs: Vec<Pair> = scored.iter().map(|(_, pair)| pair.clone()).collect();
-    let extendable = pairs
-        .iter()
-        .any(|pair| pair.replacement.starts_with(typed));
+    let extendable = pairs.iter().any(|pair| pair.replacement.starts_with(typed));
     if !extendable && pairs.len() > 1 {
         pairs.truncate(1);
         return pairs;
@@ -154,7 +147,10 @@ fn finish(scored: &mut [(i32, Pair)], typed: &str) -> Vec<Pair> {
         pairs.truncate(MAX_CANDIDATES - 1);
         // 选中这一行不改变输入：replacement 原样返回已经打出的部分。
         pairs.push(pair(
-            format!("… 还有 {} 个，继续输入缩小范围", total - (MAX_CANDIDATES - 1)),
+            format!(
+                "… 还有 {} 个，继续输入缩小范围",
+                total - (MAX_CANDIDATES - 1)
+            ),
             typed.to_string(),
         ));
     }
@@ -220,7 +216,11 @@ mod tests {
     fn a_command_prefix_completes() {
         let (start, pairs) = complete("/ne", 3, &skills()).expect("有候选");
         assert_eq!(start, 1);
-        assert!(replacements(&pairs).contains(&"new"), "{:?}", replacements(&pairs));
+        assert!(
+            replacements(&pairs).contains(&"new"),
+            "{:?}",
+            replacements(&pairs)
+        );
     }
 
     #[test]
@@ -246,7 +246,11 @@ mod tests {
         // "rev" 不是任何技能名的前缀；此时只给最佳一条，Tab 才能直接替换。
         let (_, pairs) = complete("/skill:rev", 10, &skills()).expect("有候选");
         assert_eq!(pairs.len(), 1, "只给一条：{}", pairs[0].display);
-        assert!(pairs[0].replacement.contains("review"), "{}", pairs[0].replacement);
+        assert!(
+            pairs[0].replacement.contains("review"),
+            "{}",
+            pairs[0].replacement
+        );
 
         // 命令同理：/nw 不是 /new 的前缀。
         let (_, single) = complete("/nw", 3, &skills()).expect("有候选");

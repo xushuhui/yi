@@ -6,12 +6,7 @@ use common::*;
 use yi::agent::Agent;
 
 fn open(home: &std::path::Path) -> Agent {
-    Agent::new(
-        &config(0, home, None),
-        "/tmp/proj",
-        &session_path(home),
-    )
-    .expect("打开会话")
+    Agent::new(&config(0, home, None), "/tmp/proj", &session_path(home)).expect("打开会话")
 }
 
 #[test]
@@ -41,7 +36,9 @@ fn prompt_history_keeps_only_the_newest_entries() {
     let home = temp_home("hist-cap");
     let mut agent = open(&home);
     for index in 0..205 {
-        agent.note_prompt(&format!("第 {index} 条")).expect("记一条");
+        agent
+            .note_prompt(&format!("第 {index} 条"))
+            .expect("记一条");
     }
 
     let history = agent.prompt_history();

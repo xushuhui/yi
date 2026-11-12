@@ -45,13 +45,11 @@ fn run() -> Result<()> {
         .join(config::encode_project(&cwd))
         .join("session.jsonl");
     let mut agent = Agent::new(&cfg, &cwd, &session_path)?;
-    let skills: Vec<(String, String)> = yi::skills::discover(&yi::skills::roots(
-        &cfg.home,
-        Path::new(&cwd),
-    ))
-    .into_iter()
-    .map(|skill| (skill.name, skill.description))
-    .collect();
+    let skills: Vec<(String, String)> =
+        yi::skills::discover(&yi::skills::roots(&cfg.home, Path::new(&cwd)))
+            .into_iter()
+            .map(|skill| (skill.name, skill.description))
+            .collect();
     let mut editor = make_editor(&agent, skills)?;
     // 只在真终端里上色；管道输出、NO_COLOR 时保持原样。
     let color = io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
@@ -124,11 +122,7 @@ fn run() -> Result<()> {
                 // 同上：刷新失败不影响本轮结果。
                 let _ = io::stdout().flush();
             }
-            Event::ToolResult {
-                name,
-                failed,
-                note,
-            } => {
+            Event::ToolResult { name, failed, note } => {
                 let half = renderer.flush_line();
                 print!("{half}");
                 let short: String = note.chars().take(160).collect();
