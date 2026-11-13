@@ -88,9 +88,9 @@ pub fn complete(line: &str, pos: usize, skills: &[(String, String)]) -> Option<(
             let start = pos - partial.len();
             let mut pairs: Vec<(i32, Pair)> = skills
                 .iter()
-                .filter_map(|(name, description)| {
-                    fuzzy(partial, name)
-                        .map(|score| (score, pair(format!("{name} — {description}"), name.clone())))
+                .filter_map(|(name, _description)| {
+                    // 技能描述是整句话，列进候选会折行淹没屏幕；名字足够选。
+                    fuzzy(partial, name).map(|score| (score, pair(name.clone(), name.clone())))
                 })
                 .collect();
             return Some((start, finish(&mut pairs, partial)));
@@ -259,14 +259,15 @@ mod tests {
     }
 
     #[test]
-    fn skill_names_complete_after_the_colon_with_descriptions() {
+    fn skill_candidates_list_names_without_descriptions() {
         let (start, pairs) = complete("/skill:cr", 9, &skills()).expect("有候选");
         assert_eq!(start, 7);
         let names = replacements(&pairs);
         assert_eq!(names.first(), Some(&"code-review"), "{names:?}");
+        assert_eq!(pairs[0].display, "code-review", "候选只列名字");
         assert!(
-            pairs[0].display.contains("两轴审查"),
-            "候选里要有描述：{}",
+            !pairs[0].display.contains('—'),
+            "不要把技能描述带进候选：{}",
             pairs[0].display
         );
     }
