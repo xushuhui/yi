@@ -12,13 +12,11 @@ use crate::{Error, Result};
 
 const INIT_TIMEOUT: Duration = Duration::from_secs(15);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
-const DIAGNOSTIC_WAIT: Duration = Duration::from_millis(1200);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(600);
 const REAP_INTERVAL: Duration = Duration::from_secs(60);
 /// 一次结果里最多列这么多条，超出部分在末尾说明还有多少。
 const DEFINITION_CAP: usize = 10;
 const REFERENCE_CAP: usize = 50;
-const DIAGNOSTIC_CAP: usize = 50;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Language {
@@ -78,9 +76,9 @@ impl Lsp {
         line: Option<usize>,
         symbol: Option<&str>,
     ) -> Result<String> {
-        if !matches!(action, "definition" | "references" | "diagnostics") {
+        if !matches!(action, "definition" | "references") {
             return Err(Error::Config(format!(
-                "未知的 lsp 动作 {action}；可选 definition / references / diagnostics"
+                "未知的 lsp 动作 {action}；可选 definition / references"
             )));
         }
         let language = language_of(path)?;
@@ -104,17 +102,13 @@ impl Lsp {
             .ok_or_else(|| Error::Config("语言服务器初始化失败".to_string()))?;
         client.last_used = Instant::now();
 
-        match action {
-            "definition" => {
-                let line = require_line(action, line)?;
-                client.goto(Target::Definition, path, line, symbol)
-            }
-            "references" => {
-                let line = require_line(action, line)?;
-                client.goto(Target::References, path, line, symbol)
-            }
-            _ => client.diagnostics(path),
-        }
+        let line = require_line(action, line)?;
+        let target = if action == "definition" {
+            Target::Definition
+        } else {
+            Target::References
+        };
+        client.goto(target, path, line, symbol)
     }
 }
 
@@ -172,8 +166,6 @@ struct Client {
     next_id: u64,
     /// 已经 didOpen 过的文件 → 版本号。
     opened: HashMap<PathBuf, i64>,
-    /// 服务器推来的诊断，按 uri 存。
-    diagnostics: HashMap<String, Vec<Value>>,
     last_used: Instant,
 }
 
@@ -212,7 +204,6 @@ impl Client {
             rx,
             next_id: 1,
             opened: HashMap::new(),
-            diagnostics: HashMap::new(),
             last_used: Instant::now(),
         };
         client.initialize(root, language)?;
@@ -273,56 +264,10 @@ impl Client {
         Ok(out)
     }
 
-    fn diagnostics(&mut self, path: &Path) -> Result<String> {
-        self.ensure_open(path)?;
-        let uri = file_uri(path);
-
-        let deadline = Instant::now() + DIAGNOSTIC_WAIT;
-        loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                break;
-            }
-            match self.rx.recv_timeout(remaining) {
-                Ok(message) => self.handle(message),
-                Err(_) => break,
-            }
-        }
-
-        let Some(items) = self.diagnostics.get(&uri) else {
-            return Ok("暂时没有诊断（服务器可能还没完成索引）".to_string());
-        };
-        if items.is_empty() {
-            return Ok("没有诊断".to_string());
-        }
-        let total = items.len();
-        let mut out = String::new();
-        for item in items.iter().take(DIAGNOSTIC_CAP) {
-            let line = item["range"]["start"]["line"].as_u64().unwrap_or(0) + 1;
-            let character = item["range"]["start"]["character"].as_u64().unwrap_or(0) + 1;
-            let severity = match item["severity"].as_u64() {
-                Some(1) => "错误",
-                Some(2) => "警告",
-                Some(3) => "信息",
-                _ => "提示",
-            };
-            out.push_str(&format!(
-                "{line}:{character} {severity} {}\n",
-                item["message"].as_str().unwrap_or("")
-            ));
-        }
-        if total > DIAGNOSTIC_CAP {
-            out.push_str(&format!("… 还有 {} 条未显示\n", total - DIAGNOSTIC_CAP));
-        }
-        Ok(out)
-    }
-
     fn ensure_open(&mut self, path: &Path) -> Result<()> {
         let text = std::fs::read_to_string(path)
             .map_err(|err| Error::Config(format!("读不了 {}：{err}", path.display())))?;
         let uri = file_uri(path);
-        // 文件内容变了，旧诊断立刻作废，避免把过期结果当成"干净"。
-        self.diagnostics.remove(&uri);
 
         match self.opened.get(path).copied() {
             Some(version) => {
@@ -383,24 +328,10 @@ impl Client {
                         }
                         return Ok(message.get("result").cloned().unwrap_or(Value::Null));
                     }
-                    self.handle(message);
+                    // 服务器推来的通知（诊断、日志等）用不到，丢弃。
                 }
                 Err(_) => return Err(Error::Config(format!("语言服务器超时：{method}"))),
             }
-        }
-    }
-
-    fn handle(&mut self, message: Value) {
-        if message.get("method").and_then(Value::as_str) == Some("textDocument/publishDiagnostics")
-            && let Some(params) = message.get("params")
-            && let Some(uri) = params.get("uri").and_then(Value::as_str)
-        {
-            let items = params
-                .get("diagnostics")
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default();
-            self.diagnostics.insert(uri.to_string(), items);
         }
     }
 }

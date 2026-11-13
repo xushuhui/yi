@@ -18,6 +18,8 @@ const MAX_READ_LINES: usize = 3000;
 const MAX_READ_BYTES: usize = 50 * 1024;
 const GREP_PER_FILE: usize = 20;
 const GREP_TOTAL: usize = 200;
+/// 遍历时一律跳过的目录：依赖与构建产物，即使没写进 .gitignore 也不该被搜、被列。
+const SKIP_DIRS: [&str; 3] = ["node_modules", "target", "vendor"];
 const GREP_LINE_CHARS: usize = 512;
 const GLOB_LIMIT: usize = 200;
 
@@ -140,19 +142,19 @@ impl Tools {
                 "type": "function",
                 "function": {
                     "name": "lsp",
-                    "description": "查询 Go/PHP 代码的语言服务：跳定义、找引用、看诊断。需要服务器已安装（gopls / phpantom_lsp）。",
+                    "description": "查询 Go/PHP 代码的语言服务：跳定义、找引用。需要服务器已安装（gopls / phpantom_lsp）。",
                     "parameters": {
                         "type": "object",
                         "properties": {
                             "action": {
                                 "type": "string",
-                                "enum": ["definition", "references", "diagnostics"],
+                                "enum": ["definition", "references"],
                                 "description": "要做什么"
                             },
                             "path": { "type": "string", "description": "相对项目根的 .go 或 .php 文件" },
                             "line": {
                                 "type": "integer",
-                                "description": "行号，从 1 开始；definition 和 references 必填"
+                                "description": "行号，从 1 开始；必填"
                             },
                             "symbol": { "type": "string", "description": "这一行里的符号名；省略则用第一个非空白字符" }
                         },
@@ -672,10 +674,7 @@ impl Tools {
         loop {
             if crate::cancel::check() {
                 // 用户要中断：按进程组杀，避免只杀掉 sh 留下子进程。
-                let _ = Command::new("kill")
-                    .arg("-TERM")
-                    .arg(format!("-{pid}"))
-                    .status();
+                signal_group(pid, libc::SIGTERM);
                 let _ = child.kill();
                 let _ = child.wait();
                 return "ERROR: 已取消这条命令".to_string();
@@ -690,16 +689,10 @@ impl Tools {
             }
             if Instant::now() >= deadline {
                 timed_out = true;
-                let _ = Command::new("kill")
-                    .arg("-TERM")
-                    .arg(format!("-{pid}"))
-                    .status();
+                signal_group(pid, libc::SIGTERM);
                 std::thread::sleep(Duration::from_millis(300));
                 // 孙进程可能忽略 TERM；补一次 KILL，管道才会关闭，收集线程才不会一直等。
-                let _ = Command::new("kill")
-                    .arg("-KILL")
-                    .arg(format!("-{pid}"))
-                    .status();
+                signal_group(pid, libc::SIGKILL);
                 let _ = child.kill();
                 let _ = child.wait();
                 break;
@@ -790,6 +783,9 @@ impl Tools {
             .stderr(Stdio::null());
         if !case_sensitive {
             command.arg("--ignore-case");
+        }
+        for dir in SKIP_DIRS {
+            command.arg("--glob").arg(format!("!{dir}"));
         }
         if let Some(filter) = args.get("glob").and_then(Value::as_str) {
             command.arg("--glob").arg(filter);
@@ -900,6 +896,9 @@ impl Tools {
         // `rg --files` 只列未被 .gitignore 忽略的文件，比我们自己遍历快两个数量级。
         let mut command = Command::new("rg");
         command.arg("--files").current_dir(&self.root);
+        for dir in SKIP_DIRS {
+            command.arg("--glob").arg(format!("!{dir}"));
+        }
         if !base_is_file {
             command.arg(self.rg_target(&base));
         }
@@ -1305,6 +1304,14 @@ fn stream_into_log(
 }
 
 /// 往「只留最后 50 KB」的共享缓冲里追加。
+/// 向整个进程组发信号。组已经不存在（进程都退光了）时 `kill` 返回 ESRCH，这里不关心。
+fn signal_group(pgid: u32, signal: libc::c_int) {
+    // SAFETY: 只是一次系统调用；负的 pid 表示进程组。pid_t 是 i32，进程号远小于它的上限。
+    unsafe {
+        libc::kill(-(pgid as libc::pid_t), signal);
+    }
+}
+
 fn push_tail(tail: &Arc<Mutex<Vec<u8>>>, data: &[u8]) {
     const TAIL: usize = 50 * 1024;
     let Ok(mut guard) = tail.lock() else {

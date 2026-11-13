@@ -836,3 +836,36 @@ fn describe_survives_a_command_whose_80th_byte_is_inside_a_chinese_character() {
     let line = tools.describe(&call);
     assert!(line.contains('中'), "整条命令都要留下：{line}");
 }
+
+#[test]
+fn grep_and_glob_skip_vendored_and_build_directories() {
+    let home = temp_home("skipdir-home");
+    let ws = temp_home("skipdir-ws");
+    for dir in ["node_modules/pkg", "target", "vendor/lib"] {
+        std::fs::create_dir_all(ws.join(dir)).unwrap();
+        std::fs::write(ws.join(dir).join("hit.go"), "needle\n").unwrap();
+    }
+    std::fs::create_dir_all(ws.join("src")).unwrap();
+    std::fs::write(ws.join("src/keep.go"), "needle\n").unwrap();
+
+    let server = start_server(vec![
+        tool_response(&[("c1", "grep", json!({"pattern": "needle"}))]),
+        plain_response(&["ok"]),
+        tool_response(&[("c2", "glob", json!({"pattern": "**/*.go"}))]),
+        plain_response(&["ok"]),
+    ]);
+    let mut agent = open_agent(server.port, &home, &ws);
+    collect(&mut agent, "搜 needle");
+    let grep_out = last_tool_output(&home);
+    assert!(grep_out.contains("src/keep.go"), "{grep_out}");
+    assert!(!grep_out.contains("node_modules"), "{grep_out}");
+    assert!(!grep_out.contains("target/"), "{grep_out}");
+    assert!(!grep_out.contains("vendor/"), "{grep_out}");
+
+    collect(&mut agent, "列出所有 go 文件");
+    let glob_out = last_tool_output(&home);
+    assert!(glob_out.contains("src/keep.go"), "{glob_out}");
+    assert!(!glob_out.contains("node_modules"), "{glob_out}");
+    assert!(!glob_out.contains("target/"), "{glob_out}");
+    assert!(!glob_out.contains("vendor/"), "{glob_out}");
+}

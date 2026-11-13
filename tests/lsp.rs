@@ -260,33 +260,3 @@ fn lsp_does_not_start_a_server_for_an_unknown_action() {
     assert!(output.starts_with("ERROR:"), "{output}");
     assert!(output.contains("未知的 lsp 动作"), "{output}");
 }
-
-#[test]
-fn lsp_reports_go_diagnostics() {
-    if !gopls_available() {
-        eprintln!("SKIP: PATH 里没有 gopls");
-        return;
-    }
-    let home = temp_home("lsp-diag-home");
-    let ws = temp_home("lsp-diag-ws");
-    std::fs::write(ws.join("go.mod"), "module demo\n\ngo 1.22\n").unwrap();
-    std::fs::write(
-        ws.join("main.go"),
-        "package main\n\nfunc main() {\n\tvar x int = \"文字\"\n\t_ = x\n}\n",
-    )
-    .unwrap();
-
-    let server = start_server(vec![
-        tool_response(&[(
-            "c1",
-            "lsp",
-            json!({"action": "diagnostics", "path": "main.go"}),
-        )]),
-        plain_response(&["ok"]),
-    ]);
-    let mut agent = open_agent(server.port, &home, &ws);
-    collect(&mut agent, "看诊断");
-
-    let output = last_tool_output(&home);
-    assert!(output.contains("错误"), "应报出类型错误：{output}");
-}

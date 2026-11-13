@@ -1,8 +1,9 @@
 //! 本轮对话的中断开关。
 //!
-//! 只在一次模型请求 + 工具执行期间接管 SIGINT：按下 Ctrl-C 时把标志置位，
-//! 网络读取和命令等待在自己的循环里检查它。读输入期间恢复默认处理，交给
-//! 行编辑器自己处理 Ctrl-C。
+//! 一轮之内键盘归这里管：按下 Ctrl-C 只把标志置位，网络读取和命令等待在自己的
+//! 循环里检查它，不再有第二个地方抢按键。两条入口落到同一个标志——
+//! 终端把 Ctrl-C 变成信号时走信号处理，没变成信号时（行编辑器留下的原始模式）
+//! 直接读那个字节。等输入时恢复默认处理，Ctrl-C 交回行编辑器清空输入行。
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -51,13 +52,7 @@ fn poll_terminal() {
             return;
         }
         let mut byte: u8 = 0;
-        if libc::read(
-            libc::STDIN_FILENO,
-            (&mut byte as *mut u8).cast(),
-            1,
-        ) == 1
-            && byte == 0x03
-        {
+        if libc::read(libc::STDIN_FILENO, (&mut byte as *mut u8).cast(), 1) == 1 && byte == 0x03 {
             request();
         }
     }
@@ -77,7 +72,7 @@ pub fn arm() {
     }
 }
 
-/// 恢复默认处理与终端设置：读输入时按 Ctrl-C 仍交给行编辑器自己处理。
+/// 恢复默认处理：读输入时按 Ctrl-C 仍交给行编辑器自己处理。
 pub fn disarm() {
     unsafe {
         libc::signal(libc::SIGINT, libc::SIG_DFL);
