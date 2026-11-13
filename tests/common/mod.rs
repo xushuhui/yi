@@ -174,6 +174,8 @@ pub fn config(port: u16, home: &Path, effort: Option<&str>) -> Config {
         model: "deepseek-flash".to_string(),
         model_display: "DeepSeek Flash".to_string(),
         context_window: 1_048_576,
+        // 假服务器在本机，走的是回环地址，代理本来就该被绕过。
+        proxy: None,
         effort: effort.map(str::to_string),
         home: home.to_path_buf(),
         gopls: "gopls".to_string(),

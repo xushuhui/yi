@@ -55,6 +55,7 @@ cargo install --path .
 - **密钥不写进配置文件**，只从环境变量读：`opencode-go` 用 `OPENCODE_API_KEY`，`deepseek` 用 `DEEPSEEK_API_KEY`。配置文件里写了 `api_key` 会被忽略。
 - 语言服务器命令固定取 `PATH` 里的 `gopls` / `phpantom_lsp`，不写进配置文件。
 - `YI_HOME` 可覆盖数据目录（默认 `~/.yi`）。
+- 代理只认这两个变量：`YI_PROXY_<供应商>`（如 `YI_PROXY_OPENCODE_GO`）优先，其次 `YI_PROXY`；通用 `HTTPS_PROXY` / `ALL_PROXY` 不读。本机与内网地址、`NO_PROXY` 命中的地址直连。`socks5://` 会直接报错，请写 `http://127.0.0.1:端口`。
 - 每个请求都会带 `User-Agent: yi/<版本>` 和 `x-opencode-session: <会话标识>`。后者是 opencode-go 的要求：缺了它接口直接返回 400 `MissingSessionID`；DeepSeek 官方会忽略它。
 
 ## 用法

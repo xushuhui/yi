@@ -71,6 +71,8 @@ pub struct Config {
     pub model_display: String,
     /// 当前模型的上下文窗口，页脚百分比与压缩阈值都按它算。
     pub context_window: u64,
+    /// 出网代理；`None` 表示直连。只在启动时解析一次。
+    pub proxy: Option<ureq::Proxy>,
     /// `None` = `auto`，请求里不发送 `reasoning_effort`。
     pub effort: Option<String>,
     pub home: PathBuf,
@@ -111,12 +113,14 @@ impl Config {
             model: chosen.model.to_string(),
             model_display: chosen.model_display.to_string(),
             context_window: chosen.context_window,
+            proxy: None,
             effort: None,
             home: home.clone(),
             gopls: "gopls".to_string(),
             phpantom: "phpantom_lsp".to_string(),
         };
         apply_json(&mut cfg, &value)?;
+        cfg.proxy = resolve_proxy(cfg.provider, &cfg.base_url)?;
 
         // 密钥只从环境变量读：配置文件里写了也不看。
         let key = std::env::var(chosen.env_key).unwrap_or_default();
@@ -158,6 +162,120 @@ impl Config {
     pub fn compact_at_tokens(&self) -> u64 {
         self.context_window / 2
     }
+}
+
+/// 按 omp 的规则给供应商取代理变量名：`YI_PROXY_OPENCODE_GO`。
+fn provider_proxy_var(id: &str) -> String {
+    let mut name = String::from("YI_PROXY_");
+    for ch in id.chars() {
+        if ch.is_ascii_alphanumeric() {
+            name.push(ch.to_ascii_uppercase());
+        } else {
+            name.push('_');
+        }
+    }
+    name
+}
+
+/// 启动时解析一次代理：本机与内网直连，`NO_PROXY` 命中直连，
+/// 然后是 `YI_PROXY_<供应商>`，最后是 `YI_PROXY`。
+fn resolve_proxy(provider: &str, base_url: &str) -> Result<Option<ureq::Proxy>> {
+    let host = host_of(base_url);
+    let no_proxy = std::env::var("NO_PROXY")
+        .ok()
+        .or_else(|| std::env::var("no_proxy").ok());
+    let raw = choose_proxy(provider, &host, no_proxy.as_deref(), |key| {
+        std::env::var(key).ok()
+    })?;
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    ureq::Proxy::new(&raw)
+        .map(Some)
+        .map_err(|err| Error::Config(format!("代理地址无效（{raw}）：{err}")))
+}
+
+/// 纯逻辑部分，方便单独测：返回该用的代理地址，`None` 表示直连。
+fn choose_proxy(
+    provider: &str,
+    host: &str,
+    no_proxy: Option<&str>,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Result<Option<String>> {
+    // 本机回环、内网私有地址一律直连：给它们套代理由害无益。
+    if host.is_empty() || is_private_host(host) || no_proxy_covers(no_proxy, host) {
+        return Ok(None);
+    }
+    let raw = lookup(&provider_proxy_var(provider))
+        .or_else(|| lookup("YI_PROXY"))
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    if raw.to_ascii_lowercase().starts_with("socks") {
+        return Err(Error::Config(format!(
+            "不支持 SOCKS 代理（{raw}）；请写成 http://127.0.0.1:端口"
+        )));
+    }
+    Ok(Some(raw))
+}
+
+/// 从接口地址里取主机名，够用即可：`https://host:port/path` → `host`。
+fn host_of(base_url: &str) -> String {
+    let rest = base_url
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(base_url);
+    let authority = rest.split('/').next().unwrap_or("");
+    let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    match host.rsplit_once(':') {
+        Some((head, port)) if port.chars().all(|c| c.is_ascii_digit()) => head.to_string(),
+        _ => host.to_string(),
+    }
+}
+
+/// 本机与内网：回环、link-local、RFC 1918。
+fn is_private_host(host: &str) -> bool {
+    let host = host.trim_matches(['[', ']']).to_ascii_lowercase();
+    if host == "localhost" || host == "::1" {
+        return true;
+    }
+    let parts: Vec<&str> = host.split('.').collect();
+    match parts.as_slice() {
+        ["127", ..] => true,
+        ["10", ..] => true,
+        ["192", "168", ..] => true,
+        ["169", "254", ..] => true,
+        ["172", second, ..] => second.parse::<u8>().is_ok_and(|n| (16..=31).contains(&n)),
+        _ => false,
+    }
+}
+
+/// `NO_PROXY` 的匹配：`*` 全绕过、`.example.com` 与 `*.example.com` 匹配子域、
+/// 其余按主机名精确比较（允许带端口写法）。
+fn no_proxy_covers(no_proxy: Option<&str>, host: &str) -> bool {
+    let Some(patterns) = no_proxy else {
+        return false;
+    };
+    let host = host.to_ascii_lowercase();
+    patterns.split(',').any(|pattern| {
+        let pattern = pattern.trim().to_ascii_lowercase();
+        if pattern.is_empty() {
+            return false;
+        }
+        if pattern == "*" {
+            return true;
+        }
+        let pattern = pattern.split(':').next().unwrap_or(&pattern);
+        if let Some(suffix) = pattern
+            .strip_prefix("*.")
+            .or_else(|| pattern.strip_prefix('.'))
+        {
+            return host == suffix || host.ends_with(&format!(".{suffix}"));
+        }
+        host == pattern || host.ends_with(&format!(".{pattern}"))
+    })
 }
 
 /// 把配置文件里的字段覆盖到预置上；缺的字段保持预置值。
@@ -241,6 +359,7 @@ mod tests {
             model: "deepseek-v4.1-flash".into(),
             model_display: "DeepSeek V4.1 Flash".into(),
             context_window: 1_048_576,
+            proxy: None,
             effort: None,
             home: PathBuf::from("/tmp"),
             gopls: "gopls".into(),
@@ -283,6 +402,7 @@ mod tests {
             model: "deepseek-v4.1-flash".into(),
             model_display: "DeepSeek V4.1 Flash".into(),
             context_window: 1_048_576,
+            proxy: None,
             effort: None,
             home: PathBuf::from("/tmp"),
             gopls: "gopls".into(),
@@ -311,6 +431,7 @@ mod tests {
             model: "deepseek-v4.1-flash".into(),
             model_display: "DeepSeek V4.1 Flash".into(),
             context_window: 1_048_576,
+            proxy: None,
             effort: None,
             home: PathBuf::from("/tmp"),
             gopls: "gopls".into(),
@@ -319,6 +440,72 @@ mod tests {
         assert_eq!(cfg.compact_at_tokens(), 524_288);
         cfg.context_window = 1_000_000;
         assert_eq!(cfg.compact_at_tokens(), 500_000);
+    }
+
+    #[test]
+    fn the_provider_proxy_variable_follows_the_omp_naming() {
+        assert_eq!(provider_proxy_var("opencode-go"), "YI_PROXY_OPENCODE_GO");
+        assert_eq!(provider_proxy_var("deepseek"), "YI_PROXY_DEEPSEEK");
+    }
+
+    #[test]
+    fn the_provider_specific_proxy_wins_over_the_generic_one() {
+        let lookup = |key: &str| match key {
+            "YI_PROXY_OPENCODE_GO" => Some("http://127.0.0.1:7891".into()),
+            "YI_PROXY" => Some("http://127.0.0.1:7890".into()),
+            _ => None,
+        };
+        let chosen = choose_proxy("opencode-go", "opencode.ai", None, lookup).unwrap();
+        assert_eq!(chosen.as_deref(), Some("http://127.0.0.1:7891"));
+
+        // 换一个供应商，就用不到那条专用变量，落到通用的。
+        let chosen = choose_proxy("deepseek", "api.deepseek.com", None, lookup).unwrap();
+        assert_eq!(chosen.as_deref(), Some("http://127.0.0.1:7890"));
+    }
+
+    #[test]
+    fn loopback_and_lan_hosts_bypass_the_proxy() {
+        let lookup = |_: &str| Some("http://127.0.0.1:7891".to_string());
+        for host in [
+            "127.0.0.1",
+            "localhost",
+            "192.168.1.9",
+            "10.0.0.2",
+            "172.16.5.1",
+        ] {
+            let chosen = choose_proxy("opencode-go", host, None, lookup).unwrap();
+            assert_eq!(chosen, None, "{host} 不该走代理");
+        }
+    }
+
+    #[test]
+    fn no_proxy_matches_exact_suffix_and_port_forms() {
+        let covers = |pattern: &str, host: &str| no_proxy_covers(Some(pattern), host);
+        assert!(covers("opencode.ai", "opencode.ai"));
+        assert!(
+            covers("opencode.ai", "api.opencode.ai"),
+            "无点前缀也匹配子域"
+        );
+        assert!(covers(".opencode.ai", "api.opencode.ai"));
+        assert!(covers("*.opencode.ai", "api.opencode.ai"));
+        assert!(covers("opencode.ai:443", "opencode.ai"), "允许带端口写法");
+        assert!(covers("*", "anything.example"));
+        assert!(!covers("opencode.ai", "notopencode.ai"));
+        assert!(!covers("", "opencode.ai"));
+    }
+
+    #[test]
+    fn a_socks_proxy_is_rejected_instead_of_silently_direct() {
+        let lookup = |_: &str| Some("socks5://127.0.0.1:7890".to_string());
+        let err = choose_proxy("opencode-go", "opencode.ai", None, lookup).unwrap_err();
+        assert!(format!("{err}").contains("SOCKS"), "{err}");
+    }
+
+    #[test]
+    fn the_host_is_taken_from_the_base_url() {
+        assert_eq!(host_of("https://opencode.ai/zen/go/v1"), "opencode.ai");
+        assert_eq!(host_of("http://127.0.0.1:8080"), "127.0.0.1");
+        assert_eq!(host_of("https://user@example.com:8443/v1"), "example.com");
     }
 
     #[test]

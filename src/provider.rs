@@ -51,6 +51,8 @@ impl Provider {
     pub fn new(cfg: &Config, session: &str) -> Provider {
         let agent: ureq::Agent = ureq::Agent::config_builder()
             .http_status_as_error(false)
+            // 启动时解析好的代理；`None` 就是直连。
+            .proxy(cfg.proxy.clone())
             // 供应商要求客户端自报家门，而不是露出 HTTP 库的名字。
             .user_agent(format!("yi/{}", env!("CARGO_PKG_VERSION")))
             .timeout_connect(Some(Duration::from_secs(10)))

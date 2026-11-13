@@ -108,6 +108,7 @@ Status: ready-for-agent
   | `deepseek` | `https://api.deepseek.com` | `deepseek-flash` | 1,048,576 | `DEEPSEEK_API_KEY` |
 - 请求：`POST <预置地址>/chat/completions`，`stream: true`，`stream_options: {"include_usage": true}`。两者都是 OpenAI 兼容协议，走同一份代码。
 - **密钥只从环境变量读**，配置文件里的 `api_key` 一律忽略：配置文件会被同步、备份、误提交。缺密钥时报错信息点名该供应商的环境变量。
+- 代理：启动时解析一次，一个进程只用一个代理。顺序是先判「本机回环与内网私有地址」直连，再判 `NO_PROXY` / `no_proxy`（支持 `*`、`.example.com`、`*.example.com`、带端口写法），命中就直连；否则取 `YI_PROXY_<供应商>`（供应商 id 大写、标点换下划线，例如 `YI_PROXY_OPENCODE_GO`），再退到 `YI_PROXY`。**不读通用的 `HTTPS_PROXY` / `ALL_PROXY`**：那些变量一旦指向较慢的线路，会拖慢每一次请求，而且和别的工具互相牵连。地址写成 `socks5://…` 时启动即报错，不静默退回直连——ureq 的 SOCKS 支持需要额外编译开关，当前不开。
 - 两个请求头，所有请求（含压缩用的非流式请求）都带：`User-Agent: yi/<版本>`（供应商要求客户端自报家门，而不是露出 HTTP 库名）；`x-opencode-session: <会话标识>`（opencode-go 按它做路由与缓存亲和，缺了直接返回 400 `MissingSessionID`；DeepSeek 官方忽略这个头）。会话标识取自会话文件头，一条会话内不变，`/new` 之后换新。
 - **永不发送 `tool_choice`**：DeepSeek 在思考模式下会因此返回 400。
 - assistant 的工具调用轮必须把 `reasoning_content` 原样回放，否则供应商拒绝或行为异常；该字段随消息存进会话文件。
@@ -175,7 +176,7 @@ Status: ready-for-agent
 - 中断：一轮请求或命令执行期间按 Ctrl-C 取消这一轮，会话保留，回到提示符；这段时间键盘归 yi，只认 Ctrl-C，其余按键静默丢弃。输入行里 Ctrl-C 放弃当前行，Ctrl-D 退出。
 - 斜杠命令只有三个：`/new`、`/effort <auto|low|high|max>`、`/help`。
 - 多行输入：粘贴多行时整段作为一条消息提交，不按行拆开。
-- 补全：以 `/` 开头的输入按子序列模糊匹配命令名（`/nw` → `/new`），行内灰字显示最可能补全的剩余部分，Tab 补全、再按 Tab 列出候选与说明，最多 8 条；`/skill:<前缀>`（冒号后允许空格）补技能名并在候选里带描述；没有候选以已输入内容开头时只给最佳一条，Tab 直接替换，避免列表模式先响铃，`/effort ` 补四个档位。
+- 补全：以 `/` 开头的输入按子序列模糊匹配命令名（`/nw` → `/new`），行内灰字显示最可能补全的剩余部分，Tab 补全、再按 Tab 列出候选与说明，最多 8 条；`/skill:<前缀>`（冒号后允许空格）补技能名，候选只列名字——技能描述是整句话，列进候选会折行淹没屏幕；没有候选以已输入内容开头时只给最佳一条，Tab 直接替换，避免列表模式先响铃，`/effort ` 补四个档位。
 
 ### 技能
 
