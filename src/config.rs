@@ -35,7 +35,7 @@ pub const PRESETS: [Preset; 2] = [
         model_display: "DeepSeek V4.1 Flash",
         // 与 DeepSeek 官方同一个模型版本（V4.1-Flash-1017），窗口相同。
         context_window: 1_048_576,
-        env_key: "OPENCODE_GO_API_KEY",
+        env_key: "OPENCODE_API_KEY",
     },
     Preset {
         id: "deepseek",
@@ -263,7 +263,7 @@ mod tests {
         let chosen = preset(DEFAULT_PROVIDER).unwrap();
         assert_eq!(chosen.id, "opencode-go");
         assert_eq!(chosen.model, "deepseek-v4.1-flash");
-        assert_eq!(chosen.env_key, "OPENCODE_GO_API_KEY");
+        assert_eq!(chosen.env_key, "OPENCODE_API_KEY");
         assert_eq!(chosen.context_window, 1_048_576);
     }
 

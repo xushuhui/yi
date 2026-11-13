@@ -104,7 +104,7 @@ Status: ready-for-agent
 - 两套预置，一个进程只用其中一套：
   | 预置 id | 地址 | 默认模型 | 窗口 | 密钥环境变量 |
   |---|---|---|---|---|
-  | `opencode-go`（默认） | `https://opencode.ai/zen/go/v1` | `deepseek-v4.1-flash` | 1,048,576 | `OPENCODE_GO_API_KEY` |
+  | `opencode-go`（默认） | `https://opencode.ai/zen/go/v1` | `deepseek-v4.1-flash` | 1,048,576 | `OPENCODE_API_KEY` |
   | `deepseek` | `https://api.deepseek.com` | `deepseek-flash` | 1,048,576 | `DEEPSEEK_API_KEY` |
 - 请求：`POST <预置地址>/chat/completions`，`stream: true`，`stream_options: {"include_usage": true}`。两者都是 OpenAI 兼容协议，走同一份代码。
 - **密钥只从环境变量读**，配置文件里的 `api_key` 一律忽略：配置文件会被同步、备份、误提交。缺密钥时报错信息点名该供应商的环境变量。

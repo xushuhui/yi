@@ -52,7 +52,7 @@ cargo install --path .
 
 - `provider` 选预置：`opencode-go`（默认）或 `deepseek`。不写就用 `opencode-go`。
 - `model`、`base_url` 可覆盖预置里的默认值；`effort` 是推理强度，可选 `auto` / `low` / `high` / `max`，`auto` 表示请求里不发送这个参数。
-- **密钥不写进配置文件**，只从环境变量读：`opencode-go` 用 `OPENCODE_GO_API_KEY`，`deepseek` 用 `DEEPSEEK_API_KEY`。配置文件里写了 `api_key` 会被忽略。
+- **密钥不写进配置文件**，只从环境变量读：`opencode-go` 用 `OPENCODE_API_KEY`，`deepseek` 用 `DEEPSEEK_API_KEY`。配置文件里写了 `api_key` 会被忽略。
 - 语言服务器命令固定取 `PATH` 里的 `gopls` / `phpantom_lsp`，不写进配置文件。
 - `YI_HOME` 可覆盖数据目录（默认 `~/.yi`）。
 

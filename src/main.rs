@@ -256,7 +256,7 @@ fn print_help() {
   /help                     显示这份帮助
 
 环境变量（密钥只从这里读）：
-  OPENCODE_GO_API_KEY  OpenCode Go 的密钥（默认供应商）
+  OPENCODE_API_KEY     OpenCode Go 的密钥（默认供应商）
   DEEPSEEK_API_KEY     DeepSeek 官方的密钥（provider 设为 deepseek 时）
   YI_HOME              数据目录，默认 ~/.yi
 

@@ -18,7 +18,7 @@ ADR-0001 第 2 条判断「抽象的收益来自第二个供应商，而第二�
 
 | 预置 id | 地址 | 默认模型 | 窗口 | 密钥环境变量 |
 |---|---|---|---|---|
-| `opencode-go`（默认） | `https://opencode.ai/zen/go/v1` | `deepseek-v4.1-flash` | 1,048,576 | `OPENCODE_GO_API_KEY` |
+| `opencode-go`（默认） | `https://opencode.ai/zen/go/v1` | `deepseek-v4.1-flash` | 1,048,576 | `OPENCODE_API_KEY` |
 | `deepseek` | `https://api.deepseek.com` | `deepseek-flash` | 1,048,576 | `DEEPSEEK_API_KEY` |
 
 - 配置文件只写 `provider` 选哪一行；`model`、`base_url` 仍可覆盖。
