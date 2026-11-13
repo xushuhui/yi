@@ -55,15 +55,15 @@ cargo install --path .
 - **密钥不写进配置文件**，只从环境变量读：`opencode-go` 用 `OPENCODE_API_KEY`，`deepseek` 用 `DEEPSEEK_API_KEY`。配置文件里写了 `api_key` 会被忽略。
 - 语言服务器命令固定取 `PATH` 里的 `gopls` / `phpantom_lsp`，不写进配置文件。
 - `YI_HOME` 可覆盖数据目录（默认 `~/.yi`）。
+- 每个请求都会带 `User-Agent: yi/<版本>` 和 `x-opencode-session: <会话标识>`。后者是 opencode-go 的要求：缺了它接口直接返回 400 `MissingSessionID`；DeepSeek 官方会忽略它。
 
 ## 用法
 
 ```sh
-yi          # 进入当前项目的会话
-yi -c       # 同上；继续会话是默认行为，-c 只是为了保留手感
+yi          # 有历史就接着上次，没有就新开一条
 ```
 
-启动时打印模型和会话文件路径，然后进入 `> ` 提示符。输入一句话回车即可；Ctrl-D 退出。
+`yi` 没有别的开关：同一目录下存在会话文件就打开它继续，不存在就新建一条。启动时打印供应商、模型和会话文件路径，然后进入 `> ` 提示符。输入一句话回车即可；Ctrl-D 退出。
 
 终端里输入由行编辑器接管：上下键翻当前会话的历史（最近 200 条，连续重复只留一条），左右键移动光标，Home/End、Ctrl-A/E 可用。
 
