@@ -41,12 +41,18 @@ pub struct Provider {
     url: String,
     api_key: String,
     model: String,
+    /// 会话标识，随每个请求发出去。
+    session: String,
 }
 
 impl Provider {
-    pub fn new(cfg: &Config) -> Provider {
+    /// `session` 是会话标识：opencode-go 要求每个会话带一个稳定的
+    /// `x-opencode-session` 头，否则直接 400（MissingSessionID）。
+    pub fn new(cfg: &Config, session: &str) -> Provider {
         let agent: ureq::Agent = ureq::Agent::config_builder()
             .http_status_as_error(false)
+            // 供应商要求客户端自报家门，而不是露出 HTTP 库的名字。
+            .user_agent(format!("yi/{}", env!("CARGO_PKG_VERSION")))
             .timeout_connect(Some(Duration::from_secs(10)))
             .timeout_per_read(Some(Duration::from_secs(120)))
             .build()
@@ -56,6 +62,7 @@ impl Provider {
             url: format!("{}/chat/completions", cfg.base_url.trim_end_matches('/')),
             api_key: cfg.api_key.clone(),
             model: cfg.model.clone(),
+            session: session.to_string(),
         }
     }
 
@@ -78,9 +85,10 @@ impl Provider {
         let agent = self.agent.clone();
         let url = self.url.clone();
         let api_key = self.api_key.clone();
+        let session = self.session.clone();
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
-            let result = send_with_retry(&agent, &url, &api_key, &body)
+            let result = send_with_retry(&agent, &url, &api_key, &session, &body)
                 .and_then(|resp| read_stream(resp, &tx));
             let item = match result {
                 Ok(reply) => StreamItem::Done(reply),
@@ -116,7 +124,7 @@ impl Provider {
             ],
             "stream": false,
         });
-        let resp = send_with_retry(&self.agent, &self.url, &self.api_key, &body)?;
+        let resp = send_with_retry(&self.agent, &self.url, &self.api_key, &self.session, &body)?;
         let text = resp
             .into_body()
             .read_to_string()
@@ -133,6 +141,7 @@ fn send_with_retry(
     agent: &ureq::Agent,
     url: &str,
     api_key: &str,
+    session: &str,
     body: &Value,
 ) -> Result<ureq::http::Response<ureq::Body>> {
     let delays = [1u64, 2, 4];
@@ -141,6 +150,8 @@ fn send_with_retry(
             .post(url)
             .header("Authorization", &format!("Bearer {api_key}"))
             .header("Content-Type", "application/json")
+            // DeepSeek 官方会忽略这个头；opencode-go 缺了它直接 400。
+            .header("x-opencode-session", session)
             .send_json(body);
 
         match sent {

@@ -38,8 +38,9 @@ impl Agent {
         let effort = session.current_effort().or(cfg.effort.clone());
         let log_dir = session_path.parent().unwrap_or(Path::new(".")).join("logs");
 
+        let session_id = session.id().to_string();
         Ok(Agent {
-            provider: Provider::new(cfg),
+            provider: Provider::new(cfg, &session_id),
             session,
             tools: Tools::new(
                 PathBuf::from(cwd),

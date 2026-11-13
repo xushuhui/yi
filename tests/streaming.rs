@@ -374,3 +374,39 @@ fn a_failure_followed_by_different_calls_does_not_stop_the_turn() {
     assert_eq!(text, "继续做完了");
     assert_eq!(tools.len(), 3, "换调用就重新计数，不该被拦");
 }
+
+/// opencode-go 要求每个会话带一个稳定的 `x-opencode-session`，否则直接 400
+/// （MissingSessionID）。同时要求客户端自报 User-Agent，而不是暴露 HTTP 库。
+#[test]
+fn every_request_carries_a_stable_session_header() {
+    let home = temp_home("session-header-home");
+    let server = start_server(vec![plain_response(&["一"]), plain_response(&["二"])]);
+    let mut agent = Agent::new(
+        &config(server.port, &home, None),
+        "/tmp/proj",
+        &session_path(&home),
+    )
+    .expect("打开会话");
+    collect(&mut agent, "第一句");
+    collect(&mut agent, "第二句");
+
+    let headers = server.headers.lock();
+    assert_eq!(headers.len(), 2, "两轮应当各发一次请求");
+    let find = |index: usize, name: &str| {
+        headers[index]
+            .iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.clone())
+    };
+
+    let first = find(0, "x-opencode-session").expect("请求必须带 x-opencode-session");
+    let second = find(1, "x-opencode-session").expect("第二轮也要带");
+    assert!(!first.is_empty(), "会话标识不能是空串");
+    assert_eq!(first, second, "同一条会话里这个头必须稳定");
+
+    let agent_name = find(0, "user-agent").unwrap_or_default();
+    assert!(
+        agent_name.starts_with("yi/"),
+        "要用自己的 User-Agent，实际是 {agent_name:?}"
+    );
+}

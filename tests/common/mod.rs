@@ -17,9 +17,14 @@ use yi::agent::Agent;
 use yi::config::Config;
 use yi::provider::Event;
 
+/// 一个请求的头部键值对，键已转成小写。
+pub type Headers = Vec<(String, String)>;
+
 pub struct FakeServer {
     pub port: u16,
     pub bodies: Arc<Mutex<Vec<Value>>>,
+    /// 每个请求的头部，按到达顺序；断言协议层细节时用。
+    pub headers: Arc<Mutex<Vec<Headers>>>,
 }
 
 /// 按给定顺序回应每个请求，并把收到的请求体留档。
@@ -28,13 +33,16 @@ pub fn start_server(responses: Vec<String>) -> FakeServer {
     let port = listener.local_addr().expect("取端口").port();
     let bodies = Arc::new(Mutex::new(Vec::new()));
     let recorded = Arc::clone(&bodies);
+    let headers = Arc::new(Mutex::new(Vec::new()));
+    let recorded_headers = Arc::clone(&headers);
 
     thread::spawn(move || {
         for response in responses {
             let Ok((stream, _)) = listener.accept() else {
                 return;
             };
-            let body = read_request(&stream);
+            let (head, body) = read_request(&stream);
+            recorded_headers.lock().push(head);
             if let Ok(json) = serde_json::from_str::<Value>(&body) {
                 recorded.lock().push(json);
             }
@@ -44,13 +52,19 @@ pub fn start_server(responses: Vec<String>) -> FakeServer {
         }
     });
 
-    FakeServer { port, bodies }
+    FakeServer {
+        port,
+        bodies,
+        headers,
+    }
 }
 
-fn read_request(stream: &TcpStream) -> String {
+/// 读一次请求：返回头部键值对（键统一小写）与正文。
+fn read_request(stream: &TcpStream) -> (Headers, String) {
     let mut reader = BufReader::new(stream);
     let mut content_length = 0usize;
     let mut line = String::new();
+    let mut headers = Vec::new();
     loop {
         line.clear();
         if reader.read_line(&mut line).unwrap_or(0) == 0 {
@@ -60,14 +74,18 @@ fn read_request(stream: &TcpStream) -> String {
         if head.is_empty() {
             break;
         }
-        let lower = head.to_ascii_lowercase();
-        if let Some(value) = lower.strip_prefix("content-length:") {
-            content_length = value.trim().parse().unwrap_or(0);
+        if let Some((name, value)) = head.split_once(':') {
+            let name = name.to_ascii_lowercase();
+            let value = value.trim().to_string();
+            if name == "content-length" {
+                content_length = value.parse().unwrap_or(0);
+            }
+            headers.push((name, value));
         }
     }
     let mut body = vec![0u8; content_length];
     let _ = reader.read_exact(&mut body);
-    String::from_utf8_lossy(&body).to_string()
+    (headers, String::from_utf8_lossy(&body).to_string())
 }
 
 pub fn sse_response(content: &[&str], reasoning: &[&str], usage: Value) -> String {

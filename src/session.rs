@@ -197,6 +197,11 @@ impl Session {
         })
     }
 
+    /// 会话标识：第一次打开时生成，之后固定。发给供应商做路由与缓存亲和。
+    pub fn id(&self) -> &str {
+        &self.header.id
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }
