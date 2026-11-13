@@ -14,7 +14,7 @@ Status: ready-for-agent
 
 它能读文件（带行号和内容校验锚点）、改文件（只能改这次真正看过的行，文件被别人动过会拒绝）、写文件、执行 shell 命令、按正则搜索代码、按通配符找文件，也能把图片作为输入发给模型。上下文涨到模型窗口的 50% 时，它自动把最早的一段对话压成摘要，只保留最近约 20,000 个 token 的原文，所以我永远不需要主动结束会话。
 
-它只认一个供应商地址和模型（DeepSeek 的 `deepseek-flash`），系统提示词是中文，会读取用户级和仓库级的 `AGENTS.md`。第一期不做记忆、不做多模型、不做子 agent、不做任何我没要求的通用性。
+它内置两套供应商预置（OpenCode Go 与 DeepSeek 官方），默认用 OpenCode Go 的 `deepseek-v4.1-flash`，配置文件里一句话就能换（这不是多供应商抽象，只是一张两行的预置表，见 ADR-0006）；密钥只从环境变量读，配置文件不保存密钥。系统提示词是中文，会读取用户级和仓库级的 `AGENTS.md`。第一期不做记忆、不做多模型、不做子 agent、不做任何我没要求的通用性。
 
 ## 用户故事
 
@@ -69,7 +69,6 @@ Status: ready-for-agent
 |---|---|---|---|
 | `serde` + `serde_json` | 里程碑 ① | JSON 序列化与解析 | 标准库没有 JSON |
 | `ureq`（rustls 后端） | 里程碑 ① | HTTPS 请求与流式响应体 | 标准库没有 TLS |
-| `regex` | 里程碑 ② | `grep` 工具的匹配引擎 | 标准库没有正则 |
 
 `ratatui` 与 `crossterm` **第一期不引入**：界面先走行式输出，理由见 ADR-0002。真需要全屏时再加，那时合计约 80 个包。否决的全屏方案对比（同样实测）：加 `ratatui` + `crossterm` 是 80 个包；再加 `tokio` + `reqwest` + `clap` 是 168 个包，比 omp 的依赖规模还大。开发依赖只有 `parking_lot`（工具规则要求在测试里用它替代 `std::sync::Mutex`）；测试用的假服务器仍用标准库 `TcpListener` 手写，不引入网络库。
 
@@ -91,7 +90,7 @@ Status: ready-for-agent
 
 ### 压缩
 
-- 触发判据用供应商返回的真实用量：最近一次响应的 `prompt_tokens` 超过 **524,288**（`deepseek-flash` 上下文 1,048,576 的 50%）时，在本轮结束后压缩。否决本地估算触发：供应商已经给了准确数字，估算是多余误差源。
+- 触发判据用供应商返回的真实用量：最近一次响应的 `prompt_tokens` 超过**当前模型上下文窗口的 50%**时，在本轮结束后压缩。窗口跟着预置走。两套预置服务的是同一个模型版本（V4.1-Flash-1017），官方文档给的精确窗口是 **1,048,576**（即俗称的 1M，输入与输出合计），所以阈值都是 524,288。否决本地估算触发：供应商已经给了准确数字，估算是多余误差源。
 - 切点：从最新消息往回累计，保留不少于 **20,000 个 token** 的原文（按 UTF-8 字节数除以 3 估算），且必须切在 user 消息的边界上。否决在工具结果处切：供应商要求工具调用与结果配对。
 - 摘要用同一个模型发一次非流式请求，提示词（`prompts/compaction.md`，编译期内嵌）要求中文输出九节：目标、约束、已完成、关键决定、已否决的方案及理由、当前卡点、下一步、涉及文件（只给路径和一句话作用）、未决问题。摘要本身产生的 token 不进入会话上下文，只写入日志。
 - 为什么是这九节：前六节保证接续，后三节解决压缩后最常见的两种退化——把否决过的方案重新提出来、丢掉"试过什么、为什么不行"。
@@ -102,10 +101,16 @@ Status: ready-for-agent
 
 ### 供应商
 
-- 请求：`POST https://api.deepseek.com/chat/completions`，`stream: true`，`stream_options: {"include_usage": true}`，模型 `deepseek-flash`。
+- 两套预置，一个进程只用其中一套：
+  | 预置 id | 地址 | 默认模型 | 窗口 | 密钥环境变量 |
+  |---|---|---|---|---|
+  | `opencode-go`（默认） | `https://opencode.ai/zen/go/v1` | `deepseek-v4.1-flash` | 1,048,576 | `OPENCODE_GO_API_KEY` |
+  | `deepseek` | `https://api.deepseek.com` | `deepseek-flash` | 1,048,576 | `DEEPSEEK_API_KEY` |
+- 请求：`POST <预置地址>/chat/completions`，`stream: true`，`stream_options: {"include_usage": true}`。两者都是 OpenAI 兼容协议，走同一份代码。
+- **密钥只从环境变量读**，配置文件里的 `api_key` 一律忽略：配置文件会被同步、备份、误提交。缺密钥时报错信息点名该供应商的环境变量。
 - **永不发送 `tool_choice`**：DeepSeek 在思考模式下会因此返回 400。
 - assistant 的工具调用轮必须把 `reasoning_content` 原样回放，否则供应商拒绝或行为异常；该字段随消息存进会话文件。
-- 推理强度映射：`auto` = 不发送 `reasoning_effort`（由服务端默认 high）；`low` / `high` / `max` = 原样发送。`deepseek-flash` 只支持这三档，已用 `/models` 实测确认。
+- 推理强度映射：`auto` = 不发送 `reasoning_effort`（由服务端默认 high）；`low` / `high` / `max` = 原样发送。两个模型的元数据都只列出这三档。
 - 缓存：历史前缀只追加、不改写；系统提示词在一条会话内不变；工具结果按顺序追加。用量映射：缓存命中 = `prompt_cache_hit_tokens`，未缓存输入 = `prompt_cache_miss_tokens`，输出 = `completion_tokens`。
 - 重试：连接错误、5xx、429 退避重试 3 次（1s / 2s / 4s）；4xx 立即报错并保留原始信息。连接超时 10 秒，读空闲超时 120 秒。
 - SSE 解析：按行读取，取 `data: ` 之后的内容，`[DONE]` 结束；`tool_calls` 按 `index` 累积参数片段，流结束时统一解析成 JSON 交给工具层。
@@ -142,7 +147,8 @@ Status: ready-for-agent
 - 超时先向整个进程组发 TERM，300 毫秒后补 KILL，保证孙进程也退出、管道关闭（否则收集线程会一直等）。
 
 **`grep { pattern, path?, glob?, case? }`**
-- 用 `regex` 在 Rust 内匹配，遍历时跳过 `.git`、`node_modules`、`target`、`vendor`。
+- 底层调用外部 `rg`（ripgrep），不内置正则引擎：`rg` 速度快、自带 `.gitignore` 与二进制文件处理，省去一个依赖。未安装时报错提示需要 ripgrep。
+- 遍历时固定排除 `node_modules`、`target`、`vendor`（经 `rg --glob '!dir'` 实现，`glob` 工具同样排除）。
 - 命中行按 `相对路径:行号:内容` 返回，单文件最多 20 条、总量最多 200 条，每行截断到 512 字符。
 - 输出里的行号和文件内容同样进入快照表，可以直接拿去 `edit`；同一锚点下再次 `read`/`grep` 会把新看到的行**并入**旧记录，不是覆盖。
 - 命中文件超过 **4 MB** 时不为它记快照（读整份文件只为算锚点，代价太高）；要改这种文件，先 `read`。
@@ -151,10 +157,10 @@ Status: ready-for-agent
 - 通配符相对**给定的搜索根**匹配（`path=src` 配 `*.go` 命中 `src/a.go`），跳过同上的目录，按修改时间倒序，最多 200 条。
 
 **`lsp { action, path, line?, symbol? }`**
-- `action` 三选一：`definition`、`references`、`diagnostics`；其余动作直接报错，且**在校验通过前不启动服务器**。
-- `definition` / `references` 必须给 `line`（从 1 开始），`symbol` 省略时用该行第一个非空白字符的列；`diagnostics` 不需要 `line`。
+- `action` 二选一：`definition`、`references`；其余动作直接报错，且**在校验通过前不启动服务器**。
+- 必须给 `line`（从 1 开始），`symbol` 省略时用该行第一个非空白字符的列。
 - 只接受 `.go` 和 `.php`；其余扩展名报错。
-- 输出：`文件:行:列  代码片段`，每条一行。`definition` 最多 10 条、`references` 最多 50 条、诊断最多 50 条；超出时在末尾写"还有 N 条未显示"。
+- 输出：`文件:行:列  代码片段`，每条一行。`definition` 最多 10 条、`references` 最多 50 条；超出时在末尾写"还有 N 条未显示"。
 - URI 按百分号编码传输并解码，中文、空格、`#`、`%` 等路径必须能正确往返。
 
 ### 终端界面
@@ -163,9 +169,9 @@ Status: ready-for-agent
 - **markdown 渲染**（见 ADR-0004）：按行渲染标题、列表、引用、行内代码、链接，表格保留原样只调暗分隔线；代码块攒到结束围栏后整块交给 `bat` 着色（`--style=plain --theme=ansi`），没装 bat 就退化成无色。只在标准输出是终端且未设置 `NO_COLOR` 时着色，其余情况原样透传。工具失败打一行红色原因，`edit` 成功打一行绿色摘要。
 - 流式文本逐字打印；思考内容默认隐藏，开始时打印一行「思考中…」并在正文到来时覆盖掉。
 - 工具调用按 shell 的样子显示：`bash` 打 `$ 命令`（`$` 绿色，命令不截断；命令词绿色、`-` 选项青色、引号内容黄色、`;`/`|` 调暗；heredoc 正文按解释器/文件后缀/结束标记推断语言后交给 `bat` 高亮），其余工具打 `→ 名字 参数`。
-- 每轮结束只打印一行页脚 `[上下文 3%]`：最近一次请求的 `prompt_tokens` ÷ 1,048,576。缓存命中与本轮 token 用量不再显示，但仍写进会话文件。
+- 每轮结束只打印一行页脚，五项：项目路径（家目录缩写为 `~`）、当前分支、上下文占比、供应商、模型，形如 `[~/gp/yi main · 13% · OpenCode Go · DeepSeek V4.1 Flash]`。占比是最近一次请求的 `prompt_tokens` ÷ 当前窗口。分支每轮跑一次 `git rev-parse --abbrev-ref HEAD`，不是 git 仓库或游离 HEAD 时省掉这一段。缓存命中与本轮 token 用量不显示，但仍写进会话文件。
 - 输入：标准输入是终端时交给行编辑器（`rustyline`，见 ADR-0003）——上下键翻历史、左右移动、退格、Home/End；不是终端时保持逐行读取，供管道和测试使用。Enter 提交，空行忽略，以 `/` 开头按斜杠命令处理。历史是用户敲的原文，存成会话文件里的 `prompt` 条目，最近 200 条、连续重复只留一条，不进入模型上下文。输入行里 Ctrl-C 放弃当前行，Ctrl-D 退出；一轮请求或命令执行期间按 Ctrl-C 取消这一轮（请求与读响应在工作线程，主线程每 100 毫秒检查信号标志与终端发来的 0x03）。
-- 中断：里程碑 ① 里 `Ctrl-C` 直接退出进程；「取消当前轮但不退出」需要信号处理，等工具进来后一起做。
+- 中断：一轮请求或命令执行期间按 Ctrl-C 取消这一轮，会话保留，回到提示符；这段时间键盘归 yi，只认 Ctrl-C，其余按键静默丢弃。输入行里 Ctrl-C 放弃当前行，Ctrl-D 退出。
 - 斜杠命令只有三个：`/new`、`/effort <auto|low|high|max>`、`/help`。
 - 多行输入：粘贴多行时整段作为一条消息提交，不按行拆开。
 - 补全：以 `/` 开头的输入按子序列模糊匹配命令名（`/nw` → `/new`），行内灰字显示最可能补全的剩余部分，Tab 补全、再按 Tab 列出候选与说明，最多 8 条；`/skill:<前缀>`（冒号后允许空格）补技能名并在候选里带描述；没有候选以已输入内容开头时只给最佳一条，Tab 直接替换，避免列表模式先响铃，`/effort ` 补四个档位。
@@ -182,12 +188,11 @@ Status: ready-for-agent
 
 - 只用机器上已有的服务器，**不安装新的**。实测：Go 用 `gopls`（v0.21.1，`/opt/homebrew/opt/gopath/bin/gopls`），PHP 用 `phpantom_lsp`（0.8.0，`/opt/homebrew/bin/phpantom_lsp`）；后者的 `initialize` 返回支持 definition / references / hover。
 - **不支持 TypeScript**：机器上没有独立的 TypeScript LSP；VS Code 自带的 `tsserver` 在应用包内、走私有协议，要包一层才算 LSP，属于安装新东西，不做。
-- 工具面只开三个动作：`definition`、`references`、`diagnostics`。悬停、重命名、格式化不做。
+- 工具面只开两个动作：`definition`、`references`。诊断、悬停、重命名、格式化都不做：诊断靠 `bash` 跑 `go vet` 等命令；它需要等待服务器推送且有竞态，删掉比修更划算。
 - 懒启动：第一次调用才起进程，按 (语言, 项目根) 缓存；后台线程每 60 秒清一次，空闲超过 10 分钟的服务器自动终止，yi 退出时一并终止。服务器自己崩了，下次调用自动重起。
 - 服务器命令固定取 PATH 里的 `gopls` / `phpantom_lsp`；配置文件里写 `gopls` / `phpantom` 会被忽略，免得同一个东西有两种配法。
 - 超时：`initialize` 15 秒，单次请求 15 秒；超时以 `ERROR:` 文本返回，不卡住整轮。
 - 项目根：Go 找最近的 `go.mod`，PHP 找最近的 `composer.json`；找不到就用当前目录。
-- 诊断优先用服务器主动推送的 `publishDiagnostics`；每次打开/变更文件都先清掉旧诊断，避免把过期结果当成"干净"。等待 1.2 秒仍没收到就回"暂时没有诊断（服务器可能还没完成索引）"，不谎称没有错误。
 
 ### 提示词与上下文文件
 
@@ -220,7 +225,7 @@ Status: ready-for-agent
 8. `bash` 超时 → 返回 `ERROR`，子进程已退出。
 9. 第二轮请求的 messages 前缀与第一轮逐字节相同；assistant 工具调用轮的 `reasoning_content` 出现在下一轮请求中。
 10. `/effort` 设为 `low` → 请求体含 `"reasoning_effort":"low"`；`auto` → 请求体不含该键。
-11. 假服务器返回带大 `prompt_tokens` 的用量，超过 524,288 → 会话文件追加 `compaction` 条目；下一次请求只含摘要与 `firstKeptSeq` 之后的消息。
+11. 假服务器返回带大 `prompt_tokens` 的用量，超过当前窗口的一半（`deepseek` 预置下是 524,288）→ 会话文件追加 `compaction` 条目；下一次请求只含摘要与 `firstKeptSeq` 之后的消息。
 12. 同一目录启动第二个实例 → 非零退出，提示已存在运行中的会话。
 
 LSP 另有独立用例：Go/PHP 各一条跳定义、嵌套目录里的找引用、中文路径下的定位与代码片段、带类型错误的诊断、服务器不回话时 15 秒超时、未知动作不启动服务器、配置文件里的 `gopls`/`phpantom` 被忽略。缺少服务器时用例打印 `SKIP` 并返回，不算失败。
