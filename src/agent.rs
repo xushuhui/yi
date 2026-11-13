@@ -8,8 +8,6 @@ use crate::tools::{Outcome, Tools};
 
 /// 同一个调用连续失败这么多次就停：挡住真死循环，又不掐断正常的长任务。
 const REPEAT_FAILURES: usize = 3;
-/// 输入 token 超过这个数就在本轮结束后压缩（上下文 1,048,576 的 50%）。
-const COMPACT_AT_TOKENS: u64 = 524_288;
 /// 压缩时保留的最近原文，按 UTF-8 字节数除以 3 估算。
 const KEEP_RECENT_TOKENS: u64 = 20_000;
 const COMPACTION_PROMPT: &str = include_str!("../prompts/compaction.md");
@@ -20,6 +18,8 @@ pub struct Agent {
     tools: Tools,
     system: String,
     effort: Option<String>,
+    /// 上下文涨到这个量就在本轮结束后压缩；按当前模型的窗口算。
+    compact_at: u64,
 }
 
 impl Agent {
@@ -49,6 +49,7 @@ impl Agent {
             ),
             system: cfg.system_prompt(cwd),
             effort,
+            compact_at: cfg.compact_at_tokens(),
         })
     }
 
@@ -227,7 +228,7 @@ impl Agent {
 
     /// 上下文超过阈值就压缩一次。压缩失败只提示，不影响这一轮的回答。
     fn maybe_compact(&mut self, usage: &Usage, on: &mut dyn FnMut(Event)) -> Result<()> {
-        if usage.prompt_tokens() <= COMPACT_AT_TOKENS {
+        if usage.prompt_tokens() <= self.compact_at {
             return Ok(());
         }
         let Some(plan) = self.session.plan_compaction(KEEP_RECENT_TOKENS) else {

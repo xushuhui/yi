@@ -4,7 +4,7 @@ use std::path::Path;
 
 use yi::agent::Agent;
 use yi::complete::Helper;
-use yi::config::{self, CONTEXT_WINDOW, Config};
+use yi::config::{self, Config};
 use yi::provider::Event;
 use yi::render::{self, Renderer};
 use yi::session::{HISTORY_LIMIT, Usage};
@@ -55,7 +55,7 @@ fn run() -> Result<()> {
     let color = io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
     let mut renderer = Renderer::new(color);
 
-    println!("yi · {} · {cwd}", cfg.model);
+    println!("yi · {} · {} · {cwd}", cfg.display, cfg.model_display);
     println!("会话：{}", session_path.display());
     println!("输入 /help 查看命令，Ctrl-D 退出。\n");
 
@@ -138,7 +138,18 @@ fn run() -> Result<()> {
         match result {
             Ok(usage) => {
                 println!();
-                println!("{}", footer(&usage));
+                let branch = git_branch(&cwd);
+                println!(
+                    "{}",
+                    footer(
+                        &usage,
+                        cfg.context_window,
+                        &short_project(&cwd),
+                        branch.as_deref(),
+                        cfg.display,
+                        &cfg.model_display,
+                    )
+                );
                 println!();
             }
             Err(err) => {
@@ -244,21 +255,73 @@ fn print_help() {
   /skill:<名字> [要求]      把某个技能的正文注入这一轮
   /help                     显示这份帮助
 
-环境变量：
-  DEEPSEEK_API_KEY  API key（也可写在 ~/.yi/config.json 的 api_key）
-  YI_HOME           数据目录，默认 ~/.yi
+环境变量（密钥只从这里读）：
+  OPENCODE_GO_API_KEY  OpenCode Go 的密钥（默认供应商）
+  DEEPSEEK_API_KEY     DeepSeek 官方的密钥（provider 设为 deepseek 时）
+  YI_HOME              数据目录，默认 ~/.yi
 
-配置文件 ~/.yi/config.json 可选字段：api_key、base_url、model、effort。
+配置文件 ~/.yi/config.json 可选字段：provider、base_url、model、effort。
+  provider 选预置：opencode-go（默认）或 deepseek。
 "
     );
 }
 
-/// 页脚只报上下文占比：缓存和本轮用量是内部数据，不占屏幕。
-fn footer(usage: &Usage) -> String {
+/// 页脚一行：项目、分支、上下文占比、供应商、模型。
+///
+/// 缓存与本轮用量是内部数据，只写进会话文件，不占屏幕。
+fn footer(
+    usage: &Usage,
+    window: u64,
+    place: &str,
+    branch: Option<&str>,
+    provider: &str,
+    model: &str,
+) -> String {
     // 百分比用最后一次请求的输入量：那才是「上下文现在多大」。
     // 整轮累加的 prompt 会随步数增长，和多轮工具调用的实际上下文无关。
-    let percent = usage.context_prompt * 100 / CONTEXT_WINDOW;
-    format!("[上下文 {percent}%]")
+    let percent = usage.context_prompt * 100 / window.max(1);
+    let mut out = String::from("[");
+    out.push_str(place);
+    if let Some(branch) = branch {
+        out.push(' ');
+        out.push_str(branch);
+    }
+    out.push_str(&format!(" · {percent}% · {provider} · {model}]"));
+    out
+}
+
+/// 项目路径缩写：家目录换成 `~`，其余原样。
+fn short_project(cwd: &str) -> String {
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    shorten(cwd, home.as_deref())
+}
+
+fn shorten(cwd: &str, home: Option<&Path>) -> String {
+    let Some(home) = home else {
+        return cwd.to_string();
+    };
+    match Path::new(cwd).strip_prefix(home) {
+        Ok(rest) if rest.as_os_str().is_empty() => "~".to_string(),
+        Ok(rest) => format!("~/{}", rest.display()),
+        Err(_) => cwd.to_string(),
+    }
+}
+
+/// 当前分支；不是 git 仓库、或处在游离 HEAD 时返回 `None`，页脚就省掉这一段。
+fn git_branch(cwd: &str) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .current_dir(cwd)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if branch.is_empty() || branch == "HEAD" {
+        return None;
+    }
+    Some(branch)
 }
 
 #[cfg(test)]
@@ -278,14 +341,40 @@ mod tests {
 
     #[test]
     fn footer_percent_uses_the_last_request_not_the_whole_turn() {
-        // 这一轮累计输入 1,000,000，但最后一次请求只有 524,288（窗口的一半）。
-        let line = footer(&usage(524_288, 500_000, 500_000));
-        assert!(line.contains("上下文 50%"), "{line}");
-        assert_eq!(line, "[上下文 50%]");
+        // 这一轮累计输入 1,000,000，但最后一次请求只有窗口的一半。
+        let line = footer(
+            &usage(524_288, 500_000, 500_000),
+            1_048_576,
+            "~/gp/yi",
+            Some("main"),
+            "OpenCode Go",
+            "DeepSeek V4.1 Flash",
+        );
+        assert_eq!(
+            line,
+            "[~/gp/yi main · 50% · OpenCode Go · DeepSeek V4.1 Flash]"
+        );
     }
 
     #[test]
-    fn footer_handles_an_empty_turn() {
-        assert_eq!(footer(&usage(0, 0, 0)), "[上下文 0%]");
+    fn footer_omits_the_branch_when_there_is_none() {
+        let line = footer(
+            &usage(0, 0, 0),
+            1_048_576,
+            "~/gp/yi",
+            None,
+            "DeepSeek",
+            "DeepSeek Flash",
+        );
+        assert_eq!(line, "[~/gp/yi · 0% · DeepSeek · DeepSeek Flash]");
+    }
+
+    #[test]
+    fn project_paths_under_home_get_a_tilde() {
+        let home = Path::new("/Users/xsh");
+        assert_eq!(shorten("/Users/xsh/gp/yi", Some(home)), "~/gp/yi");
+        assert_eq!(shorten("/Users/xsh", Some(home)), "~");
+        assert_eq!(shorten("/opt/tmp", Some(home)), "/opt/tmp");
+        assert_eq!(shorten("/opt/tmp", None), "/opt/tmp");
     }
 }

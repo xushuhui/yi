@@ -150,8 +150,12 @@ pub fn temp_home(tag: &str) -> PathBuf {
 pub fn config(port: u16, home: &Path, effort: Option<&str>) -> Config {
     Config {
         api_key: "test-key".to_string(),
+        provider: "deepseek",
+        display: "DeepSeek",
         base_url: format!("http://127.0.0.1:{port}"),
         model: "deepseek-flash".to_string(),
+        model_display: "DeepSeek Flash".to_string(),
+        context_window: 1_048_576,
         effort: effort.map(str::to_string),
         home: home.to_path_buf(),
         gopls: "gopls".to_string(),
