@@ -19,22 +19,17 @@ fn main() {
 
 fn run() -> Result<()> {
     yi::crash::install_hook();
-    for arg in std::env::args().skip(1) {
-        match arg.as_str() {
-            // 默认行为就是继续本项目会话，`-c` 只为保留手感。
-            "-c" => {}
-            "-h" | "--help" => {
-                print_help();
-                return Ok(());
-            }
-            "-v" | "--version" => {
-                println!("yi {}", env!("CARGO_PKG_VERSION"));
-                return Ok(());
-            }
-            other => {
-                return Err(Error::Config(format!("未知参数 {other}；用 -h 查看用法")));
-            }
+    // 只认第一个参数：`-h` 与 `-v`，其余一律报错。没有参数就是默认行为。
+    if let Some(arg) = std::env::args().nth(1) {
+        if arg == "-h" || arg == "--help" {
+            print_help();
+            return Ok(());
         }
+        if arg == "-v" || arg == "--version" {
+            println!("yi {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
+        return Err(Error::Config(format!("未知参数 {arg}；用 -h 查看用法")));
     }
 
     let cwd = std::env::current_dir()?.to_string_lossy().to_string();
@@ -243,9 +238,8 @@ fn handle_command(line: &str, agent: &mut Agent) {
 fn print_help() {
     println!(
         "\
-用法：yi [-c] [-h] [-v]
+用法：yi [-h] [-v]
 
-  -c            继续当前项目的会话（默认行为，保留手感）
   -h, --help    显示这份帮助
   -v, --version 显示版本
 
