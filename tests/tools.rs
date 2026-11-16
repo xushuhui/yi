@@ -158,17 +158,73 @@ fn a_successful_edit_does_not_print_a_result_line() {
     let mut notes = Vec::new();
     agent
         .submit("改", &mut |event| {
-            if let Event::ToolResult { name, note } = event {
-                notes.push((name, note));
+            if let Event::ToolResult { name, note, failed } = event {
+                notes.push((name, note, failed));
             }
         })
         .expect("改这一轮成功");
     // 事件照发（界面靠它把状态行推回「等待模型」），但提示是空的，什么都不打印。
     assert_eq!(
         notes,
-        vec![("edit".to_string(), String::new())],
+        vec![("edit".to_string(), String::new(), false)],
         "{notes:?}"
     );
+}
+
+#[test]
+fn a_search_with_no_match_is_reported_without_a_failure_mark() {
+    let home = temp_home("no-match-home");
+    let ws = temp_home("no-match-ws");
+    std::fs::write(ws.join("a.txt"), "one\ntwo\n").unwrap();
+
+    let server = start_server(vec![
+        tool_response(&[("c1", "bash", json!({ "command": "grep -n zzz a.txt" }))]),
+        plain_response(&["ok"]),
+    ]);
+    let mut agent = open_agent(server.port, &home, &ws);
+    let mut notes = Vec::new();
+    agent
+        .submit("找 zzz", &mut |event| {
+            if let Event::ToolResult { name, note, failed } = event {
+                notes.push((name, note, failed));
+            }
+        })
+        .expect("这一轮成功");
+
+    assert_eq!(
+        notes,
+        vec![(
+            "bash".to_string(),
+            "grep -n zzz a.txt — 没有匹配（退出码 1）".to_string(),
+            false
+        )],
+        "没匹配不该标成失败"
+    );
+}
+
+#[test]
+fn repeating_a_search_that_finds_nothing_does_not_stop_the_round() {
+    let home = temp_home("no-match-repeat-home");
+    let ws = temp_home("no-match-repeat-ws");
+    std::fs::write(ws.join("a.txt"), "one\ntwo\n").unwrap();
+
+    // 同一个调用连续三次都没匹配：以前会触发「连续失败三次就停」。
+    let server = start_server(vec![
+        tool_response(&[("c1", "bash", json!({ "command": "grep -n zzz a.txt" }))]),
+        tool_response(&[("c2", "bash", json!({ "command": "grep -n zzz a.txt" }))]),
+        tool_response(&[("c3", "bash", json!({ "command": "grep -n zzz a.txt" }))]),
+        plain_response(&["ok"]),
+    ]);
+    let mut agent = open_agent(server.port, &home, &ws);
+    let (text, _, _) = collect(&mut agent, "换着搜三次");
+
+    assert_eq!(text, "ok", "这一轮应当正常收尾");
+    let stopped = session_entries(&home).iter().any(|entry| {
+        entry["message"]["content"]
+            .as_str()
+            .is_some_and(|content| content.contains("已停止调用工具"))
+    });
+    assert!(!stopped, "没匹配不该触发放停");
 }
 
 #[test]

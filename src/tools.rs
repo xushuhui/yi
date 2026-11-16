@@ -14,6 +14,17 @@ use crate::lsp::Lsp;
 use crate::provider::Event;
 use crate::session::ToolCall;
 
+/// 搜索类命令没找到东西时的提示。grep 约定：0 有匹配、1 没匹配、2 真出错。
+pub const NO_MATCH: &str = "没有匹配（退出码 1）";
+
+/// 命令里是否在跑搜索工具。只看命令词，避免把 `false`、编译错误这类
+/// 退出码 1 也当成「没找到」。
+fn searches(command: &str) -> bool {
+    command
+        .split(|ch: char| ch.is_whitespace() || matches!(ch, ';' | '|' | '&' | '(' | ')'))
+        .any(|word| matches!(word, "grep" | "egrep" | "fgrep" | "rg" | "ag" | "ack"))
+}
+
 const DEFAULT_READ_LINES: usize = 300;
 const MAX_READ_LINES: usize = 3000;
 const MAX_READ_BYTES: usize = 50 * 1024;
@@ -746,8 +757,10 @@ impl Tools {
             text
         };
 
+        // 搜索工具用 1 表示「没找到」，不是出错：换个写法，别让上层当成失败。
         let code = match &status {
             Some(finished) => match finished.code() {
+                Some(1) if searches(&command) => NO_MATCH.to_string(),
                 Some(code) => format!("退出码：{code}"),
                 None => "退出码：被信号终止".to_string(),
             },
@@ -1379,6 +1392,27 @@ mod tests {
             name: "bash".to_string(),
             arguments: json!({ "command": command }).to_string(),
         }
+    }
+
+    #[test]
+    fn a_search_with_no_match_says_so_instead_of_an_exit_code() {
+        let root = std::env::temp_dir().join("yi-no-match");
+        std::fs::create_dir_all(&root).expect("建目录");
+        std::fs::write(root.join("a.txt"), "one\ntwo\n").expect("写文件");
+        let mut tools = tools(&root);
+
+        // grep 的 1 是「没找到」，换个说法，别让上层当成失败。
+        let out = tools.bash(&json!({ "command": "grep -n zzz a.txt" }), &mut |_| {});
+        assert!(out.contains(NO_MATCH), "{out}");
+
+        // 文件不存在是 exit 2，仍然算真失败。
+        let out = tools.bash(&json!({ "command": "grep -n zzz nope.txt" }), &mut |_| {});
+        assert!(out.contains("退出码：2"), "{out}");
+
+        // 不是搜索命令的退出码 1 保持原样。
+        let out = tools.bash(&json!({ "command": "false" }), &mut |_| {});
+        assert!(out.contains("退出码：1"), "{out}");
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]

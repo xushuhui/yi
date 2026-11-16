@@ -129,6 +129,14 @@ impl Entry {
     }
 }
 
+/// 启动时重放的一行：用户敲的原文、回答正文，或一次工具调用。
+#[derive(Clone, Debug, PartialEq)]
+pub enum Replay {
+    User(String),
+    Assistant(String),
+    Tool(ToolCall),
+}
+
 /// 上键能翻多少条历史。
 pub const HISTORY_LIMIT: usize = 200;
 
@@ -225,6 +233,75 @@ impl Session {
 
     /// 重建发给模型的对话：最近一次压缩的摘要 + 它保留的消息。
     /// 返回借用，避免每次工具步都克隆整段历史。
+    /// 最近 `turns` 轮的重放内容：用户敲的原文、回答正文、工具调用。
+    ///
+    /// 只取压缩边界之后的条目——边界之前的连模型都不记得了，重放出来只会
+    /// 让人以为它还记得。
+    pub fn replay(&self, turns: usize) -> Vec<Replay> {
+        if turns == 0 {
+            return Vec::new();
+        }
+        let mut boundary = 0;
+        if let Some(Entry::Compaction { first_kept_seq, .. }) = self
+            .entries
+            .iter()
+            .rev()
+            .find(|entry| matches!(entry, Entry::Compaction { .. }))
+        {
+            boundary = *first_kept_seq;
+        }
+
+        let mut items = Vec::new();
+        let mut typed = None;
+        for entry in self.entries.iter().filter(|entry| entry.seq() > boundary) {
+            match entry {
+                Entry::Prompt { text, .. } => typed = Some(text.clone()),
+                Entry::Message { message, .. } => match message {
+                    Message::User { content } => {
+                        // 技能调用那一轮显示用户敲的原文，展开后的正文太长。
+                        let text = typed.take().unwrap_or_else(|| content.clone());
+                        items.push(Replay::User(text));
+                    }
+                    Message::Assistant {
+                        content,
+                        tool_calls,
+                        ..
+                    } => {
+                        if !content.trim().is_empty() {
+                            items.push(Replay::Assistant(content.clone()));
+                        }
+                        for call in tool_calls {
+                            items.push(Replay::Tool(call.clone()));
+                        }
+                    }
+                    Message::Tool { .. } | Message::Image { .. } => {}
+                },
+                Entry::EffortChange { .. } | Entry::Compaction { .. } | Entry::Notice { .. } => {}
+            }
+        }
+
+        // 从后往前数用户消息，只留最后 `turns` 轮。
+        let mut seen = 0;
+        let mut start = 0;
+        for (index, item) in items.iter().enumerate().rev() {
+            if matches!(item, Replay::User(_)) {
+                seen += 1;
+                if seen == turns {
+                    start = index;
+                    break;
+                }
+            }
+        }
+        items.split_off(start)
+    }
+
+    /// 会话被压缩过没有：重放时据此说明「早前对话已压缩」。
+    pub fn compacted(&self) -> bool {
+        self.entries
+            .iter()
+            .any(|entry| matches!(entry, Entry::Compaction { .. }))
+    }
+
     pub fn context(&self) -> Context<'_> {
         let mut summary = None;
         let mut boundary = 0u64;
@@ -651,6 +728,70 @@ mod tests {
             name: "read".to_string(),
             arguments: "{}".to_string(),
         }
+    }
+
+    #[test]
+    fn replay_shows_the_last_turns_with_the_typed_line() {
+        let mut session = temp_session("replay-turns");
+        for (index, question) in ["第一问", "第二问", "第三问"].iter().enumerate() {
+            session
+                .append_prompt(&format!("/skill:demo {question}"))
+                .unwrap();
+            session.append_user("展开后的技能正文").unwrap();
+            session
+                .append_assistant(
+                    format!("回答{index}"),
+                    None,
+                    vec![call("c")],
+                    Usage::default(),
+                )
+                .unwrap();
+            session
+                .append_tool_result("c", "工具输出".to_string())
+                .unwrap();
+        }
+
+        // 只留最后两轮；用户那句用敲的原文，工具输出不进来。
+        assert_eq!(
+            session.replay(2),
+            vec![
+                Replay::User("/skill:demo 第二问".to_string()),
+                Replay::Assistant("回答1".to_string()),
+                Replay::Tool(call("c")),
+                Replay::User("/skill:demo 第三问".to_string()),
+                Replay::Assistant("回答2".to_string()),
+                Replay::Tool(call("c")),
+            ]
+        );
+    }
+
+    #[test]
+    fn replay_starts_after_the_compaction_boundary() {
+        let mut session = temp_session("replay-compaction");
+        session.append_prompt("旧问题").unwrap();
+        session.append_user("旧问题").unwrap();
+        session
+            .append_assistant("旧回答".to_string(), None, vec![], Usage::default())
+            .unwrap();
+        let boundary = session.last_seq() + 1;
+        session
+            .append_compaction("先是旧问题，然后旧回答".to_string(), boundary, 100)
+            .unwrap();
+        session.append_prompt("新问题").unwrap();
+        session.append_user("新问题").unwrap();
+        session
+            .append_assistant("新回答".to_string(), None, vec![], Usage::default())
+            .unwrap();
+
+        assert!(session.compacted());
+        // 压缩掉的部分不再重放：模型也不记得了。
+        assert_eq!(
+            session.replay(3),
+            vec![
+                Replay::User("新问题".to_string()),
+                Replay::Assistant("新回答".to_string()),
+            ]
+        );
     }
 
     fn answered(ctx: &Context<'_>) -> Vec<String> {

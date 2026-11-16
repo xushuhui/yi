@@ -7,6 +7,7 @@ use yi::agent::Agent;
 use yi::clipboard::{self, EMPTY_TOKEN, IMAGE_TOKEN};
 use yi::complete::Helper;
 use yi::config::{self, Config};
+use yi::program_status;
 use yi::provider::Event;
 use yi::render::{self, Renderer};
 use yi::session::{HISTORY_LIMIT, Usage};
@@ -59,6 +60,10 @@ fn run() -> Result<()> {
     println!("yi · {} · {} · {cwd}", cfg.display, cfg.model_display);
     println!("会话：{}", session_path.display());
     println!("输入 /help 查看命令，Ctrl-D 退出。\n");
+    // 只给真人看：管道与重定向里保持逐字节稳定。
+    if io::stdout().is_terminal() {
+        print_replay(&agent, color);
+    }
 
     while let Some(line) = read_input(&mut editor)? {
         // Ctrl-G 在行里留了标记；这里换回文字，并把图片取出来。
@@ -131,27 +136,11 @@ fn run() -> Result<()> {
                 status.resume(previous);
                 let _ = io::stdout().flush();
             }
-            Event::ToolCall { name, summary } => {
-                let half = renderer.flush_line();
-                status.clear();
-                print!("{half}");
-                println!();
-                // 命令按 shell 的样子显示（`$ 命令`），其余工具用箭头加名字。
-                if name == "bash" {
-                    if color {
-                        println!("\x1b[32m$\x1b[0m {}", render::shell_line(&summary, true));
-                    } else {
-                        println!("$ {summary}");
-                    }
-                } else if color {
-                    println!("\x1b[36m→\x1b[0m \x1b[2m{summary}\x1b[0m");
-                } else {
-                    println!("→ {summary}");
-                }
+            Event::ToolCall { name, .. } => {
+                // 过程不打印：只在状态行里露一下工具名，失败时才有红行。
                 status.set(&format!("运行 {name}"));
-                let _ = io::stdout().flush();
             }
-            Event::ToolResult { name, note } => {
+            Event::ToolResult { name, note, failed } => {
                 // 成功时没有可打印的内容：只把状态行推回「等待模型」。
                 if note.is_empty() {
                     status.set("等待模型");
@@ -161,7 +150,11 @@ fn run() -> Result<()> {
                 status.clear();
                 print!("{half}");
                 let short: String = note.chars().take(160).collect();
-                println!("{}", render::tool_line(&name, &short, color));
+                if failed {
+                    println!("{}", render::tool_line(&name, &short, color));
+                } else {
+                    println!("{}", render::tool_note(&name, &short, color));
+                }
                 // 工具跑完必然是再一次模型往返。
                 status.set("等待模型");
                 let _ = io::stdout().flush();
@@ -169,6 +162,13 @@ fn run() -> Result<()> {
         });
 
         status.clear();
+        match &result {
+            Ok(usage) => {
+                program_status::done(&format!("完成 · {:.1}s", usage.elapsed_ms as f64 / 1000.0))
+            }
+            Err(Error::Cancelled) => program_status::idle(),
+            Err(err) => program_status::error(&format!("这一轮失败：{err}")),
+        }
         yi::cancel::disarm();
         // 把没换行的半行、没闭合的代码块放出来，再打页脚。
         let tail = renderer.finish();
@@ -197,6 +197,8 @@ fn run() -> Result<()> {
             }
         }
     }
+    // done/error 会一直留在终端里，退出时清掉这条记录。
+    program_status::clear();
 
     Ok(())
 }
@@ -389,6 +391,66 @@ fn print_help() {
     );
 }
 
+/// 启动时把上次的对话放出来：最近三轮，最多两百行。
+///
+/// 只放模型当前还记得的部分（压缩边界之后），免得它「忘了」屏幕上却还写着。
+fn print_replay(agent: &Agent, color: bool) {
+    use yi::session::Replay;
+
+    let items = agent.replay(3);
+    if items.is_empty() {
+        return;
+    }
+    println!("{}", render::dim_line("—— 上次的对话 ——", color));
+    if agent.compacted() {
+        println!(
+            "{}",
+            render::dim_line("早前对话已压缩，更早的内容不再显示", color)
+        );
+    }
+
+    // 行数预算：从后往前留，超出的只丢前面的。
+    const BUDGET: usize = 200;
+    let mut used = 0;
+    let mut keep_from = 0;
+    for (index, item) in items.iter().enumerate().rev() {
+        used += match item {
+            Replay::User(text) | Replay::Assistant(text) => text.lines().count() + 2,
+            Replay::Tool(_) => 1,
+        };
+        if used > BUDGET {
+            keep_from = index + 1;
+            break;
+        }
+    }
+    // 一条消息就超过预算时也要留一条，不能什么都不显示。
+    keep_from = keep_from.min(items.len().saturating_sub(1));
+    if keep_from > 0 {
+        println!(
+            "{}",
+            render::dim_line(&format!("（前面还有 {keep_from} 条没显示）"), color)
+        );
+    }
+
+    for item in &items[keep_from..] {
+        match item {
+            Replay::User(text) => println!("> {text}"),
+            Replay::Assistant(text) => {
+                // 每条回答单独一个渲染器：代码块、表格的状态不跨条继承。
+                let mut renderer = Renderer::new(color);
+                let out = format!("{}{}", renderer.push(text), renderer.finish());
+                print!("{out}");
+                if !out.ends_with('\n') {
+                    println!();
+                }
+            }
+            // 工具调用也不重放：与实时输出一样，只看人和模型的对话。
+            Replay::Tool(_) => {}
+        }
+    }
+    println!();
+}
+
 /// 页脚一行：项目、分支、上下文占比、供应商、模型。
 ///
 /// 缓存与本轮用量是内部数据，只写进会话文件，不占屏幕。
@@ -475,9 +537,16 @@ impl Status {
     }
 
     /// 换阶段并立刻画一次；计时从这一刻重新开始。
+    ///
+    /// 阶段一变就顺手告诉终端（OSC 7501）：状态行给人看，程序状态给 Rex 这类
+    /// 终端看，两者说的是同一件事。
     fn set(&mut self, stage: &str) {
+        let changed = self.label() != Some(stage);
         self.stage = Some((stage.to_string(), std::time::Instant::now()));
         self.draw();
+        if changed {
+            program_status::working(stage);
+        }
     }
 
     /// 每 200 毫秒最多重画一次：秒数在跳，但不值得为它刷屏。

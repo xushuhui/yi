@@ -19,10 +19,11 @@ pub enum Event {
         name: String,
         summary: String,
     },
-    /// 工具结束。`note` 只在失败时有内容（工具名加原因），成功为空、界面不打印。
+    /// 工具结束。`note` 为空表示成功且无需打印；`failed` 决定界面用失败样式还是普通样式。
     ToolResult {
         name: String,
         note: String,
+        failed: bool,
     },
     /// 给用户看的一行提示（压缩完成、压缩失败等）。
     Notice(String),

@@ -754,6 +754,14 @@ pub fn tool_line(name: &str, note: &str, color: bool) -> String {
     format!("{RED}✗ {name}{RESET} {note}")
 }
 
+/// 不算失败的一行提示：暗色工具名加说明，例如「bash 没有匹配（退出码 1）」。
+pub fn tool_note(name: &str, note: &str, color: bool) -> String {
+    if !color {
+        return format!("{name} {note}");
+    }
+    format!("{DIM}{name}{RESET} {note}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -955,6 +963,17 @@ mod tests {
         assert!(out.contains(&format!("{DIM};{RESET}")), "{out}");
         // 关闭颜色时原样返回。
         assert_eq!(shell_line("git status", false), "git status");
+    }
+
+    #[test]
+    fn a_tool_note_is_dim_and_carries_no_failure_mark() {
+        let line = tool_note("bash", "没有匹配（退出码 1）", true);
+        assert_eq!(line, format!("{DIM}bash{RESET} 没有匹配（退出码 1）"));
+        assert!(!line.contains('✗'), "{line}");
+        assert_eq!(
+            tool_note("bash", "没有匹配（退出码 1）", false),
+            "bash 没有匹配（退出码 1）"
+        );
     }
 
     #[test]

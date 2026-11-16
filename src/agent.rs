@@ -67,6 +67,16 @@ impl Agent {
             .is_some_and(|line| line.trim() != "退出码：0")
     }
 
+    /// 启动时重放的最近几轮。
+    pub fn replay(&self, turns: usize) -> Vec<crate::session::Replay> {
+        self.session.replay(turns)
+    }
+
+    /// 会话是否被压缩过。
+    pub fn compacted(&self) -> bool {
+        self.session.compacted()
+    }
+
     /// 记下用户敲的原文，供上键历史使用；不进入模型上下文。
     pub fn note_prompt(&mut self, text: &str) -> Result<()> {
         self.session.append_prompt(text)
@@ -191,11 +201,17 @@ impl Agent {
                         // 清单仍在会话里，模型下一轮读得到。
                         on(Event::ToolResult {
                             name: call.name.clone(),
+                            // 工具调用行不再打印，所以提示里补上是哪条命令 / 哪个文件。
                             note: if failed {
-                                failure_note(&text).to_string()
+                                let reason = failure_note(&text);
+                                let reason = reason.strip_prefix("ERROR: ").unwrap_or(reason);
+                                format!("{last_summary} — {reason}")
+                            } else if text.contains(crate::tools::NO_MATCH) {
+                                format!("{last_summary} — {}", crate::tools::NO_MATCH)
                             } else {
                                 String::new()
                             },
+                            failed,
                         });
                         self.session.append_tool_result(&call.id, text)?;
                     }
