@@ -47,6 +47,7 @@ impl Agent {
                 log_dir,
                 cfg.gopls.clone(),
                 cfg.phpantom.clone(),
+                cfg.rust_analyzer.clone(),
             ),
             system: cfg.system_prompt(cwd),
             effort,
@@ -78,7 +79,17 @@ impl Agent {
 
     /// 一轮对话的入口：失败原因写进会话文件再返回，事后才查得到。
     pub fn submit(&mut self, prompt: &str, on: &mut dyn FnMut(Event)) -> Result<Usage> {
-        let result = self.run_turn(prompt, on);
+        self.submit_with_images(prompt, &[], on)
+    }
+
+    /// 和 [`Agent::submit`] 一样，另外把用户手上的图片一起发出去。
+    pub fn submit_with_images(
+        &mut self,
+        prompt: &str,
+        images: &[std::path::PathBuf],
+        on: &mut dyn FnMut(Event),
+    ) -> Result<Usage> {
+        let result = self.run_turn(prompt, images, on);
         if let Err(crate::Error::Cancelled) = &result {
             let _ = self
                 .session
@@ -91,8 +102,21 @@ impl Agent {
     }
 
     /// 一轮对话：追加用户消息，然后反复「请求模型 → 执行工具」直到模型不再调用工具。
-    fn run_turn(&mut self, prompt: &str, on: &mut dyn FnMut(Event)) -> Result<Usage> {
+    fn run_turn(
+        &mut self,
+        prompt: &str,
+        images: &[std::path::PathBuf],
+        on: &mut dyn FnMut(Event),
+    ) -> Result<Usage> {
         self.session.append_user(prompt)?;
+        // 用户贴的图跟着这句话一起进上下文；读不出来的图会让下一轮请求缺内容，先在这里挡住。
+        for path in images {
+            if let Err(err) = self.session.append_image(path) {
+                let _ = self
+                    .session
+                    .append_notice(&format!("图片没放进会话：{err}"));
+            }
+        }
         let definitions = Tools::definitions();
         let mut total = Usage::default();
 

@@ -86,7 +86,7 @@ fn lsp_rejects_an_unsupported_extension() {
 
     let output = last_tool_output(&home);
     assert!(output.starts_with("ERROR:"), "{output}");
-    assert!(output.contains("只支持 .go 和 .php"), "{output}");
+    assert!(output.contains("只支持 .go、.php 和 .rs"), "{output}");
 }
 
 fn phpantom_available() -> bool {
@@ -259,4 +259,49 @@ fn lsp_does_not_start_a_server_for_an_unknown_action() {
     let output = last_tool_output(&home);
     assert!(output.starts_with("ERROR:"), "{output}");
     assert!(output.contains("未知的 lsp 动作"), "{output}");
+}
+
+fn rust_analyzer_available() -> bool {
+    std::process::Command::new("rust-analyzer")
+        .arg("--version")
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
+#[test]
+fn lsp_finds_a_rust_definition() {
+    if !rust_analyzer_available() {
+        eprintln!("跳过：PATH 里没有 rust-analyzer");
+        return;
+    }
+
+    let home = temp_home("lsp-rs-home");
+    let ws = temp_home("lsp-rs-ws");
+    std::fs::write(
+        ws.join("Cargo.toml"),
+        "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(ws.join("src")).unwrap();
+    std::fs::write(
+        ws.join("src/lib.rs"),
+        "fn helper() -> i32 { 1 }\n\npub fn run() -> i32 { helper() }\n",
+    )
+    .unwrap();
+
+    let server = start_server(vec![
+        tool_response(&[(
+            "c1",
+            "lsp",
+            json!({"action": "definition", "path": "src/lib.rs", "line": 3, "symbol": "helper"}),
+        )]),
+        plain_response(&["ok"]),
+    ]);
+    let mut agent = open_agent(server.port, &home, &ws);
+    collect(&mut agent, "找 helper 的定义");
+
+    let output = last_tool_output(&home);
+    assert!(output.contains("src/lib.rs:1"), "应跳到第 1 行：{output}");
+    assert!(output.contains("fn helper"), "应带上那一行内容：{output}");
 }

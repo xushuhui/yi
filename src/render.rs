@@ -26,11 +26,17 @@ pub struct Renderer {
     in_code: bool,
     code_lang: String,
     code: String,
+    /// 攒着的表格行：整块到齐才能算列宽。
+    table: Vec<String>,
+    /// 终端宽度，用来判断表格会不会超宽；拿不到就是 80。
+    width: usize,
 }
 
 impl Renderer {
     pub fn new(color: bool) -> Renderer {
-        Renderer::with_highlighter(color, color && bat_available())
+        let mut renderer = Renderer::with_highlighter(color, color && bat_available());
+        renderer.width = terminal_width().unwrap_or(80);
+        renderer
     }
 
     /// 测试用：显式决定要不要调用 bat。
@@ -42,7 +48,15 @@ impl Renderer {
             in_code: false,
             code_lang: String::new(),
             code: String::new(),
+            table: Vec::new(),
+            width: 80,
         }
+    }
+
+    /// 测试用：固定终端宽度。
+    pub fn with_width(mut self, width: usize) -> Renderer {
+        self.width = width;
+        self
     }
 
     /// 喂一段流式文本，返回现在就该打印的内容。
@@ -73,7 +87,7 @@ impl Renderer {
         format!("{rendered}\n")
     }
 
-    /// 一轮结束时调用：把残留的半行、未闭合的代码块都放出来。
+    /// 一轮结束时调用：把残留的半行、未闭合的代码块、没等到下一行的表格都放出来。
     pub fn finish(&mut self) -> String {
         if !self.color {
             return String::new();
@@ -92,11 +106,52 @@ impl Renderer {
             self.in_code = false;
             out.push_str(&self.code_block(&lang, &code));
         }
+        let table = self.flush_table();
+        if !table.is_empty() {
+            out.push_str(&table);
+            out.push('\n');
+        }
         out
     }
 
-    /// 处理一整行（不含换行）。返回 `None` 表示这行被代码块吞了，不该单独输出。
+    /// 处理一整行（不含换行）。返回 `None` 表示这行被代码块或表格吞了，不该单独输出。
     fn line(&mut self, line: &str) -> Option<String> {
+        let trimmed = line.trim_start();
+        // 表格要整块到齐才能对齐，先攒着；遇到非表格行再一次性输出。
+        if !self.in_code && trimmed.starts_with('|') {
+            self.table.push(line.to_string());
+            return None;
+        }
+        let table = self.flush_table();
+        let body = self.plain_line(line);
+        match (table.is_empty(), body) {
+            (true, body) => body,
+            (false, None) => Some(table),
+            (false, Some(body)) => Some(format!("{table}\n{body}")),
+        }
+    }
+
+    /// 把攒着的表格画出来；不成表或太宽就原样吐回，只把分隔行调暗。
+    fn flush_table(&mut self) -> String {
+        if self.table.is_empty() {
+            return String::new();
+        }
+        let rows = std::mem::take(&mut self.table);
+        render_table(&rows, self.color, self.width).unwrap_or_else(|| {
+            rows.iter()
+                .map(|row| {
+                    if is_table_rule(row.trim_start()) {
+                        format!("{DIM}{row}{RESET}")
+                    } else {
+                        inline(row, self.color)
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+    }
+
+    fn plain_line(&mut self, line: &str) -> Option<String> {
         let trimmed = line.trim_start();
         if self.in_code {
             if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
@@ -129,7 +184,7 @@ impl Renderer {
         if is_rule(trimmed) {
             return Some(format!("{DIM}{line}{RESET}"));
         }
-        // 表格的分隔行（|---|:--:|）调暗，内容行不动，避免中英文混排算错宽度。
+        // 单独出现的表格分隔行（没有表头的残片）同样调暗。
         if is_table_rule(trimmed) {
             return Some(format!("{DIM}{line}{RESET}"));
         }
@@ -198,6 +253,161 @@ fn is_rule(line: &str) -> bool {
         && (stripped.chars().all(|c| c == '-')
             || stripped.chars().all(|c| c == '*')
             || stripped.chars().all(|c| c == '_'))
+}
+
+/// 终端宽度；不是终端或取不到就返回 `None`，由调用方退到 80。
+fn terminal_width() -> Option<usize> {
+    // SAFETY: 只把窗口大小结构体交给内核填写。
+    unsafe {
+        let mut size: libc::winsize = std::mem::zeroed();
+        if libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut size) == 0 && size.ws_col > 0 {
+            return Some(size.ws_col as usize);
+        }
+    }
+    None
+}
+
+#[derive(Clone, Copy)]
+enum Align {
+    Left,
+    Center,
+    Right,
+}
+
+/// 把攒好的表格画成对齐的列；不成表或宽过终端就返回 `None`，由调用方原样吐回。
+fn render_table(rows: &[String], color: bool, width: usize) -> Option<String> {
+    if rows.len() < 2 || !is_table_rule(rows[1].trim_start()) {
+        return None;
+    }
+    let cells: Vec<Vec<String>> = rows.iter().map(|row| split_cells(row)).collect();
+    let columns = cells.iter().map(Vec::len).max().unwrap_or(0);
+    if columns == 0 {
+        return None;
+    }
+    let aligns: Vec<Align> = (0..columns)
+        .map(|index| {
+            cells[1]
+                .get(index)
+                .map(|cell| align_of(cell))
+                .unwrap_or(Align::Left)
+        })
+        .collect();
+
+    // 列宽按显示宽度算：中文占两格，颜色控制符不算。
+    let mut widths = vec![0usize; columns];
+    for (row_index, row) in cells.iter().enumerate() {
+        if row_index == 1 {
+            continue;
+        }
+        for (index, cell) in row.iter().enumerate() {
+            let text = inline(cell, color);
+            widths[index] = widths[index].max(display_width(&text));
+        }
+    }
+    let total: usize = widths.iter().sum::<usize>() + 2 * columns.saturating_sub(1);
+    if total > width {
+        return None;
+    }
+
+    let mut out: Vec<String> = Vec::new();
+    for (row_index, row) in cells.iter().enumerate() {
+        if row_index == 1 {
+            continue;
+        }
+        let mut line = String::new();
+        for (index, width) in widths.iter().enumerate() {
+            if index > 0 {
+                line.push_str("  ");
+            }
+            let raw = row.get(index).map(String::as_str).unwrap_or("");
+            let text = inline(raw, color);
+            let used = display_width(&text);
+            line.push_str(&pad(&text, used, *width, aligns[index]));
+        }
+        out.push(line.trim_end().to_string());
+        if row_index == 0 {
+            let rule = widths
+                .iter()
+                .map(|width| "\u{2500}".repeat(*width))
+                .collect::<Vec<_>>()
+                .join("  ");
+            out.push(format!("{DIM}{rule}{RESET}"));
+        }
+    }
+    Some(out.join("\n"))
+}
+
+fn split_cells(row: &str) -> Vec<String> {
+    let trimmed = row.trim();
+    let inner = trimmed.strip_prefix('|').unwrap_or(trimmed);
+    let inner = inner.strip_suffix('|').unwrap_or(inner);
+    inner
+        .split('|')
+        .map(|cell| cell.trim().to_string())
+        .collect()
+}
+
+/// `---:` 右对齐、`:---:` 居中，其余左对齐。
+fn align_of(cell: &str) -> Align {
+    let cell = cell.trim();
+    let left = cell.starts_with(':');
+    let right = cell.ends_with(':');
+    match (left, right) {
+        (true, true) => Align::Center,
+        (false, true) => Align::Right,
+        _ => Align::Left,
+    }
+}
+
+fn pad(text: &str, used: usize, width: usize, align: Align) -> String {
+    let gap = width.saturating_sub(used);
+    match align {
+        Align::Left => format!("{text}{}", " ".repeat(gap)),
+        Align::Right => format!("{}{text}", " ".repeat(gap)),
+        Align::Center => {
+            let left = gap / 2;
+            format!("{}{text}{}", " ".repeat(left), " ".repeat(gap - left))
+        }
+    }
+}
+
+/// 显示宽度：跳过 ANSI 转义，东亚宽字符按两格算。
+fn display_width(text: &str) -> usize {
+    let mut width = 0;
+    let mut chars = text.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' {
+            for next in chars.by_ref() {
+                if next.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+            continue;
+        }
+        width += char_width(ch);
+    }
+    width
+}
+
+fn char_width(ch: char) -> usize {
+    let code = ch as u32;
+    let wide = matches!(
+        code,
+        0x1100..=0x115F
+            | 0x2E80..=0x303E
+            | 0x3041..=0x33FF
+            | 0x3400..=0x4DBF
+            | 0x4E00..=0x9FFF
+            | 0xA000..=0xA4CF
+            | 0xAC00..=0xD7A3
+            | 0xF900..=0xFAFF
+            | 0xFE30..=0xFE6F
+            | 0xFF00..=0xFF60
+            | 0xFFE0..=0xFFE6
+            | 0x1F300..=0x1F64F
+            | 0x20000..=0x3FFFD
+    );
+    if wide { 2 } else { 1 }
 }
 
 fn is_table_rule(line: &str) -> bool {
@@ -354,6 +564,15 @@ fn highlight(code: &str, lang: &str) -> Option<String> {
 
 /// 命令本身的着色：命令词绿色、`-` 开头的参数青色、引号里的内容黄色、
 /// 管道和分号调暗。只用于显示，命令怎么执行完全不变。
+/// 一行淡淡的附注（例如「图片：/path」）。
+pub fn dim_line(text: &str, color: bool) -> String {
+    if color {
+        format!("{DIM}{text}{RESET}")
+    } else {
+        text.to_string()
+    }
+}
+
 pub fn shell_line(command: &str, color: bool) -> String {
     if !color {
         return command.to_string();
@@ -601,6 +820,73 @@ mod tests {
         assert!(out.contains('•'), "{out}");
         assert!(out.contains('│'), "{out}");
         assert!(out.contains(DIM), "表格分隔线要调暗：{out}");
+    }
+
+    #[test]
+    fn a_table_becomes_aligned_columns_without_pipes() {
+        let mut renderer = plain().with_width(80);
+        let mut out = renderer.push("| 名称 | 数量 |\n|:---|---:|\n| 苹果 | 12 |\n| pear | 3 |\n");
+        out.push_str(&renderer.finish());
+        let text = strip_ansi(&out);
+        assert!(!text.contains('|'), "渲染后不该再有竖线：{text}");
+        let lines: Vec<&str> = text
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .collect();
+        assert_eq!(lines.len(), 4, "{text}");
+        assert!(
+            lines[1].contains('\u{2500}'),
+            "表头下面要有一条分隔线：{text}"
+        );
+        assert!(lines[0].starts_with("名称"), "{text}");
+        // 数字右对齐：两行的显示宽度相同（中文占两格，不能用字符数比）。
+        assert_eq!(
+            display_width(lines[2]),
+            display_width(lines[3]),
+            "右对齐后两行等宽：{text}"
+        );
+    }
+
+    #[test]
+    fn a_table_that_does_not_fit_falls_back_to_the_raw_rows() {
+        let mut renderer = plain().with_width(20);
+        let mut out = renderer.push("| 名称 | 数量 |\n|---|---|\n| 苹果很甜很好吃 | 12345 |\n");
+        out.push_str(&renderer.finish());
+        let text = strip_ansi(&out);
+        assert!(text.contains('|'), "超宽时原样输出：{text}");
+        assert!(text.contains("苹果很甜很好吃"), "一个字都不能丢：{text}");
+    }
+
+    #[test]
+    fn alignment_markers_move_the_text_inside_the_column() {
+        let mut centre = plain().with_width(80);
+        let mut out = centre.push("| abcd |\n|:---:|\n| x |\n");
+        out.push_str(&centre.finish());
+        let text = strip_ansi(&out);
+        let lines: Vec<&str> = text
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .collect();
+        assert_eq!(lines[2], " x", "居中：{text}");
+
+        let mut right = plain().with_width(80);
+        let mut out = right.push("| abcd |\n|---:|\n| x |\n");
+        out.push_str(&right.finish());
+        let text = strip_ansi(&out);
+        let lines: Vec<&str> = text
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .collect();
+        assert_eq!(lines[2], "   x", "右对齐：{text}");
+    }
+
+    #[test]
+    fn a_table_without_a_separator_row_is_left_alone() {
+        let mut renderer = plain().with_width(80);
+        let mut out = renderer.push("| 随便 |\n| 两行 |\n");
+        out.push_str(&renderer.finish());
+        let text = strip_ansi(&out);
+        assert!(text.contains('|'), "不成表就原样输出：{text}");
     }
 
     #[test]

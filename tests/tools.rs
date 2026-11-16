@@ -832,6 +832,7 @@ fn describe_survives_a_command_whose_80th_byte_is_inside_a_chinese_character() {
         std::env::temp_dir().join("yi-logs"),
         "gopls".to_string(),
         "phpantom_lsp".to_string(),
+        "rust-analyzer".to_string(),
     );
     let line = tools.describe(&call);
     assert!(line.contains('中'), "整条命令都要留下：{line}");

@@ -13,6 +13,9 @@ use crate::{Error, Result};
 const INIT_TIMEOUT: Duration = Duration::from_secs(15);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(600);
+/// rust-analyzer 建好索引前会回空；这段时间里反复查，上限到此为止。
+const WARMUP_WAIT: Duration = Duration::from_secs(30);
+const WARMUP_INTERVAL: Duration = Duration::from_millis(250);
 const REAP_INTERVAL: Duration = Duration::from_secs(60);
 /// 一次结果里最多列这么多条，超出部分在末尾说明还有多少。
 const DEFINITION_CAP: usize = 10;
@@ -22,6 +25,7 @@ const REFERENCE_CAP: usize = 50;
 pub enum Language {
     Go,
     Php,
+    Rust,
 }
 
 impl Language {
@@ -29,13 +33,23 @@ impl Language {
         match self {
             Language::Go => "go",
             Language::Php => "php",
+            Language::Rust => "rust",
         }
     }
 
-    fn command(self, gopls: &str, phpantom: &str) -> String {
+    /// 首次初始化要等多久：rust-analyzer 启动后要建索引，比 gopls / phpantom 慢得多。
+    fn init_timeout(self) -> Duration {
+        match self {
+            Language::Rust => Duration::from_secs(60),
+            _ => INIT_TIMEOUT,
+        }
+    }
+
+    fn command(self, gopls: &str, phpantom: &str, rust_analyzer: &str) -> String {
         match self {
             Language::Go => gopls.to_string(),
             Language::Php => phpantom.to_string(),
+            Language::Rust => rust_analyzer.to_string(),
         }
     }
 
@@ -44,6 +58,7 @@ impl Language {
         match self {
             Language::Go => "go.mod",
             Language::Php => "composer.json",
+            Language::Rust => "Cargo.toml",
         }
     }
 }
@@ -55,20 +70,22 @@ pub struct Lsp {
     clients: Arc<Mutex<HashMap<Key, Client>>>,
     gopls: String,
     phpantom: String,
+    rust_analyzer: String,
 }
 
 impl Lsp {
-    pub fn new(gopls: String, phpantom: String) -> Lsp {
+    pub fn new(gopls: String, phpantom: String, rust_analyzer: String) -> Lsp {
         let clients: Arc<Mutex<HashMap<Key, Client>>> = Arc::new(Mutex::new(HashMap::new()));
         spawn_reaper(Arc::downgrade(&clients));
         Lsp {
             clients,
             gopls,
             phpantom,
+            rust_analyzer,
         }
     }
 
-    /// 三个动作的入口：先校验动作，再决定要不要启动服务器。
+    /// 动作入口：先校验动作与参数，再决定要不要启动服务器。
     pub fn call(
         &mut self,
         action: &str,
@@ -93,7 +110,7 @@ impl Lsp {
             None => true,
         };
         if needs_spawn {
-            let command = language.command(&self.gopls, &self.phpantom);
+            let command = language.command(&self.gopls, &self.phpantom, &self.rust_analyzer);
             let client = Client::spawn(&command, &root, language)?;
             clients.insert(key.clone(), client);
         }
@@ -108,7 +125,7 @@ impl Lsp {
         } else {
             Target::References
         };
-        client.goto(target, path, line, symbol)
+        client.goto(target, path, line, symbol, language)
     }
 }
 
@@ -185,7 +202,13 @@ impl Client {
             .stderr(Stdio::null())
             .current_dir(root)
             .spawn()
-            .map_err(|err| Error::Config(format!("起不了语言服务器 {command}：{err}")))?;
+            .map_err(|err| {
+                let hint = match language {
+                    Language::Rust => "；用 rustup component add rust-analyzer 安装",
+                    _ => "",
+                };
+                Error::Config(format!("起不了语言服务器 {command}：{err}{hint}"))
+            })?;
         let stdin = child
             .stdin
             .take()
@@ -210,7 +233,7 @@ impl Client {
         Ok(client)
     }
 
-    fn initialize(&mut self, root: &Path, _language: Language) -> Result<()> {
+    fn initialize(&mut self, root: &Path, language: Language) -> Result<()> {
         self.request(
             "initialize",
             json!({
@@ -218,7 +241,7 @@ impl Client {
                 "rootUri": file_uri(root),
                 "capabilities": {},
             }),
-            INIT_TIMEOUT,
+            language.init_timeout(),
         )?;
         self.notify("initialized", json!({}))
     }
@@ -229,6 +252,7 @@ impl Client {
         path: &Path,
         line: usize,
         symbol: Option<&str>,
+        language: Language,
     ) -> Result<String> {
         let (line_index, character) = position_in(path, line, symbol)?;
         self.ensure_open(path)?;
@@ -241,8 +265,28 @@ impl Client {
             params["context"] = json!({ "includeDeclaration": true });
         }
 
-        let result = self.request(target.method(), params, REQUEST_TIMEOUT)?;
-        let locations = collect_locations(&result);
+        let mut result = match self.request(target.method(), params.clone(), REQUEST_TIMEOUT) {
+            Ok(value) => value,
+            Err(err) if language == Language::Rust && is_content_modified(&err) => Value::Null,
+            Err(err) => return Err(err),
+        };
+        let mut locations = collect_locations(&result);
+        if locations.is_empty() && language == Language::Rust {
+            // SIMPLIFICATION: rust-analyzer 索引完成前会回空数组、null，或者直接回
+            // `content modified`（-32801，意思是分析状态变了、请再问一次）。这里用轮询
+            // 代替跟踪 $/progress 的索引通知，上限 30 秒。要更精确就改成等
+            // rustAnalyzer/Indexing 的结束事件，代价是多一份通知状态机。
+            let deadline = Instant::now() + WARMUP_WAIT;
+            while locations.is_empty() && Instant::now() < deadline {
+                std::thread::sleep(WARMUP_INTERVAL);
+                result = match self.request(target.method(), params.clone(), REQUEST_TIMEOUT) {
+                    Ok(value) => value,
+                    Err(err) if is_content_modified(&err) => Value::Null,
+                    Err(err) => return Err(err),
+                };
+                locations = collect_locations(&result);
+            }
+        }
         if locations.is_empty() {
             return Ok(target.empty().to_string());
         }
@@ -392,8 +436,9 @@ pub fn language_of(path: &Path) -> Result<Language> {
     {
         "go" => Ok(Language::Go),
         "php" => Ok(Language::Php),
+        "rs" => Ok(Language::Rust),
         other => Err(Error::Config(format!(
-            "LSP 只支持 .go 和 .php，这个文件是 .{other}"
+            "LSP 只支持 .go、.php 和 .rs，这个文件是 .{other}"
         ))),
     }
 }
@@ -469,6 +514,11 @@ fn position_in(path: &Path, line: usize, symbol: Option<&str>) -> Result<(u64, u
     // LSP 的列号按 UTF-16 计算，不是字节。
     let character: usize = content[..byte_index].chars().map(char::len_utf16).sum();
     Ok(((line - 1) as u64, character as u64))
+}
+
+/// `content modified`：语言服务器认为分析状态变了，重问即可，不算失败。
+fn is_content_modified(err: &Error) -> bool {
+    matches!(err, Error::Config(message) if message.contains("-32801"))
 }
 
 fn collect_locations(result: &Value) -> Vec<(PathBuf, u64, u64)> {

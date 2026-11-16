@@ -22,7 +22,7 @@ yi
 ## 环境要求
 
 - macOS 或 Linux。
-- Rust 1.85 以上（项目用 2024 版语言标准）。
+- Rust 1.89 以上（项目用 2024 版语言标准，会话文件锁用到 1.89 稳定的 `File::try_lock`）。
 - [ripgrep](https://github.com/BurntSushi/ripgrep)：`grep` 和 `glob` 两个工具直接调用 `rg`，没有它这两个工具会报错。
 - DeepSeek API key。
 - 可选：`gopls`（Go 语言服务器）、`phpantom_lsp`（PHP 语言服务器），只有用到 `lsp` 工具时才需要。
@@ -71,6 +71,8 @@ yi          # 有历史就接着上次，没有就新开一条
 以 `/` 开头时会补全并给出行内提示：输入 `/ne` 光标后就淡淡显示 `w`，按 Tab 直接补成 `/new`；再按一次 Tab 列出全部候选和说明。`/skill:` 后面按同样规则补技能名（冒号后有没有空格都行），候选里带技能描述；`/effort ` 后面补 `auto` / `low` / `high` / `max`。匹配是子序列式的，`/nw` 能命中 `/new`，`dvrs` 能命中 `adversarial-review`，`/skill: doc` 能命中 `grill-with-docs`；没有候选以已输入内容开头时，Tab 直接替换成最匹配的一条，不会先响铃。候选超过 8 个时只列 7 条并注明还有多少。历史是你敲的原文，`/skill:` 不会把展开后的技能正文存进去。输入行里按 Ctrl-C 放弃这一行并回到提示符；模型正在思考或输出时按 Ctrl-C 取消这一轮，会话保留，回到提示符；命令执行中按 Ctrl-C 同样取消，并结束该命令的整个进程组。
 
 从管道或脚本喂输入时（`echo "..." | yi`）不接管按键，行为与以前一致：逐行读取。
+
+想让模型看图，把图片路径贴进来就行——整行是一个路径，或在正文里写 `@路径`（拖拽图片到终端产生的也是路径文本）。支持 png / jpg / jpeg / gif / webp，超过 20 MB 会拒绝。终端会先打一行 `图片：<路径>`，让你确认贴对了。
 
 ## 输出长什么样
 
@@ -158,8 +160,9 @@ PUT 12.=13:
 
 ### 语言服务（LSP）
 
-- 支持 `.go`（`gopls`）和 `.php`（`phpantom_lsp`），其它扩展名直接报错。
-- 按「语言 + 项目根」懒启动：第一次调用才起进程，项目根是最近的 `go.mod` / `composer.json` 所在目录。
+- 支持 `.go`（`gopls`）、`.php`（`phpantom_lsp`）和 `.rs`（`rust-analyzer`），其它扩展名直接报错。
+- 按「语言 + 项目根」懒启动：第一次调用才起进程，项目根是最近的 `go.mod` / `composer.json` / `Cargo.toml` 所在目录。
+- `rust-analyzer` 在建索引前会返回空结果，yi 会自动重问最多 30 秒；首次查定义可能要等一两秒。没装的话提示 `rustup component add rust-analyzer`。
 - 后台每 60 秒清一次，空闲超过 10 分钟的服务器会被终止；`yi` 退出时全部终止；服务器自己崩了，下次调用自动重起。
 - 两个动作：`definition`、`references`，都要给行号（从 1 开始）。
 - 单次请求 15 秒超时，超时作为普通错误文本返回给模型，不会卡住终端。
@@ -167,7 +170,8 @@ PUT 12.=13:
 ## 系统提示词、AGENTS.md 与技能
 
 - 系统提示词在 `prompts/system.md`，编译时内嵌进二进制，是唯一来源。
-- 启动时再追加两份 `AGENTS.md`（如果存在）：`~/.yi/AGENTS.md`（用户级）和项目根的 `AGENTS.md`（项目级），以 `<context-file>` 块原样拼在后面。
+- 启动时再追加两份 `AGENTS.md`（如果存在）：`~/.yi/AGENTS.md`（用户级）和仓库的 `AGENTS.md`，以 `<context-file>` 块原样拼在后面。仓库那份从启动目录**往上找最近的**，到家目录为止——所以在子目录启动也能用上仓库根的规则。
+- 系统提示词里写明了：这些块是必须遵守的规则，与当轮要求冲突时先问清楚。
 - 技能是带 YAML 头部的 `SKILL.md`，扫描顺序：`<项目>/.yi/skills`、`~/.yi/skills`、`~/.agents/skills`。
   - 系统提示词里只列技能的名字、描述和路径，模型需要时用 `read` 读正文。
   - 头部写 `disable-model-invocation: true` 的技能不出现在提示词里，只能由人用 `/skill:<名字>` 调用。

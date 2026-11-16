@@ -180,6 +180,7 @@ pub fn config(port: u16, home: &Path, effort: Option<&str>) -> Config {
         home: home.to_path_buf(),
         gopls: "gopls".to_string(),
         phpantom: "phpantom_lsp".to_string(),
+        rust_analyzer: "rust-analyzer".to_string(),
     }
 }
 

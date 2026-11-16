@@ -410,3 +410,42 @@ fn every_request_carries_a_stable_session_header() {
         "要用自己的 User-Agent，实际是 {agent_name:?}"
     );
 }
+
+/// 用户自己贴的图片（整行路径或 `@路径`）要跟着这句话一起发给模型。
+#[test]
+fn a_user_attached_image_goes_out_with_the_first_request() {
+    let home = temp_home("attach-home");
+    let ws = temp_home("attach-ws");
+    let pic = ws.join("shot.png");
+    std::fs::write(&pic, b"not-really-a-png").unwrap();
+
+    let server = start_server(vec![plain_response(&["看到了"])]);
+    let mut agent = Agent::new(
+        &config(server.port, &home, None),
+        "/tmp/proj",
+        &session_path(&home),
+    )
+    .expect("打开会话");
+
+    let mut text = String::new();
+    agent
+        .submit_with_images("看图", &[pic], &mut |event| {
+            if let yi::provider::Event::Text(piece) = event {
+                text.push_str(&piece);
+            }
+        })
+        .expect("提交");
+    assert_eq!(text, "看到了");
+
+    let bodies = server.bodies.lock();
+    let attached = bodies[0]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|message| {
+            message["content"]
+                .as_array()
+                .is_some_and(|parts| parts.iter().any(|part| part["type"] == "image_url"))
+        });
+    assert!(attached, "请求里要有图片块：{}", bodies[0]);
+}

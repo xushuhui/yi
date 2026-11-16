@@ -78,7 +78,15 @@ fn run() -> Result<()> {
         let mut thinking_shown = false;
         yi::cancel::reset();
         yi::cancel::arm();
-        let result = agent.submit(&message, &mut |event| match event {
+        // 用户可以直接把图片路径贴进来（拖拽到终端也是路径文本），或用 @路径 提及。
+        let images = image_paths(&message, Path::new(&cwd));
+        for path in &images {
+            println!(
+                "{}",
+                render::dim_line(&format!("图片：{}", path.display()), color)
+            );
+        }
+        let result = agent.submit_with_images(&message, &images, &mut |event| match event {
             Event::Text(text) => {
                 let out = renderer.push(&text);
                 print!("{out}");
@@ -156,6 +164,42 @@ fn run() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// 从一句话里找出要附给模型的图片：整行就是一个图片路径，或用 `@路径` 提及。
+///
+/// 只认真正存在的图片文件；路径相对当前项目解析。找不到就当普通文字，不当错误。
+fn image_paths(prompt: &str, cwd: &Path) -> Vec<std::path::PathBuf> {
+    const EXTENSIONS: [&str; 5] = ["png", "jpg", "jpeg", "gif", "webp"];
+    let looks_like_image = |raw: &str| -> Option<std::path::PathBuf> {
+        let candidate = raw.trim().trim_matches(['"', '\'', '@']);
+        if candidate.is_empty() {
+            return None;
+        }
+        let path = cwd.join(candidate);
+        let extension = path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if EXTENSIONS.contains(&extension.as_str()) && path.is_file() {
+            Some(path)
+        } else {
+            None
+        }
+    };
+
+    let trimmed = prompt.trim();
+    if !trimmed.contains(char::is_whitespace)
+        && let Some(path) = looks_like_image(trimmed)
+    {
+        return vec![path];
+    }
+    trimmed
+        .split_whitespace()
+        .filter(|word| word.starts_with('@'))
+        .filter_map(looks_like_image)
+        .collect()
 }
 
 /// 真终端才接管按键；管道输入保持逐行读取，脚本和冒烟测试都靠它。
@@ -331,6 +375,33 @@ mod tests {
             elapsed_ms: 0,
             context_prompt,
         }
+    }
+
+    #[test]
+    fn a_bare_image_path_is_attached() {
+        let dir = std::env::temp_dir().join(format!("yi-img-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pic = dir.join("shot.png");
+        std::fs::write(&pic, b"x").unwrap();
+
+        assert_eq!(image_paths("shot.png", &dir), vec![pic.clone()]);
+        assert_eq!(image_paths("  shot.png  ", &dir), vec![pic]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_at_mention_is_attached_and_the_rest_is_ignored() {
+        let dir = std::env::temp_dir().join(format!("yi-img2-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pic = dir.join("a.jpg");
+        std::fs::write(&pic, b"x").unwrap();
+
+        assert_eq!(image_paths("@a.jpg 看看这个", &dir), vec![pic]);
+        // 不是图片、不存在、没有 @ 的都不算。
+        assert!(image_paths("@a.go 看看这个", &dir).is_empty());
+        assert!(image_paths("@nope.png", &dir).is_empty());
+        assert!(image_paths("看看这个", &dir).is_empty());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

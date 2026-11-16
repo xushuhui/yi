@@ -79,6 +79,7 @@ pub struct Config {
     /// 语言服务器命令：固定取 PATH 里的同名程序，不从配置文件读；保留字段只为测试能换成假服务器。
     pub gopls: String,
     pub phpantom: String,
+    pub rust_analyzer: String,
 }
 
 impl Config {
@@ -118,6 +119,7 @@ impl Config {
             home: home.clone(),
             gopls: "gopls".to_string(),
             phpantom: "phpantom_lsp".to_string(),
+            rust_analyzer: "rust-analyzer".to_string(),
         };
         apply_json(&mut cfg, &value)?;
         cfg.proxy = resolve_proxy(cfg.provider, &cfg.base_url)?;
@@ -145,10 +147,9 @@ impl Config {
         }
 
         append_context_file(&mut out, &self.home.join("AGENTS.md"));
-        append_context_file(
-            &mut out,
-            std::path::Path::new(cwd).join("AGENTS.md").as_path(),
-        );
+        if let Some(path) = nearest_agents_file(std::path::Path::new(cwd), &self.home) {
+            append_context_file(&mut out, &path);
+        }
 
         // 技能只列名字和描述，正文按需读取；会话开始时算一次，保证前缀稳定。
         let discovered =
@@ -297,6 +298,23 @@ fn apply_json(cfg: &mut Config, value: &Value) -> Result<()> {
     Ok(())
 }
 
+/// 仓库级规则：从启动目录往上找最近的 `AGENTS.md`，到家目录为止。
+///
+/// 在子目录启动时也能用上仓库根的规则；再往上就不看了，避免捡到别的项目的。
+fn nearest_agents_file(cwd: &std::path::Path, home: &std::path::Path) -> Option<PathBuf> {
+    let boundary = home.parent().unwrap_or(home);
+    for dir in cwd.ancestors() {
+        let candidate = dir.join("AGENTS.md");
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+        if dir == boundary {
+            break;
+        }
+    }
+    None
+}
+
 fn append_context_file(out: &mut String, path: &std::path::Path) {
     if let Ok(text) = std::fs::read_to_string(path)
         && !text.trim().is_empty()
@@ -364,6 +382,7 @@ mod tests {
             home: PathBuf::from("/tmp"),
             gopls: "gopls".into(),
             phpantom: "phpantom_lsp".into(),
+            rust_analyzer: "rust-analyzer".into(),
         };
         apply_json(&mut cfg, &serde_json::json!({"model": "deepseek-flash"})).unwrap();
         assert_eq!(cfg.model, "deepseek-flash");
@@ -407,6 +426,7 @@ mod tests {
             home: PathBuf::from("/tmp"),
             gopls: "gopls".into(),
             phpantom: "phpantom_lsp".into(),
+            rust_analyzer: "rust-analyzer".into(),
         };
         apply_json(
             &mut cfg,
@@ -436,6 +456,7 @@ mod tests {
             home: PathBuf::from("/tmp"),
             gopls: "gopls".into(),
             phpantom: "phpantom_lsp".into(),
+            rust_analyzer: "rust-analyzer".into(),
         };
         assert_eq!(cfg.compact_at_tokens(), 524_288);
         cfg.context_window = 1_000_000;
@@ -506,6 +527,77 @@ mod tests {
         assert_eq!(host_of("https://opencode.ai/zen/go/v1"), "opencode.ai");
         assert_eq!(host_of("http://127.0.0.1:8080"), "127.0.0.1");
         assert_eq!(host_of("https://user@example.com:8443/v1"), "example.com");
+    }
+
+    fn config_at(home: &std::path::Path) -> Config {
+        Config {
+            api_key: "k".into(),
+            provider: "opencode-go",
+            display: "OpenCode Go",
+            base_url: "https://example.invalid".into(),
+            model: "deepseek-v4.1-flash".into(),
+            model_display: "DeepSeek V4.1 Flash".into(),
+            context_window: 1_048_576,
+            proxy: None,
+            effort: None,
+            home: home.to_path_buf(),
+            gopls: "gopls".into(),
+            phpantom: "phpantom_lsp".into(),
+            rust_analyzer: "rust-analyzer".into(),
+        }
+    }
+
+    fn temp_tree(tag: &str) -> (PathBuf, PathBuf) {
+        let root = std::env::temp_dir().join(format!("yi-{tag}-{}", std::process::id()));
+        let home = root.join("data");
+        std::fs::create_dir_all(&home).unwrap();
+        (root, home)
+    }
+
+    #[test]
+    fn both_rule_files_are_injected_with_the_user_one_first() {
+        let (root, home) = temp_tree("rules");
+        let project = root.join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(home.join("AGENTS.md"), "用户级规则").unwrap();
+        std::fs::write(project.join("AGENTS.md"), "仓库级规则").unwrap();
+
+        let prompt = config_at(&home).system_prompt(&project.to_string_lossy());
+        let user = prompt.find("用户级规则").expect("用户级规则要进提示词");
+        let repo = prompt.find("仓库级规则").expect("仓库级规则要进提示词");
+        assert!(user < repo, "用户级在前、仓库级在后");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_nested_directory_finds_the_repository_rules_above_it() {
+        let (root, home) = temp_tree("rules-nested");
+        let project = root.join("proj");
+        let deep = project.join("src/inner");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(project.join("AGENTS.md"), "仓库级规则").unwrap();
+
+        let prompt = config_at(&home).system_prompt(&deep.to_string_lossy());
+        assert!(
+            prompt.contains("仓库级规则"),
+            "子目录启动要能找到仓库根的规则：{prompt}"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn the_nearest_rule_file_wins() {
+        let (root, home) = temp_tree("rules-nearest");
+        let project = root.join("proj");
+        let deep = project.join("pkg");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(project.join("AGENTS.md"), "外层规则").unwrap();
+        std::fs::write(deep.join("AGENTS.md"), "内层规则").unwrap();
+
+        let prompt = config_at(&home).system_prompt(&deep.to_string_lossy());
+        assert!(prompt.contains("内层规则"), "{prompt}");
+        assert!(!prompt.contains("外层规则"), "只取最近的一个：{prompt}");
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]

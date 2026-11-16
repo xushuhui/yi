@@ -44,17 +44,23 @@ pub struct Tools {
 }
 
 impl Tools {
-    pub fn new(root: PathBuf, log_dir: PathBuf, gopls: String, phpantom: String) -> Tools {
+    pub fn new(
+        root: PathBuf,
+        log_dir: PathBuf,
+        gopls: String,
+        phpantom: String,
+        rust_analyzer: String,
+    ) -> Tools {
         Tools {
             root,
             log_dir,
             snapshots: HashMap::new(),
             log_seq: 0,
-            lsp: Lsp::new(gopls, phpantom),
+            lsp: Lsp::new(gopls, phpantom, rust_analyzer),
         }
     }
 
-    /// 六个工具的 JSON Schema。顺序固定，保证请求前缀稳定。
+    /// 七个工具的 JSON Schema。顺序固定，保证请求前缀稳定。
     pub fn definitions() -> Value {
         json!([
             {
@@ -142,7 +148,7 @@ impl Tools {
                 "type": "function",
                 "function": {
                     "name": "lsp",
-                    "description": "查询 Go/PHP 代码的语言服务：跳定义、找引用。需要服务器已安装（gopls / phpantom_lsp）。",
+                    "description": "查询 Go、PHP、Rust 代码的语言服务：跳定义、找引用。需要服务器已安装（gopls / phpantom_lsp / rust-analyzer）。",
                     "parameters": {
                         "type": "object",
                         "properties": {
@@ -151,7 +157,7 @@ impl Tools {
                                 "enum": ["definition", "references"],
                                 "description": "要做什么"
                             },
-                            "path": { "type": "string", "description": "相对项目根的 .go 或 .php 文件" },
+                            "path": { "type": "string", "description": "相对项目根的 .go、.php 或 .rs 文件" },
                             "line": {
                                 "type": "integer",
                                 "description": "行号，从 1 开始；必填"
@@ -1361,6 +1367,7 @@ mod tests {
             root.join("logs"),
             "gopls".to_string(),
             "phpantom_lsp".to_string(),
+            "rust-analyzer".to_string(),
         )
     }
 
