@@ -11,6 +11,7 @@ use serde_json::{Value, json};
 use std::os::unix::process::CommandExt;
 
 use crate::lsp::Lsp;
+use crate::provider::Event;
 use crate::session::ToolCall;
 
 const DEFAULT_READ_LINES: usize = 300;
@@ -230,7 +231,7 @@ impl Tools {
     }
 
     /// 执行工具。失败一律以 `ERROR: ...` 文本返回给模型，绝不中断循环。
-    pub fn execute(&mut self, call: &ToolCall) -> Outcome {
+    pub fn execute(&mut self, call: &ToolCall, on: &mut dyn FnMut(Event)) -> Outcome {
         let args: Value = match serde_json::from_str(&call.arguments) {
             Ok(args) => args,
             Err(_) => return Outcome::Text("ERROR: 参数不是合法 JSON".to_string()),
@@ -239,7 +240,7 @@ impl Tools {
             "read" => return self.read(&args),
             "write" => self.write(&args),
             "edit" => self.edit(&args),
-            "bash" => self.bash(&args),
+            "bash" => self.bash(&args, on),
             "grep" => self.grep(&args),
             "glob" => self.glob(&args),
             "lsp" => return Outcome::Text(self.lsp_call(&args)),
@@ -416,6 +417,7 @@ impl Tools {
             ));
         }
         let mut written: Vec<String> = Vec::new();
+        let mut changed: Vec<String> = Vec::new();
         for item in prepared {
             if let Err(err) = fs::write(&item.path, &item.content) {
                 let done = if written.is_empty() {
@@ -425,14 +427,12 @@ impl Tools {
                 };
                 return format!("ERROR: 写入 {} 失败：{err}；已写入：{done}", item.shown);
             }
-            let count = item.content.lines().count();
             self.record_snapshot(item.path, item.tag.clone(), item.seen);
-            report.push_str(&format!(
-                "[{}#{}] 改完共 {count} 行\n",
-                item.shown, item.tag
-            ));
+            changed.push(format!("{}#{}", item.shown, item.tag));
             written.push(item.shown);
         }
+        // 改动清单一行写完：每个文件只留「路径#新锚点」，不报行数。
+        report.push_str(&changed.join("、"));
         report
     }
 
@@ -604,7 +604,7 @@ impl Tools {
         self.snapshots.insert(path, Snapshot { tag, seen });
     }
 
-    fn bash(&mut self, args: &Value) -> String {
+    fn bash(&mut self, args: &Value, on: &mut dyn FnMut(Event)) -> String {
         let Some(command) = args.get("command").and_then(Value::as_str) else {
             return "ERROR: 缺少 command".to_string();
         };
@@ -703,6 +703,8 @@ impl Tools {
                 let _ = child.wait();
                 break;
             }
+            // 命令跑多久，状态行就跳多久；界面自己决定要不要显示。
+            on(Event::Tick);
             std::thread::sleep(Duration::from_millis(50));
         }
         drop(child);
@@ -1415,7 +1417,7 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let mut tools = tools(&root);
-            let out = tools.bash(&json!({ "command": "sleep 30 & echo ok" }));
+            let out = tools.bash(&json!({ "command": "sleep 30 & echo ok" }), &mut |_| {});
             let _ = tx.send(out);
         });
         match rx.recv_timeout(std::time::Duration::from_secs(3)) {
@@ -1429,9 +1431,12 @@ mod tests {
         let root = std::env::temp_dir().join("yi-strip-exec");
         std::fs::create_dir_all(&root).expect("建目录");
         let mut tools = tools(&root);
-        let out = tools.bash(&json!({
-            "command": format!("cd {} && echo 还在项目根", root.display()),
-        }));
+        let out = tools.bash(
+            &json!({
+                "command": format!("cd {} && echo 还在项目根", root.display()),
+            }),
+            &mut |_| {},
+        );
         assert!(out.contains("还在项目根"), "{out}");
     }
 }

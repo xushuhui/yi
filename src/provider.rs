@@ -19,14 +19,15 @@ pub enum Event {
         name: String,
         summary: String,
     },
-    /// 工具执行完的一行提示：失败给原因，`edit` 成功给摘要；其余成功不打扰。
+    /// 工具结束。`note` 只在失败时有内容（工具名加原因），成功为空、界面不打印。
     ToolResult {
         name: String,
-        failed: bool,
         note: String,
     },
     /// 给用户看的一行提示（压缩完成、压缩失败等）。
     Notice(String),
+    /// 时间过去了，不代表有内容：界面用它刷新处理中的状态行。
+    Tick,
 }
 
 pub struct Reply {
@@ -107,7 +108,8 @@ impl Provider {
                 Ok(StreamItem::Event(event)) => on(event),
                 Ok(StreamItem::Done(reply)) => return Ok(reply),
                 Ok(StreamItem::Failed(err)) => return Err(err),
-                Err(RecvTimeoutError::Timeout) => continue,
+                // 空转一次：界面靠这个刷新「等待模型 3.2s」这类状态行。
+                Err(RecvTimeoutError::Timeout) => on(Event::Tick),
                 // 读线程没了却没给结果，只可能是它自己 panic 了。
                 Err(RecvTimeoutError::Disconnected) => {
                     return Err(Error::Http("流式响应中断".to_string()));

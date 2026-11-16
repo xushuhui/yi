@@ -161,6 +161,11 @@ fn finish(scored: &mut [(i32, Pair)], typed: &str) -> Vec<Pair> {
 pub fn hint(line: &str, pos: usize, skills: &[(String, String)]) -> Option<String> {
     let (start, pairs) = complete(line, pos, skills)?;
     let typed = &line[start..pos];
+    // `/skill:` 后面还没写名字时不猜：一堆技能里挑最短的那个当灰字是噪声，
+    // 按 Tab 会直接列全。命令不同，`/` 后补 `new` 是有意义的默认。
+    if typed.is_empty() && line[..pos].trim_start_matches('/').starts_with("skill:") {
+        return None;
+    }
     let best = pairs.first()?;
     let rest = best.replacement.strip_prefix(typed)?;
     if rest.is_empty() {
@@ -289,6 +294,19 @@ mod tests {
         assert_eq!(pairs.len(), MAX_CANDIDATES);
         let last = pairs.last().expect("末条");
         assert!(last.display.contains("还有 5 个"), "{}", last.display);
+    }
+
+    #[test]
+    fn an_empty_skill_query_shows_no_hint_but_still_lists() {
+        // 灰字只在写了名字之后出现：24 个技能里挑一个当灰字是噪声。
+        assert_eq!(hint("/skill:", 7, &skills()), None);
+        assert_eq!(hint("/skill: ", 8, &skills()), None);
+        // 但候选照旧齐全，按 Tab 能列出来。
+        let (start, pairs) = complete("/skill:", 7, &skills()).expect("有候选");
+        assert_eq!(start, 7);
+        assert_eq!(pairs.len(), skills().len());
+        // 写了名字之后灰字照旧。
+        assert_eq!(hint("/skill:go-", 10, &skills()).as_deref(), Some("rules"));
     }
 
     #[test]

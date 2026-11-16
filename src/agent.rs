@@ -175,7 +175,7 @@ impl Agent {
                 });
                 let signature = (call.name.clone(), call.arguments.clone());
                 last_summary = self.tools.describe(call);
-                match self.tools.execute(call) {
+                match self.tools.execute(call, on) {
                     Outcome::Text(text) => {
                         let failed = Self::looks_failed(&text);
                         if failed && last_call.as_ref() == Some(&signature) {
@@ -186,20 +186,17 @@ impl Agent {
                             failures = 0;
                         }
                         last_call = Some(signature);
-                        // 失败原因和 edit 改动量值得让人看见；成功的大段输出不回显。
-                        if failed {
-                            on(Event::ToolResult {
-                                name: call.name.clone(),
-                                failed: true,
-                                note: failure_note(&text).to_string(),
-                            });
-                        } else if call.name == "edit" {
-                            on(Event::ToolResult {
-                                name: call.name.clone(),
-                                failed: false,
-                                note: failure_note(&text).to_string(),
-                            });
-                        }
+                        // 每个工具结束都发一条：界面靠它把状态行从「运行 X」推回
+                        // 「等待模型」。成功时提示为空，界面什么都不打印——输出与改动
+                        // 清单仍在会话里，模型下一轮读得到。
+                        on(Event::ToolResult {
+                            name: call.name.clone(),
+                            note: if failed {
+                                failure_note(&text).to_string()
+                            } else {
+                                String::new()
+                            },
+                        });
                         self.session.append_tool_result(&call.id, text)?;
                     }
                     Outcome::Image { path, note } => {

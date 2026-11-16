@@ -12,7 +12,6 @@ const BOLD: &str = "\x1b[1m";
 const DIM: &str = "\x1b[2m";
 const ITALIC: &str = "\x1b[3m";
 const RED: &str = "\x1b[31m";
-const GREEN: &str = "\x1b[32m";
 const CYAN: &str = "\x1b[36m";
 const YELLOW: &str = "\x1b[33m";
 const GREEN_BRIGHT: &str = "\x1b[92m";
@@ -746,18 +745,13 @@ fn extension(ext: &str) -> Option<&'static str> {
     }
 }
 
-/// 工具结果的一行提示：失败给红色，`edit` 成功给绿色摘要。
-pub fn tool_line(name: &str, failed: bool, note: &str, color: bool) -> String {
+/// 工具失败的一行提示：红色 `✗`、工具名、原因。成功不打印这一行。
+pub fn tool_line(name: &str, note: &str, color: bool) -> String {
     if !color {
-        let mark = if failed { "✗" } else { "✓" };
-        return format!("{mark} {name} {note}");
+        return format!("✗ {name} {note}");
     }
-    if failed {
-        let note = note.strip_prefix("ERROR: ").unwrap_or(note);
-        format!("{RED}✗ {name}{RESET} {note}")
-    } else {
-        format!("{GREEN}✓{RESET} {DIM}{name}{RESET} {note}")
-    }
+    let note = note.strip_prefix("ERROR: ").unwrap_or(note);
+    format!("{RED}✗ {name}{RESET} {note}")
 }
 
 #[cfg(test)]
@@ -965,7 +959,7 @@ mod tests {
 
     #[test]
     fn a_tool_failure_gets_a_red_line() {
-        let line = tool_line("bash", true, "ERROR: 退出码 1", true);
+        let line = tool_line("bash", "ERROR: 退出码 1", true);
         assert!(line.contains(RED), "{line}");
         assert!(!line.contains("ERROR: "), "去掉前缀只留原因：{line}");
     }

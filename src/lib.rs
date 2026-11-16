@@ -4,6 +4,7 @@
 
 pub mod agent;
 pub mod cancel;
+pub mod clipboard;
 pub mod complete;
 pub mod config;
 pub mod crash;

@@ -1,8 +1,10 @@
 use std::io::{self, IsTerminal, Write};
 
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 
 use yi::agent::Agent;
+use yi::clipboard::{self, EMPTY_TOKEN, IMAGE_TOKEN};
 use yi::complete::Helper;
 use yi::config::{self, Config};
 use yi::provider::Event;
@@ -45,22 +47,28 @@ fn run() -> Result<()> {
             .into_iter()
             .map(|skill| (skill.name, skill.description))
             .collect();
-    let mut editor = make_editor(&agent, skills)?;
+    // 剪贴板图片落在数据目录里，不落 /tmp：会话只记路径，重启后还要能读到。
+    let clip: ClipSlot = Arc::new(Mutex::new(None));
+    let mut editor = make_editor(&agent, skills, clip.clone(), &cfg.home.join("clipboard"))?;
     // 只在真终端里上色；管道输出、NO_COLOR 时保持原样。
     let color = io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
     let mut renderer = Renderer::new(color);
+    // 处理中的状态行：只在真终端里动，管道输出一个字节都不写。
+    let mut status = Status::new(io::stdout().is_terminal(), color);
 
     println!("yi · {} · {} · {cwd}", cfg.display, cfg.model_display);
     println!("会话：{}", session_path.display());
     println!("输入 /help 查看命令，Ctrl-D 退出。\n");
 
     while let Some(line) = read_input(&mut editor)? {
+        // Ctrl-G 在行里留了标记；这里换回文字，并把图片取出来。
+        let (line, has_image) = clipboard::strip_tokens(&line);
         let prompt = line.trim();
-        if prompt.is_empty() {
+        if prompt.is_empty() && !has_image {
             continue;
         }
         agent.note_prompt(prompt)?;
-        let message = if let Some(rest) = prompt.strip_prefix("/skill:") {
+        let mut message = if let Some(rest) = prompt.strip_prefix("/skill:") {
             match yi::skills::expand(rest, &cfg.home, std::path::Path::new(&cwd)) {
                 Ok(text) => text,
                 Err(err) => {
@@ -75,39 +83,57 @@ fn run() -> Result<()> {
             prompt.to_string()
         };
 
-        let mut thinking_shown = false;
         yi::cancel::reset();
         yi::cancel::arm();
         // 用户可以直接把图片路径贴进来（拖拽到终端也是路径文本），或用 @路径 提及。
-        let images = image_paths(&message, Path::new(&cwd));
+        let mut images = image_paths(&message, Path::new(&cwd));
+        if has_image {
+            match clip.lock().unwrap_or_else(|err| err.into_inner()).take() {
+                Some(path) => images.insert(0, path),
+                None => println!(
+                    "{}",
+                    render::dim_line("剪贴板图片已经不在了，这一轮只发文字", color)
+                ),
+            }
+        }
+        if message.is_empty() && !images.is_empty() {
+            // 只挂图不写字：空消息供应商会拒，补一句最小的话。
+            message = "看看这张图片里有什么。".to_string();
+        }
         for path in &images {
             println!(
                 "{}",
                 render::dim_line(&format!("图片：{}", path.display()), color)
             );
         }
+        status.set("等待模型");
         let result = agent.submit_with_images(&message, &images, &mut |event| match event {
+            // 空转一下：刷新「等待模型 3.2s」这类状态行，不代表有内容。
+            Event::Tick => status.tick(),
             Event::Text(text) => {
+                status.clear();
                 let out = renderer.push(&text);
                 print!("{out}");
                 let _ = io::stdout().flush();
             }
             Event::Reasoning(_) => {
-                if !thinking_shown {
-                    thinking_shown = true;
-                    println!("思考中…");
-                    // 终端已经不在了就没必要报错，后续输出自然会失败。
-                    let _ = io::stdout().flush();
+                // 只在第一次把阶段换成「思考中」，之后不重置计时。
+                if status.label() != Some("思考中") {
+                    status.set("思考中");
                 }
             }
             Event::Notice(notice) => {
                 let half = renderer.flush_line();
+                let previous = status.clear();
                 print!("{half}");
                 println!();
                 println!("· {notice}");
+                status.resume(previous);
+                let _ = io::stdout().flush();
             }
             Event::ToolCall { name, summary } => {
                 let half = renderer.flush_line();
+                status.clear();
                 print!("{half}");
                 println!();
                 // 命令按 shell 的样子显示（`$ 命令`），其余工具用箭头加名字。
@@ -122,18 +148,27 @@ fn run() -> Result<()> {
                 } else {
                     println!("→ {summary}");
                 }
-                // 同上：刷新失败不影响本轮结果。
+                status.set(&format!("运行 {name}"));
                 let _ = io::stdout().flush();
             }
-            Event::ToolResult { name, failed, note } => {
+            Event::ToolResult { name, note } => {
+                // 成功时没有可打印的内容：只把状态行推回「等待模型」。
+                if note.is_empty() {
+                    status.set("等待模型");
+                    return;
+                }
                 let half = renderer.flush_line();
+                status.clear();
                 print!("{half}");
                 let short: String = note.chars().take(160).collect();
-                println!("{}", render::tool_line(&name, failed, &short, color));
+                println!("{}", render::tool_line(&name, &short, color));
+                // 工具跑完必然是再一次模型往返。
+                status.set("等待模型");
                 let _ = io::stdout().flush();
             }
         });
 
+        status.clear();
         yi::cancel::disarm();
         // 把没换行的半行、没闭合的代码块放出来，再打页脚。
         let tail = renderer.finish();
@@ -205,7 +240,43 @@ fn image_paths(prompt: &str, cwd: &Path) -> Vec<std::path::PathBuf> {
 /// 真终端才接管按键；管道输入保持逐行读取，脚本和冒烟测试都靠它。
 type Editor = rustyline::Editor<Helper, rustyline::history::DefaultHistory>;
 
-fn make_editor(agent: &Agent, skills: Vec<(String, String)>) -> Result<Option<Editor>> {
+/// Ctrl-G 挂住的剪贴板图片：按键时写入，提交时取走。
+type ClipSlot = Arc<Mutex<Option<std::path::PathBuf>>>;
+
+/// Ctrl-G：向系统要剪贴板里的图片，往输入行插一个标记。
+///
+/// `Cmd+V` 由终端自己处理，程序看不到；图片剪贴板又没有通用协议。所以由 yi
+/// 自己接这个键，标记留给提交时替换成图片附件。
+struct PasteImage {
+    slot: ClipSlot,
+    dir: std::path::PathBuf,
+}
+
+impl rustyline::ConditionalEventHandler for PasteImage {
+    fn handle(
+        &self,
+        _event: &rustyline::Event,
+        _count: rustyline::RepeatCount,
+        _positive: bool,
+        _context: &rustyline::EventContext<'_>,
+    ) -> Option<rustyline::Cmd> {
+        let token = match clipboard::image_path(&self.dir) {
+            Some(path) => {
+                *self.slot.lock().unwrap_or_else(|err| err.into_inner()) = Some(path);
+                IMAGE_TOKEN
+            }
+            None => EMPTY_TOKEN,
+        };
+        Some(rustyline::Cmd::Insert(1, token.to_string()))
+    }
+}
+
+fn make_editor(
+    agent: &Agent,
+    skills: Vec<(String, String)>,
+    clip: ClipSlot,
+    clip_dir: &Path,
+) -> Result<Option<Editor>> {
     if !io::stdin().is_terminal() {
         return Ok(None);
     }
@@ -213,14 +284,24 @@ fn make_editor(agent: &Agent, skills: Vec<(String, String)>) -> Result<Option<Ed
         .max_history_size(HISTORY_LIMIT)
         .and_then(|builder| builder.history_ignore_dups(true))
         .map_err(|err| Error::Config(format!("配置输入行失败：{err}")))?;
-    // 候选按列表展示（带描述），不是在输入行里循环替换。
+    // 候选按列表展示，不是在输入行里循环替换；候选多于一条时第一次 Tab
+    // 就列出来——rustyline 默认要按两次，第一次只响铃，终端里等于没反应。
     let config = builder
         .completion_type(rustyline::config::CompletionType::List)
+        .completion_show_all_if_ambiguous(true)
         .auto_add_history(true)
         .build();
     let mut editor = Editor::with_config(config)
         .map_err(|err| Error::Config(format!("初始化输入行失败：{err}")))?;
     editor.set_helper(Some(Helper::new(skills)));
+    // Ctrl-G：挂剪贴板图片。终端不会把 Cmd-V 交给程序，这个键是 yi 自己能收到的。
+    editor.bind_sequence(
+        rustyline::KeyEvent(rustyline::KeyCode::Char('G'), rustyline::Modifiers::CTRL),
+        rustyline::EventHandler::Conditional(Box::new(PasteImage {
+            slot: clip,
+            dir: clip_dir.to_path_buf(),
+        })),
+    );
     for line in agent.prompt_history() {
         // 历史只用来召回：某一条加不进去不影响输入。
         let _ = editor.add_history_entry(line);
@@ -293,6 +374,10 @@ fn print_help() {
   /skill:<名字> [要求]      把某个技能的正文注入这一轮
   /help                     显示这份帮助
 
+按键：
+  Ctrl-G                    把剪贴板里的图片挂到这一轮
+                            （Cmd-V 仍是终端自己的文本粘贴，两者互不影响）
+
 环境变量（密钥只从这里读）：
   OPENCODE_API_KEY     OpenCode Go 的密钥（默认供应商）
   DEEPSEEK_API_KEY     DeepSeek 官方的密钥（provider 设为 deepseek 时）
@@ -362,6 +447,86 @@ fn git_branch(cwd: &str) -> Option<String> {
     Some(branch)
 }
 
+/// 处理中的单行状态：阶段名 + 已耗时，用回车回到行首原地重画。
+///
+/// 行式界面的底线仍是「只往下打印」，这里唯一的例外就是这一行：它随时会被擦掉，
+/// 不留下历史。见 `docs/adr/0009-progress-line-in-place.md`。
+struct Status {
+    /// 只有真终端才动；管道、重定向里一个字节都不写。
+    enabled: bool,
+    /// 上色时整行压暗，避免和正文抢注意力。
+    dim: bool,
+    stage: Option<(String, std::time::Instant)>,
+    last_draw: std::time::Instant,
+}
+
+impl Status {
+    fn new(enabled: bool, dim: bool) -> Self {
+        Self {
+            enabled,
+            dim,
+            stage: None,
+            last_draw: std::time::Instant::now(),
+        }
+    }
+
+    fn label(&self) -> Option<&str> {
+        self.stage.as_ref().map(|(label, _)| label.as_str())
+    }
+
+    /// 换阶段并立刻画一次；计时从这一刻重新开始。
+    fn set(&mut self, stage: &str) {
+        self.stage = Some((stage.to_string(), std::time::Instant::now()));
+        self.draw();
+    }
+
+    /// 每 200 毫秒最多重画一次：秒数在跳，但不值得为它刷屏。
+    fn tick(&mut self) {
+        if self.stage.is_some() && self.last_draw.elapsed().as_millis() >= 200 {
+            self.draw();
+        }
+    }
+
+    /// 擦掉状态行并把它交回来，打印完别的内容再 `resume` 回去。
+    fn clear(&mut self) -> Option<(String, std::time::Instant)> {
+        let stage = self.stage.take();
+        if stage.is_some() && self.enabled {
+            print!("\r\x1b[K");
+            let _ = io::stdout().flush();
+        }
+        stage
+    }
+
+    fn resume(&mut self, stage: Option<(String, std::time::Instant)>) {
+        self.stage = stage;
+        self.draw();
+    }
+
+    fn draw(&mut self) {
+        let Some((label, started)) = &self.stage else {
+            return;
+        };
+        if !self.enabled {
+            return;
+        }
+        print!(
+            "{}",
+            status_text(label, started.elapsed().as_secs_f32(), self.dim)
+        );
+        let _ = io::stdout().flush();
+        self.last_draw = std::time::Instant::now();
+    }
+}
+
+/// 状态行的可见内容：回车回到行首、清掉整行，再写新的。
+fn status_text(label: &str, secs: f32, dim: bool) -> String {
+    if dim {
+        format!("\r\x1b[K\x1b[2m{label} {secs:.1}s\x1b[0m")
+    } else {
+        format!("\r\x1b[K{label} {secs:.1}s")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -375,6 +540,14 @@ mod tests {
             elapsed_ms: 0,
             context_prompt,
         }
+    }
+
+    #[test]
+    fn the_status_line_rewrites_itself_in_place() {
+        let plain = status_text("等待模型", 3.24, false);
+        assert_eq!(plain, "\r\x1b[K等待模型 3.2s");
+        let dim = status_text("运行 bash", 12.46, true);
+        assert_eq!(dim, "\r\x1b[K\x1b[2m运行 bash 12.5s\x1b[0m");
     }
 
     #[test]

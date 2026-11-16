@@ -200,6 +200,8 @@ pub fn collect(agent: &mut Agent, prompt: &str) -> (String, Vec<String>, Vec<Str
             Event::ToolCall { summary, .. } => tools.push(summary),
             // 压缩提示和工具结果行只影响界面显示，断言看会话文件。
             Event::Notice(_) | Event::ToolResult { .. } => {}
+            // 空转心跳只驱动界面上的状态行。
+            Event::Tick => {}
         })
         .expect("本轮对话成功");
     (text, reasoning, tools)

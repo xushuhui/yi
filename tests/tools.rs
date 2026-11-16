@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use common::*;
 use serde_json::{Value, json};
 use yi::agent::Agent;
+use yi::provider::Event;
 
 fn open_agent(port: u16, home: &Path, workspace: &Path) -> Agent {
     Agent::new(
@@ -101,7 +102,73 @@ fn edit_applies_when_the_tag_matches() {
         std::fs::read_to_string(ws.join("a.txt")).unwrap(),
         "one\nTWO\nthree\n"
     );
-    assert!(last_tool_output(&home).starts_with("[a.txt#"));
+    assert!(
+        last_tool_output(&home).starts_with("a.txt#"),
+        "{}",
+        last_tool_output(&home)
+    );
+}
+
+#[test]
+fn one_edit_call_lists_every_changed_file_on_one_line() {
+    let home = temp_home("multi-edit-home");
+    let ws = temp_home("multi-edit-ws");
+    std::fs::write(ws.join("a.txt"), "one\n").unwrap();
+    std::fs::write(ws.join("b.txt"), "two\n").unwrap();
+    let tag_a = file_tag(ws.join("a.txt"));
+    let tag_b = file_tag(ws.join("b.txt"));
+    let patch = format!("[a.txt#{tag_a}]\nPUT 1.=1:\n+A\n[b.txt#{tag_b}]\nPUT 1.=1:\n+B\n");
+
+    // 每次 collect 是完整一轮：工具调用之后跟一句普通回答，才会结束这一轮。
+    let server = start_server(vec![
+        tool_response(&[("c1", "read", json!({ "path": "a.txt" }))]),
+        plain_response(&["ok"]),
+        tool_response(&[("c2", "read", json!({ "path": "b.txt" }))]),
+        plain_response(&["ok"]),
+        tool_response(&[("c3", "edit", json!({ "input": patch }))]),
+        plain_response(&["ok"]),
+    ]);
+    let mut agent = open_agent(server.port, &home, &ws);
+    collect(&mut agent, "读 a.txt");
+    collect(&mut agent, "读 b.txt");
+    collect(&mut agent, "两个一起改");
+
+    // 一个文件一段，用顿号连成一行；不报行数，也不带方括号。
+    let expected = format!("a.txt#{}、b.txt#{}", tag_of_str("A\n"), tag_of_str("B\n"));
+    assert_eq!(last_tool_output(&home), expected);
+}
+
+#[test]
+fn a_successful_edit_does_not_print_a_result_line() {
+    let home = temp_home("silent-edit-home");
+    let ws = temp_home("silent-edit-ws");
+    std::fs::write(ws.join("a.txt"), "one\ntwo\n").unwrap();
+    let tag = file_tag(ws.join("a.txt"));
+    let patch = format!("[a.txt#{tag}]\nPUT 2.=2:\n+TWO\n");
+
+    let server = start_server(vec![
+        tool_response(&[("c1", "read", json!({ "path": "a.txt" }))]),
+        plain_response(&["ok"]),
+        tool_response(&[("c2", "edit", json!({ "input": patch }))]),
+        plain_response(&["ok"]),
+    ]);
+    let mut agent = open_agent(server.port, &home, &ws);
+    agent.submit("读", &mut |_| {}).expect("读这一轮成功");
+
+    let mut notes = Vec::new();
+    agent
+        .submit("改", &mut |event| {
+            if let Event::ToolResult { name, note } = event {
+                notes.push((name, note));
+            }
+        })
+        .expect("改这一轮成功");
+    // 事件照发（界面靠它把状态行推回「等待模型」），但提示是空的，什么都不打印。
+    assert_eq!(
+        notes,
+        vec![("edit".to_string(), String::new())],
+        "{notes:?}"
+    );
 }
 
 #[test]
@@ -214,7 +281,7 @@ fn repeated_identical_patch_is_rejected() {
 
     let outputs = tool_outputs(&home);
     assert!(
-        outputs[1].starts_with("[a.txt#"),
+        outputs[1].starts_with("a.txt#"),
         "第一次应成功：{}",
         outputs[1]
     );
@@ -451,7 +518,7 @@ fn patch_with_bare_body_rows_is_repaired() {
     let output = last_tool_output(&home);
     assert!(output.contains("没有以 + 开头"), "{output}");
     assert!(output.starts_with("（提醒"), "{output}");
-    assert!(output.contains("[a.txt#"), "容错后仍应返回新锚点：{output}");
+    assert!(output.contains("a.txt#"), "容错后仍应返回新锚点：{output}");
     assert_eq!(
         std::fs::read_to_string(ws.join("a.txt")).unwrap(),
         "one\nTWO\nthree\n"
@@ -477,7 +544,7 @@ fn patch_envelope_is_ignored() {
     collect(&mut agent, "改");
 
     assert!(
-        last_tool_output(&home).contains("[a.txt#"),
+        last_tool_output(&home).contains("a.txt#"),
         "带信封的补丁应当成功：{}",
         last_tool_output(&home)
     );
@@ -531,7 +598,7 @@ fn reading_a_second_range_keeps_earlier_lines_editable() {
     collect(&mut agent, "改第一行");
 
     assert!(
-        last_tool_output(&home).starts_with("[a.txt#"),
+        last_tool_output(&home).starts_with("a.txt#"),
         "第二次 read 不应抹掉第一次的已读行：{}",
         last_tool_output(&home)
     );
@@ -717,7 +784,7 @@ fn edit_keeps_earlier_read_lines_editable_after_shift() {
 
     let outputs = tool_outputs(&home);
     assert!(
-        outputs[1].starts_with("[a.txt#"),
+        outputs[1].starts_with("a.txt#"),
         "插入应成功：{}",
         outputs[1]
     );
@@ -728,7 +795,7 @@ fn edit_keeps_earlier_read_lines_editable_after_shift() {
     );
     assert!(outputs[2].contains("没有读过"), "{}", outputs[2]);
     assert!(
-        outputs[3].starts_with("[a.txt#"),
+        outputs[3].starts_with("a.txt#"),
         "读过的行应仍然可改：{}",
         outputs[3]
     );
