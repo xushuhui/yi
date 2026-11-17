@@ -778,9 +778,13 @@ mod tests {
             Some(("opencode-go".to_string(), "deepseek-v4.1-flash".to_string())),
             "以最后一次切换为准"
         );
+        // 复制到新路径再打开：全量测试并行跑时，同进程里别的用例会拉起子进程，
+        // 文件锁偶发被抢；这里要验的是「记录写进了文件、重开能读回来」。
         let path = session.path().to_path_buf();
         drop(session);
-        let reopened = Session::open(&path, "/tmp/proj", "别的模型", "auto").expect("重开");
+        let copy = path.with_file_name("reopened.jsonl");
+        std::fs::copy(&path, &copy).expect("复制会话文件");
+        let reopened = Session::open(&copy, "/tmp/proj", "别的模型", "auto").expect("重开");
         assert_eq!(
             reopened.current_model(),
             Some(("opencode-go".to_string(), "deepseek-v4.1-flash".to_string())),

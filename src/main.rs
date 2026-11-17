@@ -77,9 +77,12 @@ fn run() -> Result<()> {
         print_replay(&agent, color);
     }
 
+    // 上一轮里敲的字：轮末取出来放回提示符，免得白打。
+    let mut draft = String::new();
     loop {
         print_input_band_top(band);
-        let Some(line) = read_input(&mut editor, input_prompt(band))? else {
+        let prefill = std::mem::take(&mut draft);
+        let Some(line) = read_input(&mut editor, input_prompt(band), &prefill)? else {
             break;
         };
         close_input_band(&line, band);
@@ -137,10 +140,11 @@ fn run() -> Result<()> {
                 title.spin();
             }
             Event::Text(text) => {
-                status.clear();
+                let previous = status.clear();
                 title.spin();
                 let out = renderer.push(&text);
                 print!("{out}");
+                status.resume(previous);
                 let _ = io::stdout().flush();
             }
             Event::Reasoning(_) => {
@@ -186,6 +190,7 @@ fn run() -> Result<()> {
         });
 
         status.clear();
+        draft = yi::cancel::take_draft();
         match &result {
             Ok(usage) => {
                 title.ready();
@@ -368,29 +373,100 @@ fn print_input_band_top(color: bool) {
     let _ = io::stdout().flush();
 }
 
-/// 输入块收尾：把最后一行右边补满底色，再补一行下边距。
+/// 把一句话按输入块的样式打出来：重放旧对话时用，看起来和实时输入一致。
 ///
-/// 折行时前面几行本来就被字填满了，只有最后一行右边是空的，所以只需要补它。
+/// 管道与 `NO_COLOR` 下退回一行 `> 原文`，脚本解析得到的仍是纯文本。
+fn print_input_block(text: &str, color: bool) {
+    print!("{}", input_block(text, color));
+    let _ = io::stdout().flush();
+}
+
+/// 输入块的完整输出：上下各一行底色，中间每行从文字末尾补满。
+fn input_block(text: &str, color: bool) -> String {
+    if !color {
+        return format!("> {text}\n");
+    }
+    let width = render::terminal_width().unwrap_or(80);
+    let mut out = format!("{INPUT_BAND}{}\x1b[0m\r\n", " ".repeat(width));
+    for (index, line) in text.split('\n').enumerate() {
+        let used = if index == 0 {
+            2 + render::display_width(line)
+        } else {
+            render::display_width(line)
+        };
+        out.push_str(INPUT_BAND);
+        if index == 0 {
+            out.push_str("> ");
+        }
+        out.push_str(line);
+        let col = used % width;
+        if col > 0 {
+            out.push_str(&" ".repeat(width - col));
+        }
+        out.push_str("\x1b[0m\r\n");
+    }
+    out.push_str(&format!("{INPUT_BAND}{}\x1b[0m\r\n", " ".repeat(width)));
+    out
+}
+
+/// 输入块收尾：把每一行右边补满底色，再补一行下边距。
+///
+/// 粘贴进来的多行文本每行都可能结束在行中间，右边留白没有底色，看上去就是
+/// 一块缺角的色带；折行时更麻烦——不能只补最后一行。这里逐行补。
 fn close_input_band(line: &str, color: bool) {
     if !color {
         return;
     }
     let width = render::terminal_width().unwrap_or(80);
-    let col = (2 + render::display_width(line)) % width;
-    if col > 0 {
-        // 回到刚输入完那一行，从文字末尾开始铺底色（不碰已有的字）。
-        print!(
-            "\x1b[1A\x1b[{}G{INPUT_BAND}{}\x1b[0m\x1b[1B\r",
-            col + 1,
-            " ".repeat(width - col)
-        );
+    let rows = input_rows(line, width);
+    // 光标现在停在最后一行下面，先回到第一行。
+    print!("\x1b[{}A\r", rows.len());
+    for (index, used) in rows.iter().enumerate() {
+        // used == 0 是粘贴里的空行：整行都要补；used == width 说明这行已经被字填满。
+        if *used < width {
+            // 从这一行文字末尾开始铺底色，不碰已有的字。
+            print!(
+                "\x1b[{}G{INPUT_BAND}{}\x1b[0m",
+                used + 1,
+                " ".repeat(width - used)
+            );
+        }
+        if index + 1 < rows.len() {
+            print!("\r\n");
+        }
     }
-    print!("{INPUT_BAND}{}\x1b[0m\r\n", " ".repeat(width));
+    print!("\r\n{INPUT_BAND}{}\x1b[0m\r\n", " ".repeat(width));
     let _ = io::stdout().flush();
 }
 
+/// 输入文本在屏幕上占几行、每行用到哪一列（行首起算，含提示符的两格）。
+///
+/// 粘贴里的换行各起一行；超过终端宽度的长行按显示宽度折行。返回值给
+/// [`close_input_band`] 逐行补齐底色用，顺序就是屏幕上的行序。
+fn input_rows(text: &str, width: usize) -> Vec<usize> {
+    let width = width.max(1);
+    // 提示符 `> ` 占两格，第一行的文字从第 2 列开始。
+    let mut used = 2.min(width);
+    let mut rows = Vec::new();
+    for ch in text.chars() {
+        if ch == '\n' {
+            rows.push(used);
+            used = 0;
+            continue;
+        }
+        let cells = render::display_width(&ch.to_string());
+        if used + cells > width {
+            rows.push(used);
+            used = 0;
+        }
+        used += cells;
+    }
+    rows.push(used);
+    rows
+}
+
 /// 读一行输入；返回 `None` 表示该退出了（Ctrl-D 或标准输入结束）。
-fn read_input(editor: &mut Option<Editor>, prompt: &str) -> Result<Option<String>> {
+fn read_input(editor: &mut Option<Editor>, prompt: &str, prefill: &str) -> Result<Option<String>> {
     let Some(editor) = editor else {
         print!("{prompt}");
         io::stdout().flush()?;
@@ -400,7 +476,13 @@ fn read_input(editor: &mut Option<Editor>, prompt: &str) -> Result<Option<String
         }
         return Ok(Some(line));
     };
-    match editor.readline(prompt) {
+    // 有草稿就预填到输入行，光标停在末尾：你看一眼、改一改，回车才发。
+    let result = if prefill.is_empty() {
+        editor.readline(prompt)
+    } else {
+        editor.readline_with_initial(prompt, (prefill, ""))
+    };
+    match result {
         Ok(line) => Ok(Some(line)),
         // Ctrl-C 只放弃这一行；rustyline 不给出缓冲区内容，所以无法区分空行。
         Err(rustyline::error::ReadlineError::Interrupted) => {
@@ -521,7 +603,9 @@ fn print_replay(agent: &Agent, color: bool) {
     let mut keep_from = 0;
     for (index, item) in items.iter().enumerate().rev() {
         used += match item {
-            Replay::User(text) | Replay::Assistant(text) => text.lines().count() + 2,
+            // 用户那一条还要上下各留一行底色，按多算两行。
+            Replay::User(text) => text.lines().count() + 4,
+            Replay::Assistant(text) => text.lines().count() + 2,
             Replay::Tool(_) => 1,
         };
         if used > BUDGET {
@@ -540,7 +624,7 @@ fn print_replay(agent: &Agent, color: bool) {
 
     for item in &items[keep_from..] {
         match item {
-            Replay::User(text) => println!("> {text}"),
+            Replay::User(text) => print_input_block(text, color),
             Replay::Assistant(text) => {
                 // 每条回答单独一个渲染器：代码块、表格的状态不跨条继承。
                 let mut renderer = Renderer::new(color);
@@ -719,6 +803,8 @@ struct Status {
     /// 上色时整行压暗，避免和正文抢注意力。
     dim: bool,
     stage: Option<(String, std::time::Instant)>,
+    /// 这一行现在是否真的画在屏幕上：擦之前得先知道有没有东西可擦。
+    drawn: bool,
     last_draw: std::time::Instant,
 }
 
@@ -728,6 +814,7 @@ impl Status {
             enabled,
             dim,
             stage: None,
+            drawn: false,
             last_draw: std::time::Instant::now(),
         }
     }
@@ -750,8 +837,11 @@ impl Status {
     }
 
     /// 每 200 毫秒最多重画一次：秒数在跳，但不值得为它刷屏。
+    ///
+    /// 等待期间你可能在打下一句话，草稿变了也要重画，所以条件不只「有阶段」。
     fn tick(&mut self) {
-        if self.stage.is_some() && self.last_draw.elapsed().as_millis() >= 200 {
+        let busy = self.stage.is_some() || !yi::cancel::draft_text().is_empty();
+        if busy && self.last_draw.elapsed().as_millis() >= 100 {
             self.draw();
         }
     }
@@ -759,8 +849,9 @@ impl Status {
     /// 擦掉状态行并把它交回来，打印完别的内容再 `resume` 回去。
     fn clear(&mut self) -> Option<(String, std::time::Instant)> {
         let stage = self.stage.take();
-        if stage.is_some() && self.enabled {
+        if self.drawn {
             print!("\r\x1b[K");
+            self.drawn = false;
             let _ = io::stdout().flush();
         }
         stage
@@ -772,27 +863,93 @@ impl Status {
     }
 
     fn draw(&mut self) {
-        let Some((label, started)) = &self.stage else {
-            return;
-        };
         if !self.enabled {
             return;
         }
-        print!(
-            "{}",
-            status_text(label, started.elapsed().as_secs_f32(), self.dim)
-        );
+        let draft = yi::cancel::draft_text();
+        let line = match &self.stage {
+            Some((label, started)) => {
+                let width = render::terminal_width().unwrap_or(80);
+                status_line(
+                    label,
+                    started.elapsed().as_secs_f32(),
+                    self.dim,
+                    &draft,
+                    width,
+                )
+            }
+            None if draft.is_empty() => {
+                if self.drawn {
+                    print!("\r\x1b[K");
+                    self.drawn = false;
+                    let _ = io::stdout().flush();
+                }
+                return;
+            }
+            // 流式输出期间没有阶段，只把草稿挂在行尾，你才知道字进去了。
+            None => {
+                let width = render::terminal_width().unwrap_or(80);
+                let mut line = String::from("\r\x1b[K");
+                if self.dim {
+                    line.push_str("\x1b[2m");
+                }
+                line.push_str("> ");
+                line.push_str(&tail_cells(&draft, width.saturating_sub(3)));
+                if self.dim {
+                    line.push_str("\x1b[0m");
+                }
+                line
+            }
+        };
+        print!("{line}");
+        self.drawn = true;
         let _ = io::stdout().flush();
         self.last_draw = std::time::Instant::now();
     }
 }
 
 /// 状态行的可见内容：回车回到行首、清掉整行，再写新的。
-fn status_text(label: &str, secs: f32, dim: bool) -> String {
+///
+/// 行尾挂你轮内敲的草稿，随状态行一起重画；宽度不够时只留草稿的尾巴，
+/// 因为最新的字在最右边。
+fn status_line(label: &str, secs: f32, dim: bool, draft: &str, width: usize) -> String {
+    let head = format!("{label} {secs:.1}s");
+    let mut out = String::from("\r\x1b[K");
     if dim {
-        format!("\r\x1b[K\x1b[2m{label} {secs:.1}s\x1b[0m")
+        out.push_str("\x1b[2m");
+    }
+    out.push_str(&head);
+    if !draft.is_empty() {
+        // 留一格给行尾：写满整行会触发终端折行。
+        let budget = width.saturating_sub(render::display_width(&head) + 3 + 2 + 1);
+        if budget >= 6 {
+            out.push_str(" · > ");
+            out.push_str(&tail_cells(draft, budget));
+        }
+    }
+    if dim {
+        out.push_str("\x1b[0m");
+    }
+    out
+}
+
+/// 取显示宽度的末尾若干格；截过就加省略号。
+fn tail_cells(text: &str, cells: usize) -> String {
+    let mut width = 0;
+    let mut kept: Vec<char> = Vec::new();
+    for ch in text.chars().rev() {
+        let w = render::display_width(&ch.to_string());
+        if width + w > cells {
+            break;
+        }
+        width += w;
+        kept.push(ch);
+    }
+    let tail: String = kept.into_iter().rev().collect();
+    if tail.chars().count() < text.chars().count() {
+        format!("…{tail}")
     } else {
-        format!("\r\x1b[K{label} {secs:.1}s")
+        tail
     }
 }
 
@@ -824,11 +981,84 @@ mod tests {
     }
 
     #[test]
+    fn a_replayed_question_gets_the_same_block_as_live_input() {
+        let block = input_block("问一句", true);
+        let rows: Vec<&str> = block.split("\r\n").collect();
+        // 上边距、问题行、下边距。
+        assert_eq!(rows.len(), 4, "{block:?}");
+        assert!(rows[0].starts_with(INPUT_BAND), "上边距要有底色");
+        assert!(
+            rows[1].starts_with(&format!("{INPUT_BAND}> 问一句")),
+            "{:?}",
+            rows[1]
+        );
+        assert_eq!(
+            render::display_width(rows[1]),
+            terminal_width_or(80),
+            "补齐整行"
+        );
+        assert!(rows[2].starts_with(INPUT_BAND), "下边距要有底色");
+    }
+
+    #[test]
+    fn a_replayed_multi_line_question_keeps_every_line_inside_the_block() {
+        let block = input_block("第一行\n第二行", true);
+        let rows: Vec<&str> = block.split("\r\n").collect();
+        assert_eq!(rows.len(), 5, "{block:?}");
+        assert!(rows[1].contains("> 第一行"), "{:?}", rows[1]);
+        assert!(
+            rows[2].contains("第二行") && !rows[2].contains("> "),
+            "{:?}",
+            rows[2]
+        );
+    }
+
+    #[test]
+    fn replay_falls_back_to_plain_text_without_color() {
+        assert_eq!(input_block("问一句\n第二行", false), "> 问一句\n第二行\n");
+    }
+
+    fn terminal_width_or(fallback: usize) -> usize {
+        render::terminal_width().unwrap_or(fallback)
+    }
+
+    #[test]
+    fn pasted_newlines_each_get_their_own_row() {
+        assert_eq!(input_rows("abc", 40), vec![2 + 3]);
+        assert_eq!(input_rows("abc\ndef", 40), vec![5, 3]);
+        // 粘贴里的空行也要占一行，否则底色会缺一条。
+        assert_eq!(input_rows("a\n\nb", 40), vec![3, 0, 1]);
+    }
+
+    #[test]
+    fn a_long_input_wraps_by_display_width_not_char_count() {
+        // 提示符占两格：8 个字正好填满 18 列，下一个字折到第二行。
+        assert_eq!(input_rows("一二三四五六七八", 18), vec![18]);
+        assert_eq!(input_rows("一二三四五六七八九", 18), vec![18, 2]);
+    }
+
+    #[test]
     fn the_status_line_rewrites_itself_in_place() {
-        let plain = status_text("等待模型", 3.24, false);
+        let plain = status_line("等待模型", 3.24, false, "", 80);
         assert_eq!(plain, "\r\x1b[K等待模型 3.2s");
-        let dim = status_text("运行 bash", 12.46, true);
+        let dim = status_line("运行 bash", 12.46, true, "", 80);
         assert_eq!(dim, "\r\x1b[K\x1b[2m运行 bash 12.5s\x1b[0m");
+    }
+
+    #[test]
+    fn the_status_line_carries_the_draft_you_typed() {
+        let line = status_line("等待模型", 3.2, false, "帮我看看这个", 80);
+        assert_eq!(line, "\r\x1b[K等待模型 3.2s · > 帮我看看这个");
+    }
+
+    #[test]
+    fn a_long_draft_keeps_its_tail_because_that_is_where_you_type() {
+        let draft = "一二三四五六七八九十".repeat(5);
+        let line = status_line("等待模型", 3.2, false, &draft, 30);
+        assert!(render::display_width(&line) <= 30, "不超宽：{line:?}");
+        assert!(line.ends_with("九十"), "保留最新的字：{line:?}");
+        assert!(line.contains('…'), "截断要有省略号：{line:?}");
+        assert!(line.starts_with("\r\x1b[K等待模型 3.2s · > "), "{line:?}");
     }
 
     #[test]
