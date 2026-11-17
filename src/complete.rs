@@ -16,6 +16,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/help", "显示命令、环境变量和配置字段"),
     ("/new", "归档当前会话，开始新的一条"),
     ("/effort", "设置推理强度：auto / low / high / max"),
+    ("/switch", "切换供应商与模型：opencode-go / deepseek"),
     ("/skill:", "调用一个技能：/skill:<名字> [要求]"),
 ];
 
@@ -75,6 +76,21 @@ pub fn complete(line: &str, pos: usize, skills: &[(String, String)]) -> Option<(
             .filter_map(|effort| {
                 fuzzy(partial, effort).map(|score| (score, pair(*effort, *effort)))
             })
+            .collect();
+        return Some((start, finish(&mut pairs, partial)));
+    }
+
+    // `/switch ` 之后补供应商 id。
+    if let Some(rest) = head.strip_prefix("/switch ") {
+        let partial = rest;
+        if partial.contains(' ') {
+            return None;
+        }
+        let start = pos - partial.len();
+        let mut pairs: Vec<(i32, Pair)> = crate::config::PRESETS
+            .iter()
+            .map(|preset| preset.id)
+            .filter_map(|id| fuzzy(partial, id).map(|score| (score, pair(id, id))))
             .collect();
         return Some((start, finish(&mut pairs, partial)));
     }
@@ -275,6 +291,14 @@ mod tests {
             "不要把技能描述带进候选：{}",
             pairs[0].display
         );
+    }
+
+    #[test]
+    fn switch_arguments_complete_provider_ids() {
+        let (start, pairs) = complete("/switch d", 9, &skills()).expect("有候选");
+        assert_eq!(start, 8);
+        // 子序列匹配下 opencode-go 也含 d，但最匹配的一条必须排第一。
+        assert_eq!(pairs[0].replacement, "deepseek");
     }
 
     #[test]

@@ -31,11 +31,6 @@ pub fn idle() {
     send("idle", None);
 }
 
-/// 删掉这条记录：`done`/`error` 会一直留着，退出时清掉，免得下次看见旧状态。
-pub fn clear() {
-    send("clear", None);
-}
-
 fn send(state: &str, msg: Option<&str>) {
     if !std::io::stdout().is_terminal() {
         return;

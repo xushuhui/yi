@@ -172,6 +172,39 @@ fn a_successful_edit_does_not_print_a_result_line() {
 }
 
 #[test]
+fn a_background_command_returns_at_once_and_reports_on_the_next_turn() {
+    let home = temp_home("bg-home");
+    let ws = temp_home("bg-ws");
+
+    let server = start_server(vec![
+        tool_response(&[(
+            "c1",
+            "bash",
+            json!({ "command": "sleep 1; echo bg-ok", "background": true }),
+        )]),
+        plain_response(&["ok1"]),
+        plain_response(&["ok2"]),
+    ]);
+    let mut agent = open_agent(server.port, &home, &ws);
+
+    let (text, _, _) = collect(&mut agent, "后台跑一下");
+    assert_eq!(text, "ok1", "后台命令不该拖住这一轮");
+    let out = last_tool_output(&home);
+    assert!(out.contains("已转入后台"), "{out}");
+
+    std::thread::sleep(std::time::Duration::from_millis(1800));
+    let (text2, _, _) = collect(&mut agent, "继续");
+    assert_eq!(text2, "ok2");
+
+    let delivered = session_entries(&home).iter().any(|entry| {
+        entry["message"]["content"]
+            .as_str()
+            .is_some_and(|content| content.contains("后台作业") && content.contains("bg-ok"))
+    });
+    assert!(delivered, "下一轮要把后台输出带进会话");
+}
+
+#[test]
 fn a_search_with_no_match_is_reported_without_a_failure_mark() {
     let home = temp_home("no-match-home");
     let ws = temp_home("no-match-ws");

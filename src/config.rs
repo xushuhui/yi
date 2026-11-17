@@ -137,6 +137,30 @@ impl Config {
         Ok(cfg)
     }
 
+    /// 换成另一个预置：通道、模型、窗口、密钥都跟着预置走，其余本机设置照旧。
+    ///
+    /// 密钥缺失当场报错——不留一个「每句话都失败」的会话状态。
+    pub fn with_provider(&self, id: &str) -> Result<Config> {
+        let chosen = preset(id)?;
+        let key = std::env::var(chosen.env_key).unwrap_or_default();
+        if key.trim().is_empty() {
+            return Err(Error::Config(format!(
+                "缺少 {} 的密钥。设置环境变量 {}",
+                chosen.display, chosen.env_key
+            )));
+        }
+        let mut cfg = self.clone();
+        cfg.provider = chosen.id;
+        cfg.display = chosen.display;
+        cfg.base_url = chosen.base_url.to_string();
+        cfg.model = chosen.model.to_string();
+        cfg.model_display = chosen.model_display.to_string();
+        cfg.context_window = chosen.context_window;
+        cfg.api_key = key.trim().to_string();
+        cfg.proxy = resolve_proxy(cfg.provider, &cfg.base_url)?;
+        Ok(cfg)
+    }
+
     /// 系统提示词：正文在仓库的 `prompts/system.md`，编译期内嵌；
     /// 之后拼接用户级与项目级 `AGENTS.md`。
     /// 一条会话里只在开头计算一次，之后不变，保证前缀缓存。

@@ -120,15 +120,15 @@ impl Provider {
     }
 
     /// 非流式的一次性补全，只用于生成压缩摘要。
-    pub fn complete(&self, system: &str, prompt: &str) -> Result<String> {
-        let body = json!({
-            "model": self.model,
-            "messages": [
-                { "role": "system", "content": system },
-                { "role": "user", "content": prompt },
-            ],
-            "stream": false,
-        });
+    /// 一次性补全。`messages` 是主请求里同样的那段历史——压缩请求因此能命中
+    /// 前缀缓存，只多出最后那句指令的 token。
+    pub fn complete(
+        &self,
+        system: &str,
+        messages: &[Message],
+        instruction: &str,
+    ) -> Result<String> {
+        let body = completion_body(&self.model, system, messages, instruction);
         let resp = send_with_retry(&self.agent, &self.url, &self.api_key, &self.session, &body)?;
         let text = resp
             .into_body()
@@ -188,6 +188,79 @@ fn send_with_retry(
     Err(Error::Http("重试三次仍失败".to_string()))
 }
 
+/// 一次性请求的请求体：system 与历史原样照抄主请求，指令只追加在最后。
+///
+/// 这样前缀（system + 历史）与主请求逐字节相同，提供方的前缀缓存能命中；
+/// 换掉 system 就等于从第一个 token 起全部重算。
+fn completion_body(model: &str, system: &str, messages: &[Message], instruction: &str) -> Value {
+    let mut wire = Vec::with_capacity(messages.len() + 2);
+    wire.push(json!({ "role": "system", "content": system }));
+    for message in messages {
+        wire.push(message_json(message));
+    }
+    wire.push(json!({ "role": "user", "content": instruction }));
+    json!({
+        "model": model,
+        "messages": wire,
+        "stream": false,
+    })
+}
+
+/// 一条会话消息在 wire 上的样子。主请求与压缩请求共用，保证前缀逐字节一致。
+fn message_json(message: &Message) -> Value {
+    match message {
+        Message::User { content } => json!({ "role": "user", "content": content }),
+        Message::Assistant {
+            content,
+            reasoning,
+            tool_calls,
+            ..
+        } => {
+            let mut value = json!({ "role": "assistant", "content": content });
+            if let Some(reasoning) = reasoning
+                && !reasoning.is_empty()
+            {
+                value["reasoning_content"] = json!(reasoning);
+            }
+            if !tool_calls.is_empty() {
+                let calls: Vec<Value> = tool_calls
+                    .iter()
+                    .map(|call| {
+                        json!({
+                            "id": call.id,
+                            "type": "function",
+                            "function": { "name": call.name, "arguments": call.arguments },
+                        })
+                    })
+                    .collect();
+                value["tool_calls"] = Value::Array(calls);
+            }
+            value
+        }
+        Message::Image { path } => match image_data_url(path) {
+            Some(url) => json!({
+                "role": "user",
+                "content": [
+                    { "type": "text", "text": format!("[图片] {path}") },
+                    { "type": "image_url", "image_url": { "url": url } },
+                ],
+            }),
+            None => json!({
+                "role": "user",
+                "content": format!("[图片 {path} 读不到了]"),
+            }),
+        },
+        Message::Tool {
+            tool_call_id,
+            content,
+        } => json!({
+            "role": "tool",
+            "tool_call_id": tool_call_id,
+            "content": content,
+        }),
+    }
+}
+
 fn build_body(
     model: &str,
     system: &str,
@@ -206,61 +279,7 @@ fn build_body(
     }
 
     for message in messages {
-        match *message {
-            Message::User { content } => {
-                wire.push(json!({ "role": "user", "content": content }));
-            }
-            Message::Assistant {
-                content,
-                reasoning,
-                tool_calls,
-                ..
-            } => {
-                let mut value = json!({ "role": "assistant", "content": content });
-                if let Some(reasoning) = reasoning
-                    && !reasoning.is_empty()
-                {
-                    value["reasoning_content"] = json!(reasoning);
-                }
-                if !tool_calls.is_empty() {
-                    let calls: Vec<Value> = tool_calls
-                        .iter()
-                        .map(|call| {
-                            json!({
-                                "id": call.id,
-                                "type": "function",
-                                "function": { "name": call.name, "arguments": call.arguments },
-                            })
-                        })
-                        .collect();
-                    value["tool_calls"] = Value::Array(calls);
-                }
-                wire.push(value);
-            }
-            Message::Image { path } => match image_data_url(path) {
-                Some(url) => wire.push(json!({
-                    "role": "user",
-                    "content": [
-                        { "type": "text", "text": format!("[图片] {path}") },
-                        { "type": "image_url", "image_url": { "url": url } },
-                    ],
-                })),
-                None => wire.push(json!({
-                    "role": "user",
-                    "content": format!("[图片 {path} 读不到了]"),
-                })),
-            },
-            Message::Tool {
-                tool_call_id,
-                content,
-            } => {
-                wire.push(json!({
-                    "role": "tool",
-                    "tool_call_id": tool_call_id,
-                    "content": content,
-                }));
-            }
-        }
+        wire.push(message_json(message));
     }
 
     let mut body = json!({
@@ -488,7 +507,7 @@ fn base64(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::truncate;
+    use super::*;
 
     #[test]
     fn truncate_never_splits_a_character() {
@@ -499,5 +518,41 @@ mod tests {
         // 上限正好落在「中」之后（82），可以完整保留它。
         let kept = truncate(&text, 82);
         assert!(kept.starts_with(&format!("{}中", "a".repeat(79))), "{kept}");
+    }
+
+    #[test]
+    fn the_compaction_request_reuses_the_main_prefix() {
+        let user = Message::User {
+            content: "看看这个仓库".to_string(),
+        };
+        let assistant = Message::Assistant {
+            content: "好的。".to_string(),
+            reasoning: Some("先看目录".to_string()),
+            tool_calls: Vec::new(),
+            usage: None,
+        };
+        let history = vec![user, assistant];
+
+        let main = build_body(
+            "m",
+            "系统提示",
+            None,
+            &history.iter().collect::<Vec<_>>(),
+            &serde_json::json!([]),
+            None,
+        );
+        let compact = completion_body("m", "系统提示", &history, "把上面的对话压缩成摘要");
+
+        let main_messages = main["messages"].as_array().expect("主请求消息");
+        let compact_messages = compact["messages"].as_array().expect("压缩请求消息");
+        assert_eq!(
+            &compact_messages[..main_messages.len()],
+            &main_messages[..],
+            "压缩请求的前缀必须和主请求逐字节相同"
+        );
+        assert_eq!(
+            compact_messages.last().expect("最后一句")["content"],
+            "把上面的对话压缩成摘要"
+        );
     }
 }

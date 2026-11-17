@@ -48,16 +48,28 @@ fn run() -> Result<()> {
             .into_iter()
             .map(|skill| (skill.name, skill.description))
             .collect();
+    // 终端标题：Rex 的标签页、Ghostty 的标题栏都读它。
+    let project = Path::new(&cwd)
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| cwd.clone());
+    let mut title = Title::new(io::stdout().is_terminal(), project);
     // 剪贴板图片落在数据目录里，不落 /tmp：会话只记路径，重启后还要能读到。
     let clip: ClipSlot = Arc::new(Mutex::new(None));
     let mut editor = make_editor(&agent, skills, clip.clone(), &cfg.home.join("clipboard"))?;
     // 只在真终端里上色；管道输出、NO_COLOR 时保持原样。
     let color = io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
+    // 输入块只给真人看：标准输入是管道时（没有编辑器）一个字节都不加。
+    let band = color && editor.is_some();
     let mut renderer = Renderer::new(color);
     // 处理中的状态行：只在真终端里动，管道输出一个字节都不写。
     let mut status = Status::new(io::stdout().is_terminal(), color);
 
-    println!("yi · {} · {} · {cwd}", cfg.display, cfg.model_display);
+    println!(
+        "yi · {} · {} · {cwd}",
+        agent.provider_display(),
+        agent.model_display()
+    );
     println!("会话：{}", session_path.display());
     println!("输入 /help 查看命令，Ctrl-D 退出。\n");
     // 只给真人看：管道与重定向里保持逐字节稳定。
@@ -65,7 +77,12 @@ fn run() -> Result<()> {
         print_replay(&agent, color);
     }
 
-    while let Some(line) = read_input(&mut editor)? {
+    loop {
+        print_input_band_top(band);
+        let Some(line) = read_input(&mut editor, input_prompt(band))? else {
+            break;
+        };
+        close_input_band(&line, band);
         // Ctrl-G 在行里留了标记；这里换回文字，并把图片取出来。
         let (line, has_image) = clipboard::strip_tokens(&line);
         let prompt = line.trim();
@@ -82,7 +99,7 @@ fn run() -> Result<()> {
                 }
             }
         } else if prompt.starts_with('/') {
-            handle_command(prompt, &mut agent);
+            handle_command(prompt, &mut agent, &cfg);
             continue;
         } else {
             prompt.to_string()
@@ -112,11 +129,16 @@ fn run() -> Result<()> {
             );
         }
         status.set("等待模型");
+        title.start_working();
         let result = agent.submit_with_images(&message, &images, &mut |event| match event {
             // 空转一下：刷新「等待模型 3.2s」这类状态行，不代表有内容。
-            Event::Tick => status.tick(),
+            Event::Tick => {
+                status.tick();
+                title.spin();
+            }
             Event::Text(text) => {
                 status.clear();
+                title.spin();
                 let out = renderer.push(&text);
                 print!("{out}");
                 let _ = io::stdout().flush();
@@ -126,6 +148,7 @@ fn run() -> Result<()> {
                 if status.label() != Some("思考中") {
                     status.set("思考中");
                 }
+                title.spin();
             }
             Event::Notice(notice) => {
                 let half = renderer.flush_line();
@@ -139,6 +162,7 @@ fn run() -> Result<()> {
             Event::ToolCall { name, .. } => {
                 // 过程不打印：只在状态行里露一下工具名，失败时才有红行。
                 status.set(&format!("运行 {name}"));
+                title.spin();
             }
             Event::ToolResult { name, note, failed } => {
                 // 成功时没有可打印的内容：只把状态行推回「等待模型」。
@@ -164,10 +188,17 @@ fn run() -> Result<()> {
         status.clear();
         match &result {
             Ok(usage) => {
+                title.ready();
                 program_status::done(&format!("完成 · {:.1}s", usage.elapsed_ms as f64 / 1000.0))
             }
-            Err(Error::Cancelled) => program_status::idle(),
-            Err(err) => program_status::error(&format!("这一轮失败：{err}")),
+            Err(Error::Cancelled) => {
+                title.ready();
+                program_status::idle()
+            }
+            Err(err) => {
+                title.failed();
+                program_status::error(&format!("这一轮失败：{err}"))
+            }
         }
         yi::cancel::disarm();
         // 把没换行的半行、没闭合的代码块放出来，再打页脚。
@@ -181,11 +212,11 @@ fn run() -> Result<()> {
                     "{}",
                     footer(
                         &usage,
-                        cfg.context_window,
+                        agent.window(),
                         &short_project(&cwd),
                         branch.as_deref(),
-                        cfg.display,
-                        &cfg.model_display,
+                        agent.provider_display(),
+                        agent.model_display(),
                     )
                 );
                 println!();
@@ -197,8 +228,9 @@ fn run() -> Result<()> {
             }
         }
     }
-    // done/error 会一直留在终端里，退出时清掉这条记录。
-    program_status::clear();
+    // 退出时把还在跑的后台命令整组杀掉，不留孤儿进程。
+    yi::jobs::kill_all();
+    title.ready();
 
     Ok(())
 }
@@ -311,10 +343,56 @@ fn make_editor(
     Ok(Some(editor))
 }
 
+/// 输入区的底色：比常见深色背景浅一档的灰。整行铺满，用来把「我说的话」
+/// 和回答分开；颜色关掉时这些函数什么都不做，管道输出保持逐字节原样。
+const INPUT_BAND: &str = "\x1b[48;5;236m";
+
+/// 提示符本身也要带上底色，且结尾不 reset——后面敲进来的字继承这块底色，
+/// 整行才是连续色块，而不是只有两头有颜色。
+fn input_prompt(color: bool) -> &'static str {
+    if color {
+        "\x1b[48;5;236m\x1b[2m> \x1b[0m\x1b[48;5;236m"
+    } else {
+        "> "
+    }
+}
+
+/// 输入块的上边距：整行底色。写满是靠空格，不依赖终端的「擦除用底色」。
+fn print_input_band_top(color: bool) {
+    if !color {
+        return;
+    }
+    let width = render::terminal_width().unwrap_or(80);
+    // 行尾先回车再换行：刚写满一整行时光标处于待折行状态，直接换行会多空一行。
+    print!("{INPUT_BAND}{}\x1b[0m\r\n", " ".repeat(width));
+    let _ = io::stdout().flush();
+}
+
+/// 输入块收尾：把最后一行右边补满底色，再补一行下边距。
+///
+/// 折行时前面几行本来就被字填满了，只有最后一行右边是空的，所以只需要补它。
+fn close_input_band(line: &str, color: bool) {
+    if !color {
+        return;
+    }
+    let width = render::terminal_width().unwrap_or(80);
+    let col = (2 + render::display_width(line)) % width;
+    if col > 0 {
+        // 回到刚输入完那一行，从文字末尾开始铺底色（不碰已有的字）。
+        print!(
+            "\x1b[1A\x1b[{}G{INPUT_BAND}{}\x1b[0m\x1b[1B\r",
+            col + 1,
+            " ".repeat(width - col)
+        );
+    }
+    print!("{INPUT_BAND}{}\x1b[0m\r\n", " ".repeat(width));
+    let _ = io::stdout().flush();
+}
+
 /// 读一行输入；返回 `None` 表示该退出了（Ctrl-D 或标准输入结束）。
-fn read_input(editor: &mut Option<Editor>) -> Result<Option<String>> {
+fn read_input(editor: &mut Option<Editor>, prompt: &str) -> Result<Option<String>> {
     let Some(editor) = editor else {
-        print!("> ");
+        print!("{prompt}");
         io::stdout().flush()?;
         let mut line = String::new();
         if io::stdin().read_line(&mut line)? == 0 {
@@ -322,7 +400,7 @@ fn read_input(editor: &mut Option<Editor>) -> Result<Option<String>> {
         }
         return Ok(Some(line));
     };
-    match editor.readline("> ") {
+    match editor.readline(prompt) {
         Ok(line) => Ok(Some(line)),
         // Ctrl-C 只放弃这一行；rustyline 不给出缓冲区内容，所以无法区分空行。
         Err(rustyline::error::ReadlineError::Interrupted) => {
@@ -337,7 +415,7 @@ fn read_input(editor: &mut Option<Editor>) -> Result<Option<String>> {
     }
 }
 
-fn handle_command(line: &str, agent: &mut Agent) {
+fn handle_command(line: &str, agent: &mut Agent, cfg: &Config) {
     let mut parts = line.splitn(2, char::is_whitespace);
     let command = parts.next().unwrap_or("");
     let argument = parts.next().unwrap_or("").trim();
@@ -358,6 +436,33 @@ fn handle_command(line: &str, agent: &mut Agent) {
             }
             Err(err) => println!("{err}\n"),
         },
+        "/switch" => {
+            if argument.is_empty() {
+                let known: Vec<&str> = config::PRESETS.iter().map(|p| p.id).collect();
+                println!(
+                    "当前模型：{}/{}\n可选：{}\n",
+                    agent.provider_id(),
+                    agent.model_display(),
+                    known.join(" / ")
+                );
+                return;
+            }
+            if argument == agent.provider_id() {
+                println!("已经是 {argument}\n");
+                return;
+            }
+            match cfg
+                .with_provider(argument)
+                .and_then(|next| agent.switch(&next))
+            {
+                Ok(()) => println!(
+                    "模型 → {}/{}，下一句生效；重开会话仍然用它\n",
+                    agent.provider_id(),
+                    agent.model_display()
+                ),
+                Err(err) => println!("{err}\n"),
+            }
+        }
         other => println!("未知命令 {other}；用 /help 查看\n"),
     }
 }
@@ -373,6 +478,7 @@ fn print_help() {
 斜杠命令：
   /new                      归档当前会话，开始新的一条
   /effort <档位>            设置推理强度：auto / low / high / max
+  /switch <供应商>          切换供应商与模型：opencode-go / deepseek（记在会话里）
   /skill:<名字> [要求]      把某个技能的正文注入这一轮
   /help                     显示这份帮助
 
@@ -471,7 +577,13 @@ fn footer(
         out.push(' ');
         out.push_str(branch);
     }
-    out.push_str(&format!(" · {percent}% · {provider} · {model}]"));
+    // 缓存命中率按本轮累计的输入算：命中多少、未命中多少，一眼看得出前缀有没有被保住。
+    let input = usage.cache_hit + usage.input_uncached;
+    match (usage.cache_hit * 100).checked_div(input) {
+        Some(cached) => out.push_str(&format!(" · {percent}% · 缓存 {cached}%")),
+        None => out.push_str(&format!(" · {percent}%")),
+    }
+    out.push_str(&format!(" · {provider} · {model}]"));
     out
 }
 
@@ -507,6 +619,94 @@ fn git_branch(cwd: &str) -> Option<String> {
         return None;
     }
     Some(branch)
+}
+
+/// 终端标题里工作状态的转圈字符，和 omp 用同一套盲文点。
+const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
+/// 把运行状态写进终端标题：干活时转圈，轮到你时 `>`，出错时 `!`。
+///
+/// 与 OSC 7501 是两条路：那条交给终端自己画图标，这条是文本，标签页和标题栏直接看得到。
+struct Title {
+    enabled: bool,
+    project: String,
+    working: bool,
+    failed: bool,
+    frame: usize,
+    last_draw: std::time::Instant,
+}
+
+impl Title {
+    fn new(enabled: bool, project: String) -> Self {
+        let mut title = Self {
+            enabled,
+            project,
+            working: false,
+            failed: false,
+            frame: 0,
+            last_draw: std::time::Instant::now(),
+        };
+        title.draw();
+        title
+    }
+
+    /// 一轮开始：从第一帧转起。
+    fn start_working(&mut self) {
+        self.working = true;
+        self.failed = false;
+        self.frame = 0;
+        self.draw();
+    }
+
+    /// 干活期间每 100 毫秒换一帧；再快只是白写字节。
+    fn spin(&mut self) {
+        if !self.working || self.last_draw.elapsed().as_millis() < 100 {
+            return;
+        }
+        self.frame = self.frame.wrapping_add(1);
+        self.draw();
+    }
+
+    /// 轮到你说话。
+    fn ready(&mut self) {
+        if !self.working && !self.failed {
+            return;
+        }
+        self.working = false;
+        self.failed = false;
+        self.draw();
+    }
+
+    /// 这一轮失败了。
+    fn failed(&mut self) {
+        if self.failed && !self.working {
+            return;
+        }
+        self.working = false;
+        self.failed = true;
+        self.draw();
+    }
+
+    fn draw(&mut self) {
+        if !self.enabled {
+            return;
+        }
+        let mark = if self.working {
+            SPINNER[self.frame % SPINNER.len()]
+        } else if self.failed {
+            '!'
+        } else {
+            '>'
+        };
+        print!("{}", title_sequence(mark, &self.project));
+        let _ = io::stdout().flush();
+        self.last_draw = std::time::Instant::now();
+    }
+}
+
+/// 一条设标题的 OSC 0 序列（以 BEL 结尾，老终端也认）。
+fn title_sequence(mark: char, project: &str) -> String {
+    format!("\x1b]0;yi {mark} {project}\x07")
 }
 
 /// 处理中的单行状态：阶段名 + 已耗时，用回车回到行首原地重画。
@@ -612,6 +812,18 @@ mod tests {
     }
 
     #[test]
+    fn the_title_carries_the_state_glyph() {
+        assert_eq!(
+            title_sequence('>', "fm-openapi"),
+            "\x1b]0;yi > fm-openapi\x07"
+        );
+        assert_eq!(
+            title_sequence('\u{280b}', "fm-openapi"),
+            "\x1b]0;yi \u{280b} fm-openapi\x07"
+        );
+    }
+
+    #[test]
     fn the_status_line_rewrites_itself_in_place() {
         let plain = status_text("等待模型", 3.24, false);
         assert_eq!(plain, "\r\x1b[K等待模型 3.2s");
@@ -659,8 +871,21 @@ mod tests {
         );
         assert_eq!(
             line,
-            "[~/gp/yi main · 50% · OpenCode Go · DeepSeek V4.1 Flash]"
+            "[~/gp/yi main · 50% · 缓存 50% · OpenCode Go · DeepSeek V4.1 Flash]"
         );
+    }
+
+    #[test]
+    fn footer_shows_the_cache_hit_rate_of_the_turn() {
+        let line = footer(
+            &usage(100, 9_000, 1_000),
+            1_048_576,
+            "~/gp/yi",
+            None,
+            "DeepSeek",
+            "DeepSeek Flash",
+        );
+        assert!(line.contains("缓存 10%"), "命中 1000 / 输入 10000：{line}");
     }
 
     #[test]

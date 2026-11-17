@@ -8,6 +8,7 @@ pub mod clipboard;
 pub mod complete;
 pub mod config;
 pub mod crash;
+pub mod jobs;
 pub mod lsp;
 pub mod program_status;
 pub mod provider;

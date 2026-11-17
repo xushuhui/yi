@@ -94,6 +94,13 @@ pub enum Entry {
         timestamp: u64,
         effort: String,
     },
+    /// 中途换了供应商：从这条之后发出的请求用它，重开时也照它恢复。
+    ModelChange {
+        seq: u64,
+        timestamp: u64,
+        provider: String,
+        model: String,
+    },
     Compaction {
         seq: u64,
         timestamp: u64,
@@ -122,6 +129,7 @@ impl Entry {
         match self {
             Entry::Message { seq, .. }
             | Entry::EffortChange { seq, .. }
+            | Entry::ModelChange { seq, .. }
             | Entry::Compaction { seq, .. }
             | Entry::Prompt { seq, .. }
             | Entry::Notice { seq, .. } => *seq,
@@ -231,6 +239,16 @@ impl Session {
         effort
     }
 
+    /// 最近一次切换后的供应商与模型；从没切过就是 `None`，用配置文件。
+    pub fn current_model(&self) -> Option<(String, String)> {
+        self.entries.iter().rev().find_map(|entry| match entry {
+            Entry::ModelChange {
+                provider, model, ..
+            } => Some((provider.clone(), model.clone())),
+            _ => None,
+        })
+    }
+
     /// 重建发给模型的对话：最近一次压缩的摘要 + 它保留的消息。
     /// 返回借用，避免每次工具步都克隆整段历史。
     /// 最近 `turns` 轮的重放内容：用户敲的原文、回答正文、工具调用。
@@ -258,6 +276,10 @@ impl Session {
                 Entry::Prompt { text, .. } => typed = Some(text.clone()),
                 Entry::Message { message, .. } => match message {
                     Message::User { content } => {
+                        // 后台命令的回灌不是人打的字，重放时跳过。
+                        if content.starts_with("[后台作业 ") {
+                            continue;
+                        }
                         // 技能调用那一轮显示用户敲的原文，展开后的正文太长。
                         let text = typed.take().unwrap_or_else(|| content.clone());
                         items.push(Replay::User(text));
@@ -276,7 +298,10 @@ impl Session {
                     }
                     Message::Tool { .. } | Message::Image { .. } => {}
                 },
-                Entry::EffortChange { .. } | Entry::Compaction { .. } | Entry::Notice { .. } => {}
+                Entry::EffortChange { .. }
+                | Entry::ModelChange { .. }
+                | Entry::Compaction { .. }
+                | Entry::Notice { .. } => {}
             }
         }
 
@@ -516,6 +541,15 @@ impl Session {
         })
     }
 
+    pub fn append_model(&mut self, provider: &str, model: &str) -> Result<()> {
+        self.append(Entry::ModelChange {
+            seq: self.next_seq,
+            timestamp: now_ms(),
+            provider: provider.to_string(),
+            model: model.to_string(),
+        })
+    }
+
     /// 记下用户敲的原文：技能展开后原文就没了，历史要靠它。
     pub fn append_prompt(&mut self, text: &str) -> Result<()> {
         self.append(Entry::Prompt {
@@ -728,6 +762,40 @@ mod tests {
             name: "read".to_string(),
             arguments: "{}".to_string(),
         }
+    }
+
+    #[test]
+    fn a_model_switch_survives_reopening() {
+        let mut session = temp_session("model-switch");
+        session
+            .append_model("deepseek", "deepseek-flash")
+            .expect("记切换");
+        session
+            .append_model("opencode-go", "deepseek-v4.1-flash")
+            .expect("再切回");
+        assert_eq!(
+            session.current_model(),
+            Some(("opencode-go".to_string(), "deepseek-v4.1-flash".to_string())),
+            "以最后一次切换为准"
+        );
+        let path = session.path().to_path_buf();
+        drop(session);
+        let reopened = Session::open(&path, "/tmp/proj", "别的模型", "auto").expect("重开");
+        assert_eq!(
+            reopened.current_model(),
+            Some(("opencode-go".to_string(), "deepseek-v4.1-flash".to_string())),
+            "重开仍然记得切换后的模型"
+        );
+    }
+
+    #[test]
+    fn a_model_switch_does_not_enter_the_model_context() {
+        let mut session = temp_session("model-switch-context");
+        session.append_user("你好").expect("记一句");
+        session
+            .append_model("deepseek", "deepseek-flash")
+            .expect("记切换");
+        assert_eq!(session.context().messages.len(), 1, "切换条目不该发给模型");
     }
 
     #[test]

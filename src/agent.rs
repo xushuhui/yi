@@ -20,6 +20,11 @@ pub struct Agent {
     effort: Option<String>,
     /// 上下文涨到这个量就在本轮结束后压缩；按当前模型的窗口算。
     compact_at: u64,
+    /// 当前窗口大小，页脚按它算占比；切换后跟着换。
+    window: u64,
+    provider_id: String,
+    provider_display: String,
+    model_display: String,
 }
 
 impl Agent {
@@ -38,6 +43,19 @@ impl Agent {
         let effort = session.current_effort().or(cfg.effort.clone());
         let log_dir = session_path.parent().unwrap_or(Path::new(".")).join("logs");
 
+        // 上次在这个会话里 /switch 过：以会话记录为准，配置只作新会话的默认。
+        let mut chosen = cfg.clone();
+        if let Some((provider, model)) = session.current_model() {
+            if provider != chosen.provider {
+                chosen = chosen.with_provider(&provider)?;
+            }
+            if model != chosen.model {
+                chosen.model = model.clone();
+                chosen.model_display = model;
+            }
+        }
+        let cfg = &chosen;
+
         let session_id = session.id().to_string();
         Ok(Agent {
             provider: Provider::new(cfg, &session_id),
@@ -52,7 +70,42 @@ impl Agent {
             system: cfg.system_prompt(cwd),
             effort,
             compact_at: cfg.compact_at_tokens(),
+            window: cfg.context_window,
+            provider_id: cfg.provider.to_string(),
+            provider_display: cfg.display.to_string(),
+            model_display: cfg.model_display.clone(),
         })
+    }
+
+    pub fn provider_id(&self) -> &str {
+        &self.provider_id
+    }
+
+    pub fn provider_display(&self) -> &str {
+        &self.provider_display
+    }
+
+    pub fn model_display(&self) -> &str {
+        &self.model_display
+    }
+
+    pub fn window(&self) -> u64 {
+        self.window
+    }
+
+    /// 换供应商：重建请求通道，并把这件事写进会话，重开时照它恢复。
+    ///
+    /// 系统提示与历史不动——前缀能命中的部分尽量保住；换模型必然掉一段缓存，
+    /// 这是换通道的固有代价。
+    pub fn switch(&mut self, cfg: &Config) -> Result<()> {
+        let session_id = self.session.id().to_string();
+        self.provider = Provider::new(cfg, &session_id);
+        self.compact_at = cfg.compact_at_tokens();
+        self.window = cfg.context_window;
+        self.provider_id = cfg.provider.to_string();
+        self.provider_display = cfg.display.to_string();
+        self.model_display = cfg.model_display.clone();
+        self.session.append_model(cfg.provider, &cfg.model)
     }
 
     /// 工具结果算不算失败：显式的 `ERROR`，或 bash 的非零退出码。
@@ -118,6 +171,17 @@ impl Agent {
         images: &[std::path::PathBuf],
         on: &mut dyn FnMut(Event),
     ) -> Result<Usage> {
+        // 后台命令跑完的结果先落进会话，模型这一轮就能看到；界面上只留一行提示。
+        for job in crate::jobs::take_finished() {
+            self.session.append_user(&format!(
+                "[后台作业 {} 完成，用时 {:.1}s，命令：{}]\n{}",
+                job.id, job.secs, job.command, job.output
+            ))?;
+            on(Event::Notice(format!(
+                "后台作业 {} 完成（{:.1}s）：{}",
+                job.id, job.secs, job.command
+            )));
+        }
         self.session.append_user(prompt)?;
         // 用户贴的图跟着这句话一起进上下文；读不出来的图会让下一轮请求缺内容，先在这里挡住。
         for path in images {
@@ -273,17 +337,21 @@ impl Agent {
             return Ok(());
         };
 
-        let mut prompt = String::new();
+        // 压缩请求尽量复刻主请求的前缀：先放上一份摘要（如果压缩过），再原样带上
+        // 要压缩的这段历史，最后才是一句指令。这样除了指令本身，前面的 token 都能命中缓存。
+        let mut history: Vec<Message> = Vec::new();
         if let Some(previous) = &plan.previous_summary {
-            prompt.push_str("<previous-summary>\n");
-            prompt.push_str(previous);
-            prompt.push_str("\n</previous-summary>\n\n");
+            history.push(Message::User {
+                content: format!("<compaction-summary>\n{previous}\n</compaction-summary>"),
+            });
         }
-        prompt.push_str("<conversation>\n");
-        prompt.push_str(&serialize_for_summary(&plan.messages_to_summarize));
-        prompt.push_str("</conversation>\n");
+        history.extend(plan.messages_to_summarize.iter().cloned());
+        // 系统提示保持和主请求一样，压缩要求放进最后一句用户消息里——
+        // 只要 system 一变，前缀缓存从第一个 token 就失效了。
+        let instruction =
+            format!("{COMPACTION_PROMPT}\n\n把上面的对话压缩成摘要，只输出摘要本身。");
 
-        match self.provider.complete(COMPACTION_PROMPT, &prompt) {
+        match self.provider.complete(&self.system, &history, &instruction) {
             Ok(summary) => {
                 let count = plan.messages_to_summarize.len();
                 let tokens_before = plan.tokens_before;
@@ -308,50 +376,6 @@ impl Agent {
     pub fn new_session(&mut self) -> Result<PathBuf> {
         self.session.archive()
     }
-}
-
-/// 把要摘要的消息压成纯文本，每个块截断到 2000 字符，避免摘要请求本身过长。
-fn serialize_for_summary(messages: &[Message]) -> String {
-    let mut out = String::new();
-    for message in messages {
-        match message {
-            Message::User { content } => push_block(&mut out, "用户", content),
-            Message::Assistant {
-                content,
-                tool_calls,
-                ..
-            } => {
-                push_block(&mut out, "助手", content);
-                for call in tool_calls {
-                    push_block(
-                        &mut out,
-                        "调用工具",
-                        &format!("{} {}", call.name, call.arguments),
-                    );
-                }
-            }
-            Message::Tool { content, .. } => push_block(&mut out, "工具结果", content),
-            Message::Image { path } => push_block(&mut out, "图片", path),
-        }
-    }
-    out
-}
-
-fn push_block(out: &mut String, label: &str, body: &str) {
-    out.push('[');
-    out.push_str(label);
-    out.push_str("] ");
-    out.push_str(&truncate_chars(body, 2000));
-    out.push('\n');
-}
-
-fn truncate_chars(text: &str, max: usize) -> String {
-    if text.chars().count() <= max {
-        return text.to_string();
-    }
-    let mut out: String = text.chars().take(max).collect();
-    out.push('…');
-    out
 }
 
 /// 取第一行，给界面用。

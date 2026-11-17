@@ -10,6 +10,7 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 use serde_json::{Value, json};
 use std::os::unix::process::CommandExt;
 
+use crate::jobs;
 use crate::lsp::Lsp;
 use crate::provider::Event;
 use crate::session::ToolCall;
@@ -133,7 +134,11 @@ impl Tools {
                                 "type": "string",
                                 "description": "在哪个目录执行；相对路径按项目根解析，绝对路径原样使用；默认项目根"
                             },
-                            "timeout": { "type": "integer", "description": "秒，默认 300" }
+                            "timeout": { "type": "integer", "description": "秒，默认 300" },
+                            "background": {
+                                "type": "boolean",
+                                "description": "设为 true 就把命令丢后台，立刻返回；跑完的输出会在下一轮对话开始时自动带上"
+                            }
                         },
                         "required": ["command"]
                     }
@@ -685,11 +690,76 @@ impl Tools {
             let _ = done_tx.send(());
         });
 
+        if args
+            .get("background")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            let label = match jobs::register(&command, pid) {
+                Ok(label) => label,
+                Err(err) => {
+                    signal_group(pid, libc::SIGTERM);
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return format!("ERROR: {err}");
+                }
+            };
+            let thread_label = label.clone();
+            std::thread::spawn(move || {
+                let started = Instant::now();
+                let output = Self::wait_for_command(
+                    child,
+                    done_rx,
+                    stdout_tail,
+                    stderr_tail,
+                    stdout_total,
+                    pid,
+                    timeout,
+                    log_path,
+                    command,
+                    None,
+                );
+                jobs::finish(&thread_label, output, started.elapsed().as_secs_f32());
+            });
+            return format!(
+                "已转入后台：{label}。命令跑完后，输出会在下一轮对话开始时自动带上，不用再问。"
+            );
+        }
+
+        Self::wait_for_command(
+            child,
+            done_rx,
+            stdout_tail,
+            stderr_tail,
+            stdout_total,
+            pid,
+            timeout,
+            log_path,
+            command,
+            Some(on),
+        )
+    }
+
+    /// 等命令结束并整理成工具输出；前台边等边发心跳，后台什么都不打扰。
+    #[allow(clippy::too_many_arguments)]
+    fn wait_for_command(
+        mut child: std::process::Child,
+        done_rx: mpsc::Receiver<()>,
+        stdout_tail: Arc<Mutex<Vec<u8>>>,
+        stderr_tail: Arc<Mutex<Vec<u8>>>,
+        stdout_total: Arc<AtomicU64>,
+        pid: u32,
+        timeout: u64,
+        log_path: PathBuf,
+        command: String,
+        mut tick: Option<&mut dyn FnMut(Event)>,
+    ) -> String {
         let deadline = Instant::now() + Duration::from_secs(timeout);
         let mut status = None;
         let mut timed_out = false;
         loop {
-            if crate::cancel::check() {
+            // 只有前台才响应 Ctrl-C：后台命令是用户明确放走的，不该被这一轮连坐。
+            if tick.is_some() && crate::cancel::check() {
                 // 用户要中断：按进程组杀，避免只杀掉 sh 留下子进程。
                 signal_group(pid, libc::SIGTERM);
                 let _ = child.kill();
@@ -715,7 +785,9 @@ impl Tools {
                 break;
             }
             // 命令跑多久，状态行就跳多久；界面自己决定要不要显示。
-            on(Event::Tick);
+            if let Some(on) = tick.as_deref_mut() {
+                on(Event::Tick);
+            }
             std::thread::sleep(Duration::from_millis(50));
         }
         drop(child);

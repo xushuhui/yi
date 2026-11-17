@@ -255,7 +255,7 @@ fn is_rule(line: &str) -> bool {
 }
 
 /// 终端宽度；不是终端或取不到就返回 `None`，由调用方退到 80。
-fn terminal_width() -> Option<usize> {
+pub fn terminal_width() -> Option<usize> {
     // SAFETY: 只把窗口大小结构体交给内核填写。
     unsafe {
         let mut size: libc::winsize = std::mem::zeroed();
@@ -304,26 +304,45 @@ fn render_table(rows: &[String], color: bool, width: usize) -> Option<String> {
         }
     }
     let total: usize = widths.iter().sum::<usize>() + 2 * columns.saturating_sub(1);
-    if total > width {
-        return None;
-    }
+    // 比终端宽就收缩列宽再折行，而不是整表退回原文：表还是表，只是每格可能占几行。
+    let widths = if total > width {
+        let room = width.saturating_sub(2 * columns.saturating_sub(1));
+        if room < columns {
+            return None;
+        }
+        shrink_widths(&widths, room)
+    } else {
+        widths
+    };
 
     let mut out: Vec<String> = Vec::new();
     for (row_index, row) in cells.iter().enumerate() {
         if row_index == 1 {
             continue;
         }
-        let mut line = String::new();
-        for (index, width) in widths.iter().enumerate() {
-            if index > 0 {
-                line.push_str("  ");
+        let wrapped: Vec<Vec<String>> = (0..columns)
+            .map(|index| {
+                let raw = row.get(index).map(String::as_str).unwrap_or("");
+                wrap_cell(raw, widths[index], color)
+            })
+            .collect();
+        let height = wrapped.iter().map(Vec::len).max().unwrap_or(1);
+        for line_index in 0..height {
+            let mut line = String::new();
+            for (index, width) in widths.iter().enumerate() {
+                if index > 0 {
+                    line.push_str("  ");
+                }
+                let raw = wrapped[index]
+                    .get(line_index)
+                    .map(String::as_str)
+                    .unwrap_or("");
+                let text = inline(raw, color);
+                let used = display_width(&text);
+                line.push_str(&pad(&text, used, *width, aligns[index]));
             }
-            let raw = row.get(index).map(String::as_str).unwrap_or("");
-            let text = inline(raw, color);
-            let used = display_width(&text);
-            line.push_str(&pad(&text, used, *width, aligns[index]));
+            out.push(line.trim_end().to_string());
         }
-        out.push(line.trim_end().to_string());
         if row_index == 0 {
             let rule = widths
                 .iter()
@@ -334,6 +353,111 @@ fn render_table(rows: &[String], color: bool, width: usize) -> Option<String> {
         }
     }
     Some(out.join("\n"))
+}
+
+/// 把自然列宽压进 `room`：先从最窄的列开始给，保证宽列吃掉剩下的空间。
+fn shrink_widths(natural: &[usize], room: usize) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..natural.len()).collect();
+    order.sort_by_key(|index| natural[*index]);
+    let mut widths = vec![0usize; natural.len()];
+    let mut left = natural.len();
+    let mut remaining = room;
+    for index in order {
+        let share = remaining / left.max(1);
+        let width = natural[index].min(share);
+        widths[index] = width;
+        remaining -= width;
+        left -= 1;
+    }
+    widths
+}
+
+/// 按显示宽度折行，但不在行内标记（反引号、粗体）中间断开。
+///
+/// 宽度按「去掉标记之后」算：`**粗体**` 在屏幕上只占粗体那两个字的宽度。
+fn wrap_cell(raw: &str, width: usize, color: bool) -> Vec<String> {
+    if width == 0 {
+        return vec![String::new()];
+    }
+    let mut lines: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut used = 0usize;
+    for token in markdown_tokens(raw) {
+        let token_width = display_width(&inline(&token, color));
+        if used > 0 && used + token_width > width {
+            lines.push(std::mem::take(&mut current));
+            used = 0;
+            if token.trim().is_empty() {
+                continue;
+            }
+        }
+        if token_width > width {
+            // 单个词比整列还宽：只能硬切，宁可断样式也不让行超宽。
+            for ch in token.chars() {
+                let ch_width = char_width(ch);
+                if used > 0 && used + ch_width > width {
+                    lines.push(std::mem::take(&mut current));
+                    used = 0;
+                }
+                current.push(ch);
+                used += ch_width;
+            }
+            continue;
+        }
+        current.push_str(&token);
+        used += token_width;
+    }
+    if !current.is_empty() || lines.is_empty() {
+        lines.push(current);
+    }
+    lines
+        .into_iter()
+        .map(|line| line.trim_end().to_string())
+        .collect()
+}
+
+/// 把一格拆成折行单位：行内标记整段算一个，其余按空白切。
+fn markdown_tokens(raw: &str) -> Vec<String> {
+    let chars: Vec<char> = raw.chars().collect();
+    let mut tokens = Vec::new();
+    let mut index = 0;
+    while index < chars.len() {
+        if chars[index] == '`'
+            && let Some(end) = find(&chars, index + 1, &['`'])
+        {
+            tokens.push(chars[index..=end].iter().collect());
+            index = end + 1;
+            continue;
+        }
+        if chars[index] == '*'
+            && chars.get(index + 1) == Some(&'*')
+            && let Some(end) = find_double_star(&chars, index + 2)
+        {
+            tokens.push(chars[index..end + 2].iter().collect());
+            index = end + 2;
+            continue;
+        }
+        if chars[index].is_whitespace() {
+            let start = index;
+            while index < chars.len() && chars[index].is_whitespace() {
+                index += 1;
+            }
+            tokens.push(chars[start..index].iter().collect());
+            continue;
+        }
+        let start = index;
+        while index < chars.len() && !chars[index].is_whitespace() && chars[index] != '`' {
+            index += 1;
+        }
+        tokens.push(chars[start..index].iter().collect());
+    }
+    tokens
+}
+
+/// 找闭合的 `**`。
+fn find_double_star(chars: &[char], from: usize) -> Option<usize> {
+    (from..chars.len().saturating_sub(1))
+        .find(|&index| chars[index] == '*' && chars[index + 1] == '*')
 }
 
 fn split_cells(row: &str) -> Vec<String> {
@@ -371,7 +495,7 @@ fn pad(text: &str, used: usize, width: usize, align: Align) -> String {
 }
 
 /// 显示宽度：跳过 ANSI 转义，东亚宽字符按两格算。
-fn display_width(text: &str) -> usize {
+pub fn display_width(text: &str) -> usize {
     let mut width = 0;
     let mut chars = text.chars();
     while let Some(ch) = chars.next() {
@@ -850,13 +974,42 @@ mod tests {
     }
 
     #[test]
-    fn a_table_that_does_not_fit_falls_back_to_the_raw_rows() {
+    fn a_table_wider_than_the_terminal_wraps_instead_of_leaking_pipes() {
         let mut renderer = plain().with_width(20);
         let mut out = renderer.push("| 名称 | 数量 |\n|---|---|\n| 苹果很甜很好吃 | 12345 |\n");
         out.push_str(&renderer.finish());
         let text = strip_ansi(&out);
-        assert!(text.contains('|'), "超宽时原样输出：{text}");
-        assert!(text.contains("苹果很甜很好吃"), "一个字都不能丢：{text}");
+        assert!(!text.contains('|'), "折行后不该再有竖线：{text}");
+        // 折行会把「吃」挤到下一行，但一个字都不能丢。
+        assert!(text.contains("苹果很甜很好"), "一个字都不能丢：{text}");
+        assert!(text.lines().any(|line| line.trim() == "吃"), "{text}");
+        for line in text.lines() {
+            assert!(display_width(line) <= 20, "每行都不超过终端宽度：{line:?}");
+        }
+    }
+
+    #[test]
+    fn wrapping_never_splits_an_inline_span() {
+        let mut renderer = Renderer::with_highlighter(true, false).with_width(20);
+        let mut out =
+            renderer.push("| a | b |\n|---|---|\n| 甲 **丙丁戊己** | 乙乙乙乙乙乙乙乙 |\n");
+        out.push_str(&renderer.finish());
+        // 粗体整段算一个折行单位：真被切开就会剩下没配对的 `**`。
+        assert!(!out.contains("**"), "行内标记必须成对：{out:?}");
+        let text = strip_ansi(&out);
+        assert!(text.contains("丙丁戊己"), "{text}");
+        for line in text.lines() {
+            assert!(display_width(line) <= 20, "每行都不超过终端宽度：{line:?}");
+        }
+    }
+
+    #[test]
+    fn a_table_too_narrow_for_any_column_still_falls_back() {
+        let mut renderer = plain().with_width(1);
+        let mut out = renderer.push("| 名称 | 数量 |\n|---|---|\n| 苹果 | 1 |\n");
+        out.push_str(&renderer.finish());
+        let text = strip_ansi(&out);
+        assert!(text.contains('|'), "连一列都放不下时原样输出：{text}");
     }
 
     #[test]
