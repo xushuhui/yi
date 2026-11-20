@@ -59,16 +59,14 @@ fn run() -> Result<()> {
     let mut title = Title::new(io::stdout().is_terminal(), project);
     // 只在真终端里上色；管道输出、NO_COLOR 时保持原样。
     let color = io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
-    // 输入块只给真人看：标准输入是管道时一个字节都不加。
+    // 行编辑器只给真人用：标准输入是管道时一个字节都不加。
     let interactive = io::stdin().is_terminal();
-    let band = color && interactive;
     // 剪贴板图片落在数据目录里，不落 /tmp：会话只记路径，重启后还要能读到。
     let clip_dir = cfg.home.join("clipboard");
     let mut input = if interactive {
         Some(yi::input::Input::new(
             skills,
             agent.prompt_history(),
-            band,
             agent.plan(),
         )?)
     } else {
@@ -93,7 +91,6 @@ fn run() -> Result<()> {
     // 上一轮里敲的字：轮末取出来放回提示符，免得白打。
     let mut draft = String::new();
     loop {
-        print_input_band_top(band);
         let prefill = std::mem::take(&mut draft);
         let line = match &mut input {
             Some(input) => {
@@ -108,10 +105,7 @@ fn run() -> Result<()> {
                 };
                 match input.read(&prefill, &mut toggle_plan)? {
                     Action::Line(line) => line,
-                    Action::Interrupted => {
-                        close_input_band("", band);
-                        continue;
-                    }
+                    Action::Interrupted => continue,
                     Action::Eof => break,
                 }
             }
@@ -126,7 +120,6 @@ fn run() -> Result<()> {
                 line
             }
         };
-        close_input_band(&line, band);
         // Ctrl-G 在行里留了标记；这里换回文字，并把图片取出来。
         let (line, has_image) = clipboard::strip_tokens(&line);
         let prompt = line.trim();
@@ -337,113 +330,6 @@ fn show_cursor() {
     }
 }
 
-/// 输入区的底色：比常见深色背景浅一档的灰。整行铺满，用来把「我说的话」
-/// 和回答分开；颜色关掉时这些函数什么都不做，管道输出保持逐字节原样。
-const INPUT_BAND: &str = "\x1b[48;5;236m";
-
-/// 输入块的上边距：整行底色。写满是靠空格，不依赖终端的「擦除用底色」。
-fn print_input_band_top(color: bool) {
-    if !color {
-        return;
-    }
-    let width = render::terminal_width().unwrap_or(80);
-    // 行尾先回车再换行：刚写满一整行时光标处于待折行状态，直接换行会多空一行。
-    print!("{INPUT_BAND}{}\x1b[0m\r\n", " ".repeat(width));
-    let _ = io::stdout().flush();
-}
-
-/// 把一句话按输入块的样式打出来：重放旧对话时用，看起来和实时输入一致。
-///
-/// 管道与 `NO_COLOR` 下退回一行 `> 原文`，脚本解析得到的仍是纯文本。
-fn print_input_block(text: &str, color: bool) {
-    print!("{}", input_block(text, color));
-    let _ = io::stdout().flush();
-}
-
-/// 输入块的完整输出：上下各一行底色，中间每行从文字末尾补满。
-fn input_block(text: &str, color: bool) -> String {
-    if !color {
-        return format!("> {text}\n");
-    }
-    let width = render::terminal_width().unwrap_or(80);
-    let mut out = format!("{INPUT_BAND}{}\x1b[0m\r\n", " ".repeat(width));
-    for (index, line) in text.split('\n').enumerate() {
-        let used = if index == 0 {
-            2 + render::display_width(line)
-        } else {
-            render::display_width(line)
-        };
-        out.push_str(INPUT_BAND);
-        if index == 0 {
-            out.push_str("> ");
-        }
-        out.push_str(line);
-        let col = used % width;
-        if col > 0 {
-            out.push_str(&" ".repeat(width - col));
-        }
-        out.push_str("\x1b[0m\r\n");
-    }
-    out.push_str(&format!("{INPUT_BAND}{}\x1b[0m\r\n", " ".repeat(width)));
-    out
-}
-
-/// 输入块收尾：把每一行右边补满底色，再补一行下边距。
-///
-/// 粘贴进来的多行文本每行都可能结束在行中间，右边留白没有底色，看上去就是
-/// 一块缺角的色带；折行时更麻烦——不能只补最后一行。这里逐行补。
-fn close_input_band(line: &str, color: bool) {
-    if !color {
-        return;
-    }
-    let width = render::terminal_width().unwrap_or(80);
-    let rows = input_rows(line, width);
-    // 光标现在停在最后一行下面，先回到第一行。
-    print!("\x1b[{}A\r", rows.len());
-    for (index, used) in rows.iter().enumerate() {
-        // used == 0 是粘贴里的空行：整行都要补；used == width 说明这行已经被字填满。
-        if *used < width {
-            // 从这一行文字末尾开始铺底色，不碰已有的字。
-            print!(
-                "\x1b[{}G{INPUT_BAND}{}\x1b[0m",
-                used + 1,
-                " ".repeat(width - used)
-            );
-        }
-        if index + 1 < rows.len() {
-            print!("\r\n");
-        }
-    }
-    print!("\r\n{INPUT_BAND}{}\x1b[0m\r\n", " ".repeat(width));
-    let _ = io::stdout().flush();
-}
-
-/// 输入文本在屏幕上占几行、每行用到哪一列（行首起算，含提示符的两格）。
-///
-/// 粘贴里的换行各起一行；超过终端宽度的长行按显示宽度折行。返回值给
-/// [`close_input_band`] 逐行补齐底色用，顺序就是屏幕上的行序。
-fn input_rows(text: &str, width: usize) -> Vec<usize> {
-    let width = width.max(1);
-    // 提示符 `> ` 占两格，第一行的文字从第 2 列开始。
-    let mut used = 2.min(width);
-    let mut rows = Vec::new();
-    for ch in text.chars() {
-        if ch == '\n' {
-            rows.push(used);
-            used = 0;
-            continue;
-        }
-        let cells = render::display_width(&ch.to_string());
-        if used + cells > width {
-            rows.push(used);
-            used = 0;
-        }
-        used += cells;
-    }
-    rows.push(used);
-    rows
-}
-
 fn handle_command(line: &str, agent: &mut Agent, cfg: &Config) {
     let mut parts = line.splitn(2, char::is_whitespace);
     let command = parts.next().unwrap_or("");
@@ -518,7 +404,10 @@ fn handle_command(line: &str, agent: &mut Agent, cfg: &Config) {
 
 /// `/db` 不带参数：把配置路径、当前 profile 和可选项一次说清。
 fn print_db(agent: &Agent) {
-    println!("数据库配置：{}", agent.db_path().display());
+    match agent.db_shared() {
+        Some(name) => println!("数据库配置：共享 {name}（{}）", agent.db_path().display()),
+        None => println!("数据库配置：项目自带（{}）", agent.db_path().display()),
+    }
     let Some(config) = agent.db() else {
         println!(
             "（还没有）写一份，密码放环境变量 MYSQL_PWD：\n{{\n  \"default\": \"dev\",\n  \"profiles\": {{\n    \"dev\": {{ \"host\": \"127.0.0.1\", \"user\": \"root\", \"database\": \"demo\" }}\n  }}\n}}\n"
@@ -629,7 +518,7 @@ fn print_replay(agent: &Agent, color: bool) {
 
     for item in &items[keep_from..] {
         match item {
-            Replay::User(text) => print_input_block(text, color),
+            Replay::User(text) => println!("> {text}"),
             Replay::Assistant(text) => {
                 // 每条回答单独一个渲染器：代码块、表格的状态不跨条继承。
                 let mut renderer = Renderer::new(color);
@@ -988,63 +877,6 @@ mod tests {
             title_sequence('\u{280b}', "fm-openapi"),
             "\x1b]0;yi \u{280b} fm-openapi\x07"
         );
-    }
-
-    #[test]
-    fn a_replayed_question_gets_the_same_block_as_live_input() {
-        let block = input_block("问一句", true);
-        let rows: Vec<&str> = block.split("\r\n").collect();
-        // 上边距、问题行、下边距。
-        assert_eq!(rows.len(), 4, "{block:?}");
-        assert!(rows[0].starts_with(INPUT_BAND), "上边距要有底色");
-        assert!(
-            rows[1].starts_with(&format!("{INPUT_BAND}> 问一句")),
-            "{:?}",
-            rows[1]
-        );
-        assert_eq!(
-            render::display_width(rows[1]),
-            terminal_width_or(80),
-            "补齐整行"
-        );
-        assert!(rows[2].starts_with(INPUT_BAND), "下边距要有底色");
-    }
-
-    #[test]
-    fn a_replayed_multi_line_question_keeps_every_line_inside_the_block() {
-        let block = input_block("第一行\n第二行", true);
-        let rows: Vec<&str> = block.split("\r\n").collect();
-        assert_eq!(rows.len(), 5, "{block:?}");
-        assert!(rows[1].contains("> 第一行"), "{:?}", rows[1]);
-        assert!(
-            rows[2].contains("第二行") && !rows[2].contains("> "),
-            "{:?}",
-            rows[2]
-        );
-    }
-
-    #[test]
-    fn replay_falls_back_to_plain_text_without_color() {
-        assert_eq!(input_block("问一句\n第二行", false), "> 问一句\n第二行\n");
-    }
-
-    fn terminal_width_or(fallback: usize) -> usize {
-        render::terminal_width().unwrap_or(fallback)
-    }
-
-    #[test]
-    fn pasted_newlines_each_get_their_own_row() {
-        assert_eq!(input_rows("abc", 40), vec![2 + 3]);
-        assert_eq!(input_rows("abc\ndef", 40), vec![5, 3]);
-        // 粘贴里的空行也要占一行，否则底色会缺一条。
-        assert_eq!(input_rows("a\n\nb", 40), vec![3, 0, 1]);
-    }
-
-    #[test]
-    fn a_long_input_wraps_by_display_width_not_char_count() {
-        // 提示符占两格：8 个字正好填满 18 列，下一个字折到第二行。
-        assert_eq!(input_rows("一二三四五六七八", 18), vec![18]);
-        assert_eq!(input_rows("一二三四五六七八九", 18), vec![18, 2]);
     }
 
     #[test]

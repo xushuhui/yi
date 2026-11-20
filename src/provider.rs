@@ -70,6 +70,17 @@ impl Provider {
         }
     }
 
+    /// 同一个供应商、换一个会话标识：子 agent 用独立标识，避免路由与缓存串味。
+    pub fn with_session(&self, session: &str) -> Provider {
+        Provider {
+            agent: self.agent.clone(),
+            url: self.url.clone(),
+            api_key: self.api_key.clone(),
+            model: self.model.clone(),
+            session: session.to_string(),
+        }
+    }
+
     pub fn stream(
         &self,
         system: &str,

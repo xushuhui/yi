@@ -6,15 +6,19 @@
 
 | 路径 | 作用 |
 |---|---|
-| `src/main.rs` | 薄壳：参数、读输入、斜杠命令、页脚、图片路径识别 |
+| `src/main.rs` | 薄壳：参数、启动与重放、输入循环、斜杠命令、状态行与页脚、图片路径识别 |
+| `src/input.rs` | `reedline` 行编辑：历史、原地补全菜单、`Shift+Tab` 计划模式、`Ctrl-G` 挂图标记 |
 | `src/agent.rs` | 一轮对话的编排：循环、工具分发、连续失败检测、压缩触发 |
 | `src/provider.rs` | OpenAI 兼容的 HTTP/SSE 客户端；请求体、重试、用量解析、`x-opencode-session` 头 |
 | `src/session.rs` | JSONL 会话：追加、上下文重建、压缩规划、中断修复、`/new` 归档 |
-| `src/tools.rs` | 八个工具与 JSON Schema；锚点快照、bash 日志与进程组 |
-| `src/db.rs` | 按项目的数据库配置（`$YI_HOME/projects/<编码>/db.json`）与 profile 解析 |
+| `src/tools.rs` | 九个工具与 JSON Schema；锚点快照、bash 日志与进程组；子 agent 的只读工具集 |
+| `src/db.rs` | 按项目的数据库配置（`$YI_HOME/projects/<编码>/db.json`，可用 `{"use": 名字}` 引用 `$YI_HOME/db/<名字>.json`）与 profile 解析 |
 | `src/config.rs` | 供应商预置、配置文件、密钥与代理、系统提示词组装 |
 | `src/render.rs` | 行式 markdown：标题/列表/引用/表格对齐、代码块交 `bat` |
-| `src/complete.rs` | 斜杠命令与技能名补全、行内提示 |
+| `src/complete.rs` | 斜杠命令与技能名候选计算；菜单由 `input` 画，不做行内灰字 |
+| `src/clipboard.rs` | `Ctrl-G` 在提交时用 `osascript` 从剪贴板取 PNG，落到 `$YI_HOME/clipboard/` |
+| `src/jobs.rs` | 进程内后台命令登记表，最多 3 条；跑完的结果下一轮取回对话 |
+| `src/program_status.rs` | OSC 7501 状态上报（Rex 标签页转圈与完成标记），只在真终端发 |
 | `src/lsp.rs` | `gopls` / `phpantom_lsp` / `rust-analyzer` 客户端，按（语言, 项目根）缓存并回收 |
 | `src/skills.rs` | 扫描 `SKILL.md`，生成提示词条目，展开 `/skill:` |
 | `src/cancel.rs` | 本轮取消标志：SIGINT 处理器 + 终端 `0x03` 字节，两条入口同一个原子量 |
@@ -60,7 +64,7 @@ main::run
 
 - 平台：macOS / Linux（`src/tools.rs` 用了 `std::os::unix::process::CommandExt`），不支持 Windows。
 - Rust 1.89+（会话文件锁用到 `File::try_lock`）；edition 2024。
-- 外部命令：`rg`（`grep` / `glob` 必需）、`/bin/sh`；可选 `bat`、`gopls`、`phpantom_lsp`、`rust-analyzer`、`git`。
+- 外部命令：`rg`（`grep` / `glob` 必需）、`/bin/sh`；可选 `bat`、`gopls`、`phpantom_lsp`、`rust-analyzer`、`git`，macOS 上 `osascript` 用于 `Ctrl-G` 剪贴板图片（缺失时只影响挂图）。
 - 环境变量：`YI_HOME`（默认 `~/.yi`）、`OPENCODE_API_KEY` / `DEEPSEEK_API_KEY`、`YI_PROXY_<供应商>` → `YI_PROXY`（不读通用 `HTTPS_PROXY` / `ALL_PROXY`）、`NO_COLOR`。配置文件里的 `api_key` 会被忽略。
 - 数据目录：`~/.yi/sessions/<编码路径>/session.jsonl`；同一项目只允许一个实例（文件锁）。
 

@@ -2,7 +2,7 @@
 
 ## Status
 
-accepted（取代 ADR-0003 里「用 rustyline 做行编辑」这一条；历史、按键归属与 Ctrl-C/D 的决定不变）
+accepted（取代 ADR-0003 里「用 rustyline 做行编辑」这一条；历史、按键归属与 Ctrl-C/D 的决定不变。「输入底色由 Highlighter 设置」一条已被 ADR-0012 取代：输入区不再加底色）
 
 ## 背景
 
@@ -14,7 +14,7 @@ accepted（取代 ADR-0003 里「用 rustyline 做行编辑」这一条；历史
 
 - 输入行改用 `reedline`（nushell 的编辑器）：`Completer` 返回候选，`IdeMenu` 负责把菜单画在输入行下方并原地刷新，继续打字时按当前内容重算。
 - 候选仍由 `complete::candidates` 算：子序列匹配、最多 8 条、`/skill:` 带说明。菜单只负责排版。
-- 输入底色由 `Highlighter` 设置，不能只写在提示符里：reedline 在写缓冲区之前会复位一次 SGR，提示符里留下的底色会被清掉。提示符的 `> ` 仍用同一层底色，两段拼起来才是连续色块。
+- ~~输入底色由 `Highlighter` 设置…~~（已被 ADR-0012 取代：输入区不再铺底色，`Highlighter` 一并删除。）
 - 历史仍随会话：启动时把会话文件里的 `prompt` 条目灌进 `FileBackedHistory`（内存、容量 200），不落独立历史文件。
 - `Ctrl-G` 改成「插入 `[图片]` 标记，提交时再读剪贴板」，因为 reedline 没有「按键时执行外部代码、还能继续编辑同一行」的钩子：能执行外部代码的 `ExecuteHostCommand` 会结束这次 `read_line`，把缓冲区一起带走。
 - `Ctrl-C` / `Ctrl-D` 走 `Signal::CtrlC` / `CtrlD`；`Ctrl-C` 交回的缓冲区直接丢掉，与之前「放弃这一行」一致。
@@ -28,7 +28,7 @@ accepted（取代 ADR-0003 里「用 rustyline 做行编辑」这一条；历史
 
 ## 影响
 
-- 直接依赖 5 → 6（新增 `nu-ansi-term`，只为给输入行设底色；`reedline` 直接替换 `rustyline`）。依赖树明显变大，二进制从 4.26 MB 涨到 4.71 MB。
+- 直接依赖 5 → 6（新增 `nu-ansi-term`，只为给输入行设底色；`reedline` 直接替换 `rustyline`）。依赖树明显变大，二进制从 4.26 MB 涨到 4.71 MB。ADR-0012 去掉底色后依赖回到 5。
 - reedline 是 0.x：仓库 main 分支的示例与 0.53 已经不兼容（`Prompt`、`Completer`、`Highlighter` 的签名都变过），升级要跟着改并重跑真终端脚本。
 - 按键语义：Tab 打开菜单；菜单打开时回车是「选定候选」，再回车才提交。
 - 输入色块的行尾补满仍由 `main` 在提交后按行宽补齐；`read_line` 返回时光标位于下一行开头，与之前一致。

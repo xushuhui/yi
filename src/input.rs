@@ -9,13 +9,11 @@
 use std::borrow::Cow;
 
 use reedline::{
-    Completer, CompletionResult, DescriptionMode, EditCommand, Emacs, FileBackedHistory,
-    Highlighter, History, HistoryItem, IdeMenu, KeyCode, KeyModifiers, Keybindings, MenuBuilder,
-    Prompt, PromptEditMode, PromptHistorySearch, Reedline, ReedlineEvent, ReedlineMenu, Signal,
-    Span, StyledText, Suggestion, default_emacs_keybindings,
+    Completer, CompletionResult, DescriptionMode, EditCommand, Emacs, FileBackedHistory, History,
+    HistoryItem, IdeMenu, KeyCode, KeyModifiers, Keybindings, MenuBuilder, Prompt, PromptEditMode,
+    PromptHistorySearch, Reedline, ReedlineEvent, ReedlineMenu, Signal, Span, Suggestion,
+    default_emacs_keybindings,
 };
-
-use nu_ansi_term::{Color, Style};
 
 use crate::Error;
 use crate::Result;
@@ -35,18 +33,15 @@ pub enum Action {
 
 pub struct Input {
     editor: Reedline,
-    band: bool,
     /// 计划模式当前状态：Shift+Tab 切换后立刻改写提示符，不用等下一轮。
     planned: bool,
 }
 
 impl Input {
     /// `prompts` 是这条会话里人敲过的原文，用来喂上键历史。
-    /// `band` 为真时给输入行铺底色（只在真终端里有意义）。
     pub fn new(
         skills: Vec<(String, String)>,
         prompts: Vec<String>,
-        band: bool,
         planned: bool,
     ) -> Result<Input> {
         let mut history = FileBackedHistory::new(200)
@@ -74,15 +69,10 @@ impl Input {
         let editor = Reedline::create()
             .with_completer(Box::new(Skills(skills)))
             .with_history(Box::new(history))
-            .with_highlighter(Box::new(BandHighlighter { band }))
             .with_menu(ReedlineMenu::EngineCompleter(Box::new(menu)))
             .with_edit_mode(Box::new(Emacs::new(keys)));
 
-        Ok(Input {
-            editor,
-            band,
-            planned,
-        })
+        Ok(Input { editor, planned })
     }
 
     /// 命令行走过 `/plan` 之后把提示符同步过来。
@@ -97,8 +87,7 @@ impl Input {
                 .run_edit_commands(&[EditCommand::InsertString(draft.to_string())]);
         }
         loop {
-            let prompt = BandPrompt {
-                band: self.band,
+            let prompt = MarkerPrompt {
                 planned: self.planned,
             };
             match self.editor.read_line(&prompt) {
@@ -170,33 +159,12 @@ impl Completer for Skills {
     }
 }
 
-/// 输入行的高亮：真终端里给文字铺一层底色。
-///
-/// 只在提示符里设底色不够——reedline 写缓冲区之前会复位一次 SGR，底色会被
-/// 清掉；高亮器返回的字符串会原样写进去，正好接管这一段。
-struct BandHighlighter {
-    band: bool,
-}
-
-impl Highlighter for BandHighlighter {
-    fn highlight(&self, line: &str, _cursor: usize) -> StyledText {
-        let mut styled = StyledText::new();
-        if self.band && !line.is_empty() {
-            styled.push((Style::new().on(Color::Fixed(236)), line.to_string()));
-        } else {
-            styled.push((Style::default(), line.to_string()));
-        }
-        styled
-    }
-}
-
-/// 提示符：真终端里给整行铺一层底色，和实时输入的色块一致。
-struct BandPrompt {
-    band: bool,
+/// 提示符：只有模式标记，不再给输入行加底色。
+struct MarkerPrompt {
     planned: bool,
 }
 
-impl Prompt for BandPrompt {
+impl Prompt for MarkerPrompt {
     fn render_prompt_left(&self) -> Cow<'_, str> {
         Cow::Borrowed("")
     }
@@ -206,15 +174,7 @@ impl Prompt for BandPrompt {
     }
 
     fn render_prompt_indicator(&self, _: PromptEditMode) -> Cow<'_, str> {
-        let marker = if self.planned { "plan> " } else { "> " };
-        if self.band {
-            // 结尾不 reset：后面敲进来的字继承底色，整行才是连续色块。
-            Cow::Owned(format!(
-                "\x1b[48;5;236m\x1b[2m{marker}\x1b[0m\x1b[48;5;236m"
-            ))
-        } else {
-            Cow::Owned(marker.to_string())
-        }
+        Cow::Borrowed(if self.planned { "plan> " } else { "> " })
     }
 
     fn render_prompt_multiline_indicator(&self) -> Cow<'_, str> {
@@ -238,18 +198,12 @@ mod tests {
 
     #[test]
     fn the_prompt_announces_plan_mode() {
-        let planned = BandPrompt {
-            band: false,
-            planned: true,
-        };
+        let planned = MarkerPrompt { planned: true };
         assert_eq!(
             planned.render_prompt_indicator(PromptEditMode::Default),
             "plan> "
         );
-        let plain = BandPrompt {
-            band: false,
-            planned: false,
-        };
+        let plain = MarkerPrompt { planned: false };
         assert_eq!(plain.render_prompt_indicator(PromptEditMode::Default), "> ");
     }
 

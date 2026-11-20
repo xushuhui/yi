@@ -253,6 +253,21 @@ impl Tools {
                     }
                 }
             },
+            {
+                "type": "function",
+                "function": {
+                    "name": "task",
+                    "description": "派一个只读子 agent 做独立调查或评审：它有自己的上下文，看不到当前对话，只返回最终回答。多个 task 调用会在同一轮并行执行（最多 4 个）。子 agent 只有 read / grep / glob / lsp 和只读 bash，不能再派子 agent。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "task": { "type": "string", "description": "完整任务描述，子 agent 看不到当前对话，要写全" },
+                            "name": { "type": "string", "description": "可选标签，结果里用来标识是哪一个" }
+                        },
+                        "required": ["task"]
+                    }
+                }
+            },
         ])
     }
 
@@ -295,8 +310,58 @@ impl Tools {
             "grep" => format!("grep {}", pick("pattern")),
             "glob" => format!("glob {}", pick("pattern")),
             "lsp" => format!("lsp {} {}", pick("action"), pick("path")),
+            // task 优先显示标签；没给就用任务第一行，太长会撑坏状态行。
+            "task" => {
+                let label = pick("name");
+                let head = if label.is_empty() {
+                    pick("task")
+                        .lines()
+                        .next()
+                        .unwrap_or("")
+                        .chars()
+                        .take(40)
+                        .collect()
+                } else {
+                    label
+                };
+                format!("task {head}")
+            }
             other => other.to_string(),
         }
+    }
+
+    /// 子 agent 的工具：和计划模式一样只读，且工具表里没有 task（深度只有一层）。
+    pub fn subagent(
+        root: PathBuf,
+        log_dir: PathBuf,
+        gopls: String,
+        phpantom: String,
+        rust_analyzer: String,
+    ) -> Tools {
+        let mut tools = Tools::new(root, log_dir, gopls, phpantom, rust_analyzer);
+        tools.set_plan(true);
+        tools
+    }
+
+    /// 子 agent 能看到的工具定义：只读集合，没有 write / edit / db_query / task。
+    pub fn subagent_definitions() -> Value {
+        let all = Self::definitions();
+        let keep = ["read", "grep", "glob", "lsp", "bash"];
+        let picked: Vec<Value> = all
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .filter(|tool| {
+                        tool["function"]["name"]
+                            .as_str()
+                            .is_some_and(|name| keep.contains(&name))
+                    })
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        Value::Array(picked)
     }
 
     /// 执行工具。失败一律以 `ERROR: ...` 文本返回给模型，绝不中断循环。

@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use crate::Result;
 use crate::config::Config;
 use crate::provider::{Event, Provider};
-use crate::session::{Message, Session, Usage};
+use crate::session::{Message, Session, ToolCall, Usage};
 use crate::tools::{Outcome, Tools};
 
 /// 同一个调用连续失败这么多次就停：挡住真死循环，又不掐断正常的长任务。
@@ -11,6 +11,26 @@ const REPEAT_FAILURES: usize = 3;
 /// 压缩时保留的最近原文，按 UTF-8 字节数除以 3 估算。
 const KEEP_RECENT_TOKENS: u64 = 20_000;
 const COMPACTION_PROMPT: &str = include_str!("../prompts/compaction.md");
+
+/// 计划模式追加在系统提示词后面：模型从第一句就知道边界，不靠撞拒绝猜。
+/// 切到/切出计划模式会让前缀缓存失效一次，人工切换频率低，可以接受。
+/// 子 agent 的单次输出上限：它会作为工具结果进入父对话，不能无限长。
+const TASK_OUTPUT_BYTES: usize = 16 * 1024;
+const TASK_OUTPUT_LINES: usize = 400;
+/// 同一轮里最多同时跑几个子 agent。
+const MAX_PARALLEL_TASKS: usize = 4;
+/// 子 agent 最多几步。SIMPLIFICATION: 没有按「失败三次」收尾，先给一个硬上限；
+/// 真出现反复失败时再补和主循环一样的规则。
+const MAX_TASK_STEPS: usize = 30;
+
+const PLAN_PROMPT: &str = "\n\n<plan-mode>
+现在是计划模式：工作树只读。write / edit 会被拒绝，bash 只放行只读命令。
+先用工具把能查的事实查清楚；能自己查到的事不要问人。
+信息不足就一次把要确认的问题问完，给出具体选项；信息已经够就直接给计划。
+计划要能直接执行：改哪些文件、每处改什么、先做什么后做什么、怎么验证、取舍与风险。
+计划不落盘；需要新增或修改的 ADR、术语，列进计划，等用户退出计划模式后再写。
+</plan-mode>
+";
 
 pub struct Agent {
     provider: Provider,
@@ -31,8 +51,15 @@ pub struct Agent {
     db: Option<crate::db::DbConfig>,
     /// 会话里选过的 profile。
     db_selected: Option<String>,
+    /// 配置来自共享文件时，记它的名字。
+    db_shared: Option<String>,
     /// 数据库配置文件路径，`/db` 要显示它。
     db_path: std::path::PathBuf,
+    /// 子 agent 需要：自己造 Provider、造只读工具、写日志。
+    cfg: Config,
+    cwd: String,
+    session_id: String,
+    log_dir: PathBuf,
 }
 
 impl Agent {
@@ -66,12 +93,17 @@ impl Agent {
 
         let session_id = session.id().to_string();
         let plan = session.current_plan();
-        let db_path = crate::db::path(&cfg.home, cwd);
-        let db = crate::db::load(&cfg.home, cwd)?;
+        let loaded = crate::db::load(&cfg.home, cwd)?;
+        let db = loaded.as_ref().map(|found| found.config.clone());
+        let db_path = loaded
+            .as_ref()
+            .map(|found| found.path.clone())
+            .unwrap_or_else(|| crate::db::path(&cfg.home, cwd));
+        let db_shared = loaded.as_ref().and_then(|found| found.shared.clone());
         let db_profile = session.current_db();
         let mut tools = Tools::new(
             PathBuf::from(cwd),
-            log_dir,
+            log_dir.clone(),
             cfg.gopls.clone(),
             cfg.phpantom.clone(),
             cfg.rust_analyzer.clone(),
@@ -92,8 +124,22 @@ impl Agent {
             plan,
             db,
             db_selected: db_profile,
+            db_shared,
             db_path,
+            cfg: chosen.clone(),
+            cwd: cwd.to_string(),
+            session_id,
+            log_dir,
         })
+    }
+
+    /// 当前生效的系统提示词：计划模式追加一段说明。
+    fn system_prompt(&self) -> std::borrow::Cow<'_, str> {
+        if self.plan {
+            std::borrow::Cow::Owned(format!("{}{PLAN_PROMPT}", self.system))
+        } else {
+            std::borrow::Cow::Borrowed(&self.system)
+        }
     }
 
     pub fn plan(&self) -> bool {
@@ -106,6 +152,10 @@ impl Agent {
 
     pub fn db_path(&self) -> &std::path::Path {
         &self.db_path
+    }
+
+    pub fn db_shared(&self) -> Option<&str> {
+        self.db_shared.as_deref()
     }
 
     pub fn db_profile(&self) -> Option<&str> {
@@ -265,8 +315,9 @@ impl Agent {
         loop {
             let context = self.session.context();
             let started = std::time::Instant::now();
+            let system = self.system_prompt();
             let mut reply = self.provider.stream(
-                &self.system,
+                system.as_ref(),
                 context.summary,
                 &context.messages,
                 &definitions,
@@ -295,6 +346,59 @@ impl Agent {
                 return Ok(total);
             }
 
+            // 一轮里可能有多个 task：它们各自独立，可以并行；其余工具仍按原顺序执行。
+            let mut task_results: Vec<Option<String>> = vec![None; reply.tool_calls.len()];
+            let task_slots: Vec<usize> = reply
+                .tool_calls
+                .iter()
+                .enumerate()
+                .filter(|(_, call)| call.name == "task")
+                .map(|(index, _)| index)
+                .collect();
+            if !task_slots.is_empty() {
+                let cfg = self.cfg.clone();
+                let session_id = self.session_id.clone();
+                let cwd = self.cwd.clone();
+                let log_dir = self.log_dir.clone();
+                let system = self.system_prompt().into_owned();
+                let effort = self.effort.clone();
+                std::thread::scope(|scope| {
+                    for chunk in task_slots.chunks(MAX_PARALLEL_TASKS) {
+                        let mut handles = Vec::new();
+                        for &index in chunk {
+                            let cfg = cfg.clone();
+                            let session_id = session_id.clone();
+                            let cwd = cwd.clone();
+                            let log_dir = log_dir.clone();
+                            let system = system.clone();
+                            let effort = effort.clone();
+                            let call = reply.tool_calls[index].clone();
+                            handles.push((
+                                index,
+                                scope.spawn(move || {
+                                    run_subagent(
+                                        &cfg,
+                                        &session_id,
+                                        &cwd,
+                                        &log_dir,
+                                        &system,
+                                        effort.as_deref(),
+                                        &call,
+                                    )
+                                }),
+                            ));
+                        }
+                        for (index, handle) in handles {
+                            task_results[index] = Some(
+                                handle
+                                    .join()
+                                    .unwrap_or_else(|_| "ERROR: 子 agent 线程崩溃".to_string()),
+                            );
+                        }
+                    }
+                });
+            }
+
             for (index, call) in reply.tool_calls.iter().enumerate() {
                 if crate::cancel::requested() {
                     // 这一批里还没跑的调用要补上结果，否则下次请求会被供应商拒绝。
@@ -312,7 +416,16 @@ impl Agent {
                 });
                 let signature = (call.name.clone(), call.arguments.clone());
                 last_summary = self.tools.describe(call);
-                match self.tools.execute(call, on) {
+                let outcome = if call.name == "task" {
+                    Outcome::Text(
+                        task_results[index]
+                            .take()
+                            .unwrap_or_else(|| "ERROR: 子 agent 没有返回结果".to_string()),
+                    )
+                } else {
+                    self.tools.execute(call, on)
+                };
+                match outcome {
                     Outcome::Text(text) => {
                         let failed = Self::looks_failed(&text);
                         if failed && last_call.as_ref() == Some(&signature) {
@@ -373,8 +486,9 @@ impl Agent {
     ) -> Result<Usage> {
         let context = self.session.context();
         let stop = "工具调用已被强行停止，不能再调用任何工具。用几句话说明：已经改了什么、验证了什么、为什么卡住、还剩什么没做完。";
+        let system = self.system_prompt();
         let reply = self.provider.stream(
-            &format!("{stop}\n\n{}", self.system),
+            &format!("{stop}\n\n{system}"),
             context.summary,
             &context.messages,
             &serde_json::json!([]),
@@ -414,7 +528,11 @@ impl Agent {
         let instruction =
             format!("{COMPACTION_PROMPT}\n\n把上面的对话压缩成摘要，只输出摘要本身。");
 
-        match self.provider.complete(&self.system, &history, &instruction) {
+        let system = self.system_prompt();
+        match self
+            .provider
+            .complete(system.as_ref(), &history, &instruction)
+        {
             Ok(summary) => {
                 let count = plan.messages_to_summarize.len();
                 let tokens_before = plan.tokens_before;
@@ -439,6 +557,152 @@ impl Agent {
     pub fn new_session(&mut self) -> Result<PathBuf> {
         self.session.archive()
     }
+}
+
+/// 跑一个子 agent：独立上下文、只读工具，结果只有最后一段话。
+fn run_subagent(
+    cfg: &Config,
+    session_id: &str,
+    cwd: &str,
+    log_dir: &Path,
+    system: &str,
+    effort: Option<&str>,
+    call: &ToolCall,
+) -> String {
+    let Ok(args) = serde_json::from_str::<serde_json::Value>(&call.arguments) else {
+        return "ERROR: 子 agent 的参数不是合法 JSON".to_string();
+    };
+    let Some(task) = args.get("task").and_then(serde_json::Value::as_str) else {
+        return "ERROR: task 缺少 task 描述".to_string();
+    };
+    let label = args
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("task");
+    let provider = Provider::new(cfg, &format!("{session_id}-sub-{}", sanitize(&call.id)));
+    let mut tools = Tools::subagent(
+        PathBuf::from(cwd),
+        log_dir.to_path_buf(),
+        cfg.gopls.clone(),
+        cfg.phpantom.clone(),
+        cfg.rust_analyzer.clone(),
+    );
+    let definitions = Tools::subagent_definitions();
+    let mut messages = vec![Message::User {
+        content: format!("任务：{task}"),
+    }];
+    let mut log = format!(
+        "# 子 agent {label}
+任务：{task}
+"
+    );
+
+    for _ in 0..MAX_TASK_STEPS {
+        if crate::cancel::requested() {
+            return finish_subagent(log_dir, call, log, "ERROR: 已取消".to_string());
+        }
+        let refs: Vec<&Message> = messages.iter().collect();
+        let reply = match provider.stream(system, None, &refs, &definitions, effort, &mut |_| {}) {
+            Ok(reply) => reply,
+            Err(err) => {
+                return finish_subagent(log_dir, call, log, format!("ERROR: 子 agent 失败：{err}"));
+            }
+        };
+        log.push_str(&format!(
+            "
+## 助手
+{}
+",
+            reply.content
+        ));
+        if reply.tool_calls.is_empty() {
+            let text = format!(
+                "[子 agent {label}]
+{}",
+                cap_task_output(&reply.content)
+            );
+            return finish_subagent(log_dir, call, log, text);
+        }
+        messages.push(Message::Assistant {
+            content: reply.content,
+            reasoning: reply.reasoning,
+            tool_calls: reply.tool_calls.clone(),
+            usage: None,
+        });
+        for called in &reply.tool_calls {
+            let output = match tools.execute(called, &mut |_| {}) {
+                Outcome::Text(text) => text,
+                Outcome::Image { note, .. } => note,
+            };
+            log.push_str(&format!(
+                "
+### 工具 {} {}
+{}
+",
+                called.name, called.arguments, output
+            ));
+            messages.push(Message::Tool {
+                tool_call_id: called.id.clone(),
+                content: output,
+            });
+        }
+    }
+    finish_subagent(
+        log_dir,
+        call,
+        log,
+        format!("ERROR: 子 agent 超过 {MAX_TASK_STEPS} 步仍未收尾"),
+    )
+}
+
+fn finish_subagent(log_dir: &Path, call: &ToolCall, log: String, text: String) -> String {
+    let path = log_dir.join(format!("task-{}.log", sanitize(&call.id)));
+    let _ = std::fs::create_dir_all(log_dir);
+    // 日志写不进去不影响这次结果：中间过程只是排查用的。
+    let _ = std::fs::write(&path, log);
+    text
+}
+
+fn sanitize(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// 子 agent 的结果会作为工具结果进入父对话，按行数和字节数截断。
+fn cap_task_output(text: &str) -> String {
+    let mut out = String::new();
+    let mut truncated = false;
+    for (index, line) in text.lines().enumerate() {
+        if index >= TASK_OUTPUT_LINES || out.len() + line.len() + 1 > TASK_OUTPUT_BYTES {
+            truncated = true;
+            break;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    if out.is_empty() {
+        out = text.to_string();
+    }
+    if out.len() > TASK_OUTPUT_BYTES {
+        let mut cut = TASK_OUTPUT_BYTES;
+        while cut > 0 && !out.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        out.truncate(cut);
+        truncated = true;
+    }
+    if truncated {
+        out.push_str("…（子 agent 输出已截断）");
+    }
+    out.trim_end().to_string()
 }
 
 /// 取第一行，给界面用。

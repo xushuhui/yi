@@ -93,3 +93,26 @@ fn plan_mode_is_restored_when_the_same_session_reopens() {
     let reopened = open_agent(server.port, &home, &ws);
     assert!(reopened.plan(), "重开同一条会话仍然记得计划模式是开的");
 }
+
+#[test]
+fn plan_mode_is_announced_in_the_system_prompt() {
+    let home = temp_home("plan-prompt-home");
+    let ws = temp_home("plan-prompt-ws");
+    let server = start_server(vec![plain_response(&["好"]), plain_response(&["好"])]);
+    let mut agent = open_agent(server.port, &home, &ws);
+
+    collect(&mut agent, "先问一句");
+    agent.set_plan(true).expect("开计划模式");
+    collect(&mut agent, "再问一句");
+
+    let bodies = server.bodies.lock();
+    let before = bodies[0]["messages"][0]["content"].as_str().unwrap_or("");
+    let after = bodies[1]["messages"][0]["content"].as_str().unwrap_or("");
+    assert!(!before.contains("<plan-mode>"), "平时不该带计划模式说明");
+    assert!(after.contains("<plan-mode>"), "进入计划模式要告诉模型");
+    assert!(after.contains("工作树只读"), "{after}");
+    assert!(
+        after.contains("没有 Skill"),
+        "技能里提到 Skill 工具时要有替代做法"
+    );
+}

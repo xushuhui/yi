@@ -1044,7 +1044,6 @@ name = "yi"
 version = "0.1.0"
 dependencies = [
  "libc",
- "nu-ansi-term",
  "parking_lot",
  "reedline",
  "serde",
