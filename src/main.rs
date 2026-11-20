@@ -1,16 +1,19 @@
+// 生产代码不 panic：和库里同一条规则，放在 CLI 这层也拦一道。
+#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
+
 use std::io::{self, IsTerminal, Write};
 
 use std::path::Path;
-use std::sync::{Arc, Mutex};
 
 use yi::agent::Agent;
-use yi::clipboard::{self, EMPTY_TOKEN, IMAGE_TOKEN};
-use yi::complete::Helper;
+use yi::clipboard;
 use yi::config::{self, Config};
+use yi::input::Action;
 use yi::program_status;
 use yi::provider::Event;
 use yi::render::{self, Renderer};
-use yi::session::{HISTORY_LIMIT, Usage};
+use yi::session::Usage;
 use yi::{Error, Result};
 
 fn main() {
@@ -54,13 +57,23 @@ fn run() -> Result<()> {
         .map(|name| name.to_string_lossy().to_string())
         .unwrap_or_else(|| cwd.clone());
     let mut title = Title::new(io::stdout().is_terminal(), project);
-    // 剪贴板图片落在数据目录里，不落 /tmp：会话只记路径，重启后还要能读到。
-    let clip: ClipSlot = Arc::new(Mutex::new(None));
-    let mut editor = make_editor(&agent, skills, clip.clone(), &cfg.home.join("clipboard"))?;
     // 只在真终端里上色；管道输出、NO_COLOR 时保持原样。
     let color = io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
-    // 输入块只给真人看：标准输入是管道时（没有编辑器）一个字节都不加。
-    let band = color && editor.is_some();
+    // 输入块只给真人看：标准输入是管道时一个字节都不加。
+    let interactive = io::stdin().is_terminal();
+    let band = color && interactive;
+    // 剪贴板图片落在数据目录里，不落 /tmp：会话只记路径，重启后还要能读到。
+    let clip_dir = cfg.home.join("clipboard");
+    let mut input = if interactive {
+        Some(yi::input::Input::new(
+            skills,
+            agent.prompt_history(),
+            band,
+            agent.plan(),
+        )?)
+    } else {
+        None
+    };
     let mut renderer = Renderer::new(color);
     // 处理中的状态行：只在真终端里动，管道输出一个字节都不写。
     let mut status = Status::new(io::stdout().is_terminal(), color);
@@ -82,8 +95,36 @@ fn run() -> Result<()> {
     loop {
         print_input_band_top(band);
         let prefill = std::mem::take(&mut draft);
-        let Some(line) = read_input(&mut editor, input_prompt(band), &prefill)? else {
-            break;
+        let line = match &mut input {
+            Some(input) => {
+                // 提示符要反映最新的模式：`/plan` 改过之后也得跟上。
+                input.set_planned(agent.plan());
+                let mut toggle_plan = || {
+                    let planned = !agent.plan();
+                    if let Err(err) = agent.set_plan(planned) {
+                        println!("{err}");
+                    }
+                    agent.plan()
+                };
+                match input.read(&prefill, &mut toggle_plan)? {
+                    Action::Line(line) => line,
+                    Action::Interrupted => {
+                        close_input_band("", band);
+                        continue;
+                    }
+                    Action::Eof => break,
+                }
+            }
+            None => {
+                // 管道与重定向：逐行读，不加任何界面字节。
+                print!("> ");
+                io::stdout().flush()?;
+                let mut line = String::new();
+                if io::stdin().read_line(&mut line)? == 0 {
+                    break;
+                }
+                line
+            }
         };
         close_input_band(&line, band);
         // Ctrl-G 在行里留了标记；这里换回文字，并把图片取出来。
@@ -113,11 +154,11 @@ fn run() -> Result<()> {
         // 用户可以直接把图片路径贴进来（拖拽到终端也是路径文本），或用 @路径 提及。
         let mut images = image_paths(&message, Path::new(&cwd));
         if has_image {
-            match clip.lock().unwrap_or_else(|err| err.into_inner()).take() {
+            match clipboard::image_path(&clip_dir) {
                 Some(path) => images.insert(0, path),
                 None => println!(
                     "{}",
-                    render::dim_line("剪贴板图片已经不在了，这一轮只发文字", color)
+                    render::dim_line("剪贴板里没有图片，这一轮只发文字", color)
                 ),
             }
         }
@@ -131,6 +172,8 @@ fn run() -> Result<()> {
                 render::dim_line(&format!("图片：{}", path.display()), color)
             );
         }
+        // 干活期间藏光标：状态行原地刷新，光标停在行尾会被当成「又在等你输入」。
+        hide_cursor();
         status.set("等待模型");
         title.start_working();
         let result = agent.submit_with_images(&message, &images, &mut |event| match event {
@@ -190,6 +233,7 @@ fn run() -> Result<()> {
         });
 
         status.clear();
+        show_cursor();
         draft = yi::cancel::take_draft();
         match &result {
             Ok(usage) => {
@@ -220,6 +264,7 @@ fn run() -> Result<()> {
                         agent.window(),
                         &short_project(&cwd),
                         branch.as_deref(),
+                        agent.plan(),
                         agent.provider_display(),
                         agent.model_display(),
                     )
@@ -276,91 +321,25 @@ fn image_paths(prompt: &str, cwd: &Path) -> Vec<std::path::PathBuf> {
         .collect()
 }
 
-/// 真终端才接管按键；管道输入保持逐行读取，脚本和冒烟测试都靠它。
-type Editor = rustyline::Editor<Helper, rustyline::history::DefaultHistory>;
-
-/// Ctrl-G 挂住的剪贴板图片：按键时写入，提交时取走。
-type ClipSlot = Arc<Mutex<Option<std::path::PathBuf>>>;
-
-/// Ctrl-G：向系统要剪贴板里的图片，往输入行插一个标记。
-///
-/// `Cmd+V` 由终端自己处理，程序看不到；图片剪贴板又没有通用协议。所以由 yi
-/// 自己接这个键，标记留给提交时替换成图片附件。
-struct PasteImage {
-    slot: ClipSlot,
-    dir: std::path::PathBuf,
-}
-
-impl rustyline::ConditionalEventHandler for PasteImage {
-    fn handle(
-        &self,
-        _event: &rustyline::Event,
-        _count: rustyline::RepeatCount,
-        _positive: bool,
-        _context: &rustyline::EventContext<'_>,
-    ) -> Option<rustyline::Cmd> {
-        let token = match clipboard::image_path(&self.dir) {
-            Some(path) => {
-                *self.slot.lock().unwrap_or_else(|err| err.into_inner()) = Some(path);
-                IMAGE_TOKEN
-            }
-            None => EMPTY_TOKEN,
-        };
-        Some(rustyline::Cmd::Insert(1, token.to_string()))
+/// 干活期间藏光标：状态行原地刷新，光标停在行尾会被误认成新的输入行。
+fn hide_cursor() {
+    if io::stdout().is_terminal() {
+        print!("\x1b[?25l");
+        let _ = io::stdout().flush();
     }
 }
 
-fn make_editor(
-    agent: &Agent,
-    skills: Vec<(String, String)>,
-    clip: ClipSlot,
-    clip_dir: &Path,
-) -> Result<Option<Editor>> {
-    if !io::stdin().is_terminal() {
-        return Ok(None);
+/// 把光标交回去。行编辑器会自己再管一次，这里负责两轮之间那段空档。
+fn show_cursor() {
+    if io::stdout().is_terminal() {
+        print!("\x1b[?25h");
+        let _ = io::stdout().flush();
     }
-    let builder = rustyline::Config::builder()
-        .max_history_size(HISTORY_LIMIT)
-        .and_then(|builder| builder.history_ignore_dups(true))
-        .map_err(|err| Error::Config(format!("配置输入行失败：{err}")))?;
-    // 候选按列表展示，不是在输入行里循环替换；候选多于一条时第一次 Tab
-    // 就列出来——rustyline 默认要按两次，第一次只响铃，终端里等于没反应。
-    let config = builder
-        .completion_type(rustyline::config::CompletionType::List)
-        .completion_show_all_if_ambiguous(true)
-        .auto_add_history(true)
-        .build();
-    let mut editor = Editor::with_config(config)
-        .map_err(|err| Error::Config(format!("初始化输入行失败：{err}")))?;
-    editor.set_helper(Some(Helper::new(skills)));
-    // Ctrl-G：挂剪贴板图片。终端不会把 Cmd-V 交给程序，这个键是 yi 自己能收到的。
-    editor.bind_sequence(
-        rustyline::KeyEvent(rustyline::KeyCode::Char('G'), rustyline::Modifiers::CTRL),
-        rustyline::EventHandler::Conditional(Box::new(PasteImage {
-            slot: clip,
-            dir: clip_dir.to_path_buf(),
-        })),
-    );
-    for line in agent.prompt_history() {
-        // 历史只用来召回：某一条加不进去不影响输入。
-        let _ = editor.add_history_entry(line);
-    }
-    Ok(Some(editor))
 }
 
 /// 输入区的底色：比常见深色背景浅一档的灰。整行铺满，用来把「我说的话」
 /// 和回答分开；颜色关掉时这些函数什么都不做，管道输出保持逐字节原样。
 const INPUT_BAND: &str = "\x1b[48;5;236m";
-
-/// 提示符本身也要带上底色，且结尾不 reset——后面敲进来的字继承这块底色，
-/// 整行才是连续色块，而不是只有两头有颜色。
-fn input_prompt(color: bool) -> &'static str {
-    if color {
-        "\x1b[48;5;236m\x1b[2m> \x1b[0m\x1b[48;5;236m"
-    } else {
-        "> "
-    }
-}
 
 /// 输入块的上边距：整行底色。写满是靠空格，不依赖终端的「擦除用底色」。
 fn print_input_band_top(color: bool) {
@@ -465,38 +444,6 @@ fn input_rows(text: &str, width: usize) -> Vec<usize> {
     rows
 }
 
-/// 读一行输入；返回 `None` 表示该退出了（Ctrl-D 或标准输入结束）。
-fn read_input(editor: &mut Option<Editor>, prompt: &str, prefill: &str) -> Result<Option<String>> {
-    let Some(editor) = editor else {
-        print!("{prompt}");
-        io::stdout().flush()?;
-        let mut line = String::new();
-        if io::stdin().read_line(&mut line)? == 0 {
-            return Ok(None);
-        }
-        return Ok(Some(line));
-    };
-    // 有草稿就预填到输入行，光标停在末尾：你看一眼、改一改，回车才发。
-    let result = if prefill.is_empty() {
-        editor.readline(prompt)
-    } else {
-        editor.readline_with_initial(prompt, (prefill, ""))
-    };
-    match result {
-        Ok(line) => Ok(Some(line)),
-        // Ctrl-C 只放弃这一行；rustyline 不给出缓冲区内容，所以无法区分空行。
-        Err(rustyline::error::ReadlineError::Interrupted) => {
-            println!();
-            Ok(Some(String::new()))
-        }
-        Err(rustyline::error::ReadlineError::Eof) => {
-            println!();
-            Ok(None)
-        }
-        Err(err) => Err(Error::Config(format!("读输入失败：{err}"))),
-    }
-}
-
 fn handle_command(line: &str, agent: &mut Agent, cfg: &Config) {
     let mut parts = line.splitn(2, char::is_whitespace);
     let command = parts.next().unwrap_or("");
@@ -508,6 +455,26 @@ fn handle_command(line: &str, agent: &mut Agent, cfg: &Config) {
             Ok(archived) => println!("已归档到 {}，开始新会话。\n", archived.display()),
             Err(err) => println!("{err}\n"),
         },
+        "/plan" => {
+            let planned = !agent.plan();
+            match agent.set_plan(planned) {
+                Ok(()) if planned => println!(
+                    "计划模式 开：工作树只读，bash 只放行只读命令。\n把计划想清楚再敲 /plan 退出。\n"
+                ),
+                Ok(()) => println!("计划模式 关：可以改文件了。\n"),
+                Err(err) => println!("{err}\n"),
+            }
+        }
+        "/db" => {
+            if argument.is_empty() {
+                print_db(agent);
+            } else {
+                match agent.set_db_profile(argument) {
+                    Ok(()) => println!("数据库 profile → {argument}\n"),
+                    Err(err) => println!("{err}\n"),
+                }
+            }
+        }
         "/effort" => match config::parse_effort(argument) {
             Ok(level) => {
                 if let Err(err) = agent.set_effort(level.clone()) {
@@ -549,6 +516,42 @@ fn handle_command(line: &str, agent: &mut Agent, cfg: &Config) {
     }
 }
 
+/// `/db` 不带参数：把配置路径、当前 profile 和可选项一次说清。
+fn print_db(agent: &Agent) {
+    println!("数据库配置：{}", agent.db_path().display());
+    let Some(config) = agent.db() else {
+        println!(
+            "（还没有）写一份，密码放环境变量 MYSQL_PWD：\n{{\n  \"default\": \"dev\",\n  \"profiles\": {{\n    \"dev\": {{ \"host\": \"127.0.0.1\", \"user\": \"root\", \"database\": \"demo\" }}\n  }}\n}}\n"
+        );
+        return;
+    };
+    let chosen = agent.db_profile();
+    match yi::db::resolve(config, chosen) {
+        Ok((name, profile)) => {
+            let password = profile.password_env.as_deref().unwrap_or("MYSQL_PWD");
+            let mark = if chosen.is_none() { "（默认）" } else { "" };
+            println!(
+                "当前：{name}{mark} → {}:{}/{}，用户 {}，密码取 {password}",
+                profile.host, profile.port, profile.database, profile.user
+            );
+        }
+        Err(err) => println!("{err}"),
+    }
+    let names: Vec<String> = config
+        .profiles
+        .keys()
+        .map(|name| {
+            if name == &config.default {
+                format!("{name}（默认）")
+            } else {
+                name.clone()
+            }
+        })
+        .collect();
+    println!("可选：{}", names.join("、"));
+    println!("切换：/db <名字>\n");
+}
+
 fn print_help() {
     println!(
         "\
@@ -559,6 +562,8 @@ fn print_help() {
 
 斜杠命令：
   /new                      归档当前会话，开始新的一条
+  /plan                     切换计划模式：只读调查，不改文件
+  /db [profile]             查看或切换数据库环境（dev / test / prod）
   /effort <档位>            设置推理强度：auto / low / high / max
   /switch <供应商>          切换供应商与模型：opencode-go / deepseek（记在会话里）
   /skill:<名字> [要求]      把某个技能的正文注入这一轮
@@ -649,6 +654,7 @@ fn footer(
     window: u64,
     place: &str,
     branch: Option<&str>,
+    plan: bool,
     provider: &str,
     model: &str,
 ) -> String {
@@ -660,6 +666,10 @@ fn footer(
     if let Some(branch) = branch {
         out.push(' ');
         out.push_str(branch);
+    }
+    // 计划模式是个持续状态，页脚常驻提示，免得忘了自己还在只读里。
+    if plan {
+        out.push_str(" · plan");
     }
     // 缓存命中率按本轮累计的输入算：命中多少、未命中多少，一眼看得出前缀有没有被保住。
     let input = usage.cache_hit + usage.input_uncached;
@@ -1096,6 +1106,7 @@ mod tests {
             1_048_576,
             "~/gp/yi",
             Some("main"),
+            false,
             "OpenCode Go",
             "DeepSeek V4.1 Flash",
         );
@@ -1112,6 +1123,7 @@ mod tests {
             1_048_576,
             "~/gp/yi",
             None,
+            false,
             "DeepSeek",
             "DeepSeek Flash",
         );
@@ -1125,6 +1137,7 @@ mod tests {
             1_048_576,
             "~/gp/yi",
             None,
+            false,
             "DeepSeek",
             "DeepSeek Flash",
         );

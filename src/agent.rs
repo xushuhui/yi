@@ -25,6 +25,14 @@ pub struct Agent {
     provider_id: String,
     provider_display: String,
     model_display: String,
+    /// 计划模式：只能读，改文件与写命令会被工具层拒绝。
+    plan: bool,
+    /// 本项目的数据库配置；`None` 表示还没配。
+    db: Option<crate::db::DbConfig>,
+    /// 会话里选过的 profile。
+    db_selected: Option<String>,
+    /// 数据库配置文件路径，`/db` 要显示它。
+    db_path: std::path::PathBuf,
 }
 
 impl Agent {
@@ -57,16 +65,23 @@ impl Agent {
         let cfg = &chosen;
 
         let session_id = session.id().to_string();
+        let plan = session.current_plan();
+        let db_path = crate::db::path(&cfg.home, cwd);
+        let db = crate::db::load(&cfg.home, cwd)?;
+        let db_profile = session.current_db();
+        let mut tools = Tools::new(
+            PathBuf::from(cwd),
+            log_dir,
+            cfg.gopls.clone(),
+            cfg.phpantom.clone(),
+            cfg.rust_analyzer.clone(),
+        );
+        tools.set_plan(plan);
+        tools.set_db(db.clone(), db_profile.clone(), db_path.clone());
         Ok(Agent {
             provider: Provider::new(cfg, &session_id),
             session,
-            tools: Tools::new(
-                PathBuf::from(cwd),
-                log_dir,
-                cfg.gopls.clone(),
-                cfg.phpantom.clone(),
-                cfg.rust_analyzer.clone(),
-            ),
+            tools,
             system: cfg.system_prompt(cwd),
             effort,
             compact_at: cfg.compact_at_tokens(),
@@ -74,7 +89,55 @@ impl Agent {
             provider_id: cfg.provider.to_string(),
             provider_display: cfg.display.to_string(),
             model_display: cfg.model_display.clone(),
+            plan,
+            db,
+            db_selected: db_profile,
+            db_path,
         })
+    }
+
+    pub fn plan(&self) -> bool {
+        self.plan
+    }
+
+    pub fn db(&self) -> Option<&crate::db::DbConfig> {
+        self.db.as_ref()
+    }
+
+    pub fn db_path(&self) -> &std::path::Path {
+        &self.db_path
+    }
+
+    pub fn db_profile(&self) -> Option<&str> {
+        self.db_selected.as_deref()
+    }
+
+    /// 切数据库环境：只认配置里存在的 profile；先落会话再改工具层。
+    pub fn set_db_profile(&mut self, name: &str) -> Result<()> {
+        let Some(config) = self.db.as_ref() else {
+            return Err(crate::Error::Config(format!(
+                "本项目还没配数据库：写一份 {}",
+                self.db_path.display()
+            )));
+        };
+        crate::db::resolve(config, Some(name))?;
+        self.session.append_db(name)?;
+        self.db_selected = Some(name.to_string());
+        self.tools.set_db(
+            self.db.clone(),
+            self.db_selected.clone(),
+            self.db_path.clone(),
+        );
+        Ok(())
+    }
+
+    /// 切计划模式：先落会话，再改工具层——顺序反了的话，写盘失败会留下
+    /// 「界面说只读、工具却没锁」的状态。
+    pub fn set_plan(&mut self, planned: bool) -> Result<()> {
+        self.session.append_plan(planned)?;
+        self.plan = planned;
+        self.tools.set_plan(planned);
+        Ok(())
     }
 
     pub fn provider_id(&self) -> &str {

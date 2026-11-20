@@ -94,6 +94,18 @@ pub enum Entry {
         timestamp: u64,
         effort: String,
     },
+    /// 计划模式开关：只追加，不进入模型上下文，重开时照最后一条恢复。
+    PlanChange {
+        seq: u64,
+        timestamp: u64,
+        planned: bool,
+    },
+    /// 数据库 profile 的选择：只追加，不进入模型上下文，重开时照最后一条恢复。
+    DbChange {
+        seq: u64,
+        timestamp: u64,
+        profile: String,
+    },
     /// 中途换了供应商：从这条之后发出的请求用它，重开时也照它恢复。
     ModelChange {
         seq: u64,
@@ -130,6 +142,8 @@ impl Entry {
             Entry::Message { seq, .. }
             | Entry::EffortChange { seq, .. }
             | Entry::ModelChange { seq, .. }
+            | Entry::PlanChange { seq, .. }
+            | Entry::DbChange { seq, .. }
             | Entry::Compaction { seq, .. }
             | Entry::Prompt { seq, .. }
             | Entry::Notice { seq, .. } => *seq,
@@ -239,6 +253,26 @@ impl Session {
         effort
     }
 
+    /// 计划模式是否打开；从没记过就是关。
+    pub fn current_plan(&self) -> bool {
+        self.entries
+            .iter()
+            .rev()
+            .find_map(|entry| match entry {
+                Entry::PlanChange { planned, .. } => Some(*planned),
+                _ => None,
+            })
+            .unwrap_or(false)
+    }
+
+    /// 这个会话选过的数据库 profile；从没选过就是 `None`，用配置里的 default。
+    pub fn current_db(&self) -> Option<String> {
+        self.entries.iter().rev().find_map(|entry| match entry {
+            Entry::DbChange { profile, .. } => Some(profile.clone()),
+            _ => None,
+        })
+    }
+
     /// 最近一次切换后的供应商与模型；从没切过就是 `None`，用配置文件。
     pub fn current_model(&self) -> Option<(String, String)> {
         self.entries.iter().rev().find_map(|entry| match entry {
@@ -300,6 +334,8 @@ impl Session {
                 },
                 Entry::EffortChange { .. }
                 | Entry::ModelChange { .. }
+                | Entry::PlanChange { .. }
+                | Entry::DbChange { .. }
                 | Entry::Compaction { .. }
                 | Entry::Notice { .. } => {}
             }
@@ -538,6 +574,22 @@ impl Session {
             seq: self.next_seq,
             timestamp: now_ms(),
             effort: effort.to_string(),
+        })
+    }
+
+    pub fn append_plan(&mut self, planned: bool) -> Result<()> {
+        self.append(Entry::PlanChange {
+            seq: self.next_seq,
+            timestamp: now_ms(),
+            planned,
+        })
+    }
+
+    pub fn append_db(&mut self, profile: &str) -> Result<()> {
+        self.append(Entry::DbChange {
+            seq: self.next_seq,
+            timestamp: now_ms(),
+            profile: profile.to_string(),
         })
     }
 
@@ -800,6 +852,41 @@ mod tests {
             .append_model("deepseek", "deepseek-flash")
             .expect("记切换");
         assert_eq!(session.context().messages.len(), 1, "切换条目不该发给模型");
+    }
+
+    #[test]
+    fn plan_mode_survives_reopening_and_stays_out_of_the_context() {
+        let mut session = temp_session("plan-mode");
+        session.append_user("你好").expect("记一句");
+        session.append_plan(true).expect("开计划");
+        assert!(session.current_plan());
+        session.append_plan(false).expect("关计划");
+        assert!(!session.current_plan(), "以最后一次为准");
+        assert_eq!(session.context().messages.len(), 1, "开关不该发给模型");
+
+        session.append_plan(true).expect("再开");
+        let path = session.path().to_path_buf();
+        drop(session);
+        let copy = path.with_file_name("reopened.jsonl");
+        std::fs::copy(&path, &copy).expect("复制会话文件");
+        let reopened = Session::open(&copy, "/tmp/proj", "别的模型", "auto").expect("重开");
+        assert!(reopened.current_plan(), "重开仍然记得计划模式是开的");
+    }
+
+    #[test]
+    fn the_chosen_database_profile_survives_reopening_and_stays_out_of_the_context() {
+        let mut session = temp_session("db-profile");
+        session.append_user("你好").expect("记一句");
+        session.append_db("test").expect("选环境");
+        assert_eq!(session.current_db().as_deref(), Some("test"));
+        assert_eq!(session.context().messages.len(), 1, "选环境不该发给模型");
+
+        let path = session.path().to_path_buf();
+        drop(session);
+        let copy = path.with_file_name("reopened.jsonl");
+        std::fs::copy(&path, &copy).expect("复制会话文件");
+        let reopened = Session::open(&copy, "/tmp/proj", "别的模型", "auto").expect("重开");
+        assert_eq!(reopened.current_db().as_deref(), Some("test"));
     }
 
     #[test]

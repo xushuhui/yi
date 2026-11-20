@@ -100,13 +100,16 @@ mod tests {
     #[test]
     fn finished_jobs_are_handed_over_once() {
         let id = register("echo hi", 1).expect("登记成功");
-        assert!(take_finished().is_empty(), "还在跑，不该取走");
+        // 作业表是进程级全局状态，并行跑时别的用例也会交作业；只认自己这条。
+        let early = take_finished();
+        assert!(!early.iter().any(|job| job.id == id), "还在跑，不该被取走");
         finish(&id, "hi".to_string(), 0.5);
         let finished = take_finished();
-        assert_eq!(finished.len(), 1);
-        assert_eq!(finished[0].id, id);
-        assert_eq!(finished[0].output, "hi");
-        assert!(take_finished().is_empty(), "取过一次就不该再来");
+        let mine: Vec<_> = finished.iter().filter(|job| job.id == id).collect();
+        assert_eq!(mine.len(), 1, "自己这条要交上来一次");
+        assert_eq!(mine[0].output, "hi");
+        let again = take_finished();
+        assert!(!again.iter().any(|job| job.id == id), "取过一次就不该再来");
     }
 
     #[test]

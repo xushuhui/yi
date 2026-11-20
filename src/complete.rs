@@ -1,20 +1,21 @@
-//! 斜杠命令与技能的补全、行内提示。
+//! 斜杠命令与技能的补全。
 //!
 //! 匹配是「子序列」：按顺序出现即可，`/nw` 命中 `/new`，`dvrs` 命中
 //! `adversarial-review`。只补第一段（命令或命令后面的技能名），不猜自然语言。
+//!
+//! 这里只算候选，不管怎么画：菜单由 `input` 模块交给 reedline 渲染。
 
-use rustyline::completion::{Completer, Pair};
-use rustyline::highlight::Highlighter;
-use rustyline::hint::Hinter;
-use rustyline::validate::Validator;
-use rustyline::{Context, Helper as RustylineHelper};
-
-/// 一次最多列这么多条候选，其余收成一行「还有 N 个」。
+/// 一次最多给这么多条候选，其余收成一条「还有 N 个」的提示。
 pub const MAX_CANDIDATES: usize = 8;
+
+/// 说明最多占多少格：太长会让菜单变成一大块，用户还得自己扫。
+const DESCRIPTION_CELLS: usize = 90;
 
 const COMMANDS: &[(&str, &str)] = &[
     ("/help", "显示命令、环境变量和配置字段"),
     ("/new", "归档当前会话，开始新的一条"),
+    ("/plan", "切换计划模式：只读调查，不改文件"),
+    ("/db", "查看或切换数据库环境：/db <profile>"),
     ("/effort", "设置推理强度：auto / low / high / max"),
     ("/switch", "切换供应商与模型：opencode-go / deepseek"),
     ("/skill:", "调用一个技能：/skill:<名字> [要求]"),
@@ -22,43 +23,28 @@ const COMMANDS: &[(&str, &str)] = &[
 
 const EFFORTS: &[&str] = &["auto", "low", "high", "max"];
 
-pub struct Helper {
-    skills: Vec<(String, String)>,
+/// 一条候选：写回输入行的文本，加上菜单右侧的说明。
+#[derive(Clone, Debug, PartialEq)]
+pub struct Candidate {
+    pub value: String,
+    pub description: Option<String>,
 }
 
-impl Helper {
-    pub fn new(skills: Vec<(String, String)>) -> Helper {
-        Helper { skills }
+impl Candidate {
+    fn new(value: impl Into<String>, description: Option<String>) -> Candidate {
+        Candidate {
+            value: value.into(),
+            description,
+        }
     }
 }
-
-impl Completer for Helper {
-    type Candidate = Pair;
-
-    fn complete(
-        &self,
-        line: &str,
-        pos: usize,
-        _ctx: &Context<'_>,
-    ) -> rustyline::Result<(usize, Vec<Pair>)> {
-        Ok(complete(line, pos, &self.skills).unwrap_or((pos, Vec::new())))
-    }
-}
-
-impl Hinter for Helper {
-    type Hint = String;
-
-    fn hint(&self, line: &str, pos: usize, _ctx: &Context<'_>) -> Option<String> {
-        hint(line, pos, &self.skills)
-    }
-}
-
-impl Highlighter for Helper {}
-impl Validator for Helper {}
-impl RustylineHelper for Helper {}
 
 /// 当前光标处的补全：返回替换起点和候选。
-pub fn complete(line: &str, pos: usize, skills: &[(String, String)]) -> Option<(usize, Vec<Pair>)> {
+pub fn candidates(
+    line: &str,
+    pos: usize,
+    skills: &[(String, String)],
+) -> Option<(usize, Vec<Candidate>)> {
     if !line.starts_with('/') || pos > line.len() {
         return None;
     }
@@ -71,13 +57,13 @@ pub fn complete(line: &str, pos: usize, skills: &[(String, String)]) -> Option<(
             return None;
         }
         let start = pos - partial.len();
-        let mut pairs: Vec<(i32, Pair)> = EFFORTS
+        let mut found: Vec<(i32, Candidate)> = EFFORTS
             .iter()
             .filter_map(|effort| {
-                fuzzy(partial, effort).map(|score| (score, pair(*effort, *effort)))
+                fuzzy(partial, effort).map(|score| (score, Candidate::new(*effort, None)))
             })
             .collect();
-        return Some((start, finish(&mut pairs, partial)));
+        return Some((start, finish(&mut found, partial)));
     }
 
     // `/switch ` 之后补供应商 id。
@@ -87,12 +73,18 @@ pub fn complete(line: &str, pos: usize, skills: &[(String, String)]) -> Option<(
             return None;
         }
         let start = pos - partial.len();
-        let mut pairs: Vec<(i32, Pair)> = crate::config::PRESETS
+        let mut found: Vec<(i32, Candidate)> = crate::config::PRESETS
             .iter()
-            .map(|preset| preset.id)
-            .filter_map(|id| fuzzy(partial, id).map(|score| (score, pair(id, id))))
+            .filter_map(|preset| {
+                fuzzy(partial, preset.id).map(|score| {
+                    (
+                        score,
+                        Candidate::new(preset.id, Some(preset.model_display.to_string())),
+                    )
+                })
+            })
             .collect();
-        return Some((start, finish(&mut pairs, partial)));
+        return Some((start, finish(&mut found, partial)));
     }
 
     // 第一个词还没打完：补命令本身。
@@ -102,20 +94,24 @@ pub fn complete(line: &str, pos: usize, skills: &[(String, String)]) -> Option<(
         let partial = rest.trim_start();
         if !partial.contains(' ') {
             let start = pos - partial.len();
-            let mut pairs: Vec<(i32, Pair)> = skills
+            let mut found: Vec<(i32, Candidate)> = skills
                 .iter()
-                .filter_map(|(name, _description)| {
-                    // 技能描述是整句话，列进候选会折行淹没屏幕；名字足够选。
-                    fuzzy(partial, name).map(|score| (score, pair(name.clone(), name.clone())))
+                .filter_map(|(name, description)| {
+                    fuzzy(partial, name).map(|score| {
+                        (
+                            score,
+                            Candidate::new(name.clone(), Some(shorten(description))),
+                        )
+                    })
                 })
                 .collect();
-            return Some((start, finish(&mut pairs, partial)));
+            return Some((start, finish(&mut found, partial)));
         }
     }
     if !first.contains(' ') {
         // 还没输入命令名时，全部候选同分，按名字长短排；一旦输入了，才用模糊分。
         let typed = first;
-        let mut pairs: Vec<(i32, Pair)> = COMMANDS
+        let mut found: Vec<(i32, Candidate)> = COMMANDS
             .iter()
             .filter_map(|(command, description)| {
                 let replacement = command.trim_start_matches('/').to_string();
@@ -126,68 +122,54 @@ pub fn complete(line: &str, pos: usize, skills: &[(String, String)]) -> Option<(
                 };
                 Some((
                     score,
-                    pair(format!("{command} — {description}"), replacement),
+                    Candidate::new(replacement, Some((*description).to_string())),
                 ))
             })
             .collect();
         let start = pos - typed.len();
-        return Some((start, finish(&mut pairs, typed)));
+        return Some((start, finish(&mut found, typed)));
     }
 
     None
 }
 
-fn pair(display: impl Into<String>, replacement: impl Into<String>) -> Pair {
-    Pair {
-        display: display.into(),
-        replacement: replacement.into(),
-    }
-}
-
-/// 排序、截断，并在超出上限时追加一行不可选中的提示。
-/// 没有候选以已输入内容开头时只返回最佳一条：rustyline 的列表模式对
-/// 「无法延长公共前缀」的输入会先响铃，模糊匹配就会显得没反应。
-fn finish(scored: &mut [(i32, Pair)], typed: &str) -> Vec<Pair> {
+/// 排序、截断，并在超出上限时追加一条不可选中的提示。
+/// 没有候选以已输入内容开头时只返回最佳一条，避免菜单对「怎么补都不会变长」
+/// 的输入反复弹同一批东西。
+fn finish(scored: &mut [(i32, Candidate)], typed: &str) -> Vec<Candidate> {
     scored.sort_by(|a, b| {
-        b.0.cmp(&a.0)
-            .then_with(|| a.1.replacement.len().cmp(&b.1.replacement.len()))
+        // 还没输入时按名字排；输入之后按匹配度，同分再按长短。
+        if typed.is_empty() {
+            a.1.value.cmp(&b.1.value)
+        } else {
+            b.0.cmp(&a.0)
+                .then_with(|| a.1.value.len().cmp(&b.1.value.len()))
+        }
     });
-    let total = scored.len();
-    let mut pairs: Vec<Pair> = scored.iter().map(|(_, pair)| pair.clone()).collect();
-    let extendable = pairs.iter().any(|pair| pair.replacement.starts_with(typed));
-    if !extendable && pairs.len() > 1 {
-        pairs.truncate(1);
-        return pairs;
+    let mut items: Vec<Candidate> = scored.iter().map(|(_, item)| item.clone()).collect();
+    let extendable = items.iter().any(|item| item.value.starts_with(typed));
+    if !extendable && items.len() > 1 {
+        items.truncate(1);
+        return items;
     }
-    if total > MAX_CANDIDATES {
-        pairs.truncate(MAX_CANDIDATES - 1);
-        // 选中这一行不改变输入：replacement 原样返回已经打出的部分。
-        pairs.push(pair(
-            format!(
-                "… 还有 {} 个，继续输入缩小范围",
-                total - (MAX_CANDIDATES - 1)
-            ),
-            typed.to_string(),
-        ));
-    }
-    pairs
+    items.truncate(MAX_CANDIDATES);
+    items
 }
 
-/// 行内灰字：给出最可能补全的剩余部分。
-pub fn hint(line: &str, pos: usize, skills: &[(String, String)]) -> Option<String> {
-    let (start, pairs) = complete(line, pos, skills)?;
-    let typed = &line[start..pos];
-    // `/skill:` 后面还没写名字时不猜：一堆技能里挑最短的那个当灰字是噪声，
-    // 按 Tab 会直接列全。命令不同，`/` 后补 `new` 是有意义的默认。
-    if typed.is_empty() && line[..pos].trim_start_matches('/').starts_with("skill:") {
-        return None;
+/// 说明按显示宽度截断，中文占两格。
+fn shorten(text: &str) -> String {
+    let mut out = String::new();
+    let mut used = 0;
+    for ch in text.chars() {
+        let cells = crate::render::display_width(&ch.to_string());
+        if used + cells > DESCRIPTION_CELLS {
+            out.push('…');
+            break;
+        }
+        used += cells;
+        out.push(ch);
     }
-    let best = pairs.first()?;
-    let rest = best.replacement.strip_prefix(typed)?;
-    if rest.is_empty() {
-        return None;
-    }
-    Some(rest.to_string())
+    out
 }
 
 /// 子序列匹配，返回分数；空 needle 命中一切（分数最低）。
@@ -229,120 +211,100 @@ mod tests {
         ]
     }
 
-    fn replacements(pairs: &[Pair]) -> Vec<&str> {
-        pairs.iter().map(|pair| pair.replacement.as_str()).collect()
+    fn values(items: &[Candidate]) -> Vec<&str> {
+        items.iter().map(|item| item.value.as_str()).collect()
     }
 
     #[test]
-    fn a_command_prefix_completes() {
-        let (start, pairs) = complete("/ne", 3, &skills()).expect("有候选");
+    fn a_bare_slash_lists_every_command() {
+        let (start, items) = candidates("/", 1, &skills()).expect("有候选");
+        // 替换起点在 `/` 之后：命令名不带斜杠写回。
         assert_eq!(start, 1);
-        assert!(
-            replacements(&pairs).contains(&"new"),
-            "{:?}",
-            replacements(&pairs)
+        let names = values(&items);
+        assert!(names.contains(&"new"), "{names:?}");
+        assert!(names.contains(&"switch"), "{names:?}");
+        assert_eq!(
+            items
+                .iter()
+                .find(|item| item.value == "new")
+                .and_then(|item| item.description.clone()),
+            Some("归档当前会话，开始新的一条".to_string())
         );
-    }
-
-    #[test]
-    fn a_bare_slash_hints_the_shortest_matching_command() {
-        assert_eq!(hint("/", 1, &skills()).as_deref(), Some("new"));
     }
 
     #[test]
     fn fuzzy_subsequence_finds_the_command() {
-        let (_, pairs) = complete("/nw", 3, &skills()).expect("有候选");
-        assert_eq!(replacements(&pairs).first(), Some(&"new"));
+        let (start, items) = candidates("/nw", 3, &skills()).expect("有候选");
+        assert_eq!(start, 1);
+        assert_eq!(values(&items), vec!["new"]);
     }
 
     #[test]
-    fn a_space_after_skill_colon_still_completes() {
-        let (start, pairs) = complete("/skill: go", 10, &skills()).expect("有候选");
-        assert_eq!(start, 8);
-        assert_eq!(pairs[0].replacement, "go-rules");
-    }
-
-    #[test]
-    fn a_fuzzy_match_that_is_not_a_prefix_still_completes() {
-        // "rev" 不是任何技能名的前缀；此时只给最佳一条，Tab 才能直接替换。
-        let (_, pairs) = complete("/skill:rev", 10, &skills()).expect("有候选");
-        assert_eq!(pairs.len(), 1, "只给一条：{}", pairs[0].display);
-        assert!(
-            pairs[0].replacement.contains("review"),
-            "{}",
-            pairs[0].replacement
-        );
-
-        // 命令同理：/nw 不是 /new 的前缀。
-        let (_, single) = complete("/nw", 3, &skills()).expect("有候选");
-        assert_eq!(single.len(), 1);
-        assert_eq!(single[0].replacement, "new");
-    }
-
-    #[test]
-    fn skill_candidates_list_names_without_descriptions() {
-        let (start, pairs) = complete("/skill:cr", 9, &skills()).expect("有候选");
+    fn skills_come_with_their_description() {
+        let (start, items) = candidates("/skill:cr", 9, &skills()).expect("有候选");
         assert_eq!(start, 7);
-        let names = replacements(&pairs);
-        assert_eq!(names.first(), Some(&"code-review"), "{names:?}");
-        assert_eq!(pairs[0].display, "code-review", "候选只列名字");
-        assert!(
-            !pairs[0].display.contains('—'),
-            "不要把技能描述带进候选：{}",
-            pairs[0].display
+        assert_eq!(values(&items), vec!["code-review"]);
+        assert_eq!(items[0].description.as_deref(), Some("两轴审查"));
+    }
+
+    #[test]
+    fn an_empty_skill_query_lists_them_alphabetically() {
+        let (_, items) = candidates("/skill:", 7, &skills()).expect("有候选");
+        assert_eq!(
+            values(&items),
+            vec![
+                "adversarial-review",
+                "code-review",
+                "codebase-design",
+                "go-rules"
+            ]
         );
     }
 
     #[test]
-    fn switch_arguments_complete_provider_ids() {
-        let (start, pairs) = complete("/switch d", 9, &skills()).expect("有候选");
+    fn switch_arguments_list_providers_with_their_model() {
+        let (start, items) = candidates("/switch d", 9, &skills()).expect("有候选");
         assert_eq!(start, 8);
-        // 子序列匹配下 opencode-go 也含 d，但最匹配的一条必须排第一。
-        assert_eq!(pairs[0].replacement, "deepseek");
+        assert_eq!(items[0].value, "deepseek");
+        assert_eq!(items[0].description.as_deref(), Some("DeepSeek Flash"));
     }
 
     #[test]
     fn effort_arguments_complete() {
-        let (start, pairs) = complete("/effort h", 9, &skills()).expect("有候选");
+        let (start, items) = candidates("/effort h", 9, &skills()).expect("有候选");
         assert_eq!(start, 8);
-        assert_eq!(replacements(&pairs), vec!["high"]);
+        assert_eq!(values(&items), vec!["high"]);
     }
 
     #[test]
-    fn long_skill_lists_are_capped_with_a_footer() {
+    fn the_list_is_capped() {
         let many: Vec<(String, String)> = (0..12)
             .map(|index| (format!("code-{index}"), format!("第 {index} 个")))
             .collect();
-        let (_, pairs) = complete("/skill:code", 11, &many).expect("有候选");
-        // "/skill:code" 共 11 个字符：7 个固定前缀 + 4 个已输入字符。
-        assert_eq!(pairs.len(), MAX_CANDIDATES);
-        let last = pairs.last().expect("末条");
-        assert!(last.display.contains("还有 5 个"), "{}", last.display);
+        let (_, items) = candidates("/skill:code", 11, &many).expect("有候选");
+        assert_eq!(items.len(), MAX_CANDIDATES);
     }
 
     #[test]
-    fn an_empty_skill_query_shows_no_hint_but_still_lists() {
-        // 灰字只在写了名字之后出现：24 个技能里挑一个当灰字是噪声。
-        assert_eq!(hint("/skill:", 7, &skills()), None);
-        assert_eq!(hint("/skill: ", 8, &skills()), None);
-        // 但候选照旧齐全，按 Tab 能列出来。
-        let (start, pairs) = complete("/skill:", 7, &skills()).expect("有候选");
-        assert_eq!(start, 7);
-        assert_eq!(pairs.len(), skills().len());
-        // 写了名字之后灰字照旧。
-        assert_eq!(hint("/skill:go-", 10, &skills()).as_deref(), Some("rules"));
-    }
-
-    #[test]
-    fn the_hint_shows_only_the_remaining_characters() {
-        assert_eq!(hint("/ne", 3, &skills()).as_deref(), Some("w"));
-        assert_eq!(hint("/skill:go-", 10, &skills()).as_deref(), Some("rules"));
-        assert_eq!(hint("你好", 6, &skills()), None);
+    fn a_query_that_cannot_be_extended_collapses_to_the_best_one() {
+        // "cr" 没有任何候选以它开头，只给最匹配的一条，菜单不会停在那里。
+        let line = "/skill:cr";
+        let (_, items) = candidates(line, line.len(), &skills()).expect("有候选");
+        assert_eq!(items.len(), 1);
     }
 
     #[test]
     fn plain_text_gets_no_completion() {
-        assert!(complete("你好", 6, &skills()).is_none());
-        assert!(complete("/effort high now", 16, &skills()).is_none());
+        assert!(candidates("你好", 6, &skills()).is_none());
+        assert!(candidates("/effort high now", 16, &skills()).is_none());
+    }
+
+    #[test]
+    fn a_long_description_is_cut_to_one_row() {
+        let long = vec![("code-review".to_string(), "很长的描述".repeat(60))];
+        let (_, items) = candidates("/skill:co", 9, &long).expect("有候选");
+        let desc = items[0].description.as_deref().unwrap_or("");
+        assert!(crate::render::display_width(desc) <= DESCRIPTION_CELLS + 1);
+        assert!(desc.ends_with('…'));
     }
 }

@@ -10,7 +10,8 @@
 | `src/agent.rs` | 一轮对话的编排：循环、工具分发、连续失败检测、压缩触发 |
 | `src/provider.rs` | OpenAI 兼容的 HTTP/SSE 客户端；请求体、重试、用量解析、`x-opencode-session` 头 |
 | `src/session.rs` | JSONL 会话：追加、上下文重建、压缩规划、中断修复、`/new` 归档 |
-| `src/tools.rs` | 七个工具与 JSON Schema；锚点快照、bash 日志与进程组 |
+| `src/tools.rs` | 八个工具与 JSON Schema；锚点快照、bash 日志与进程组 |
+| `src/db.rs` | 按项目的数据库配置（`$YI_HOME/projects/<编码>/db.json`）与 profile 解析 |
 | `src/config.rs` | 供应商预置、配置文件、密钥与代理、系统提示词组装 |
 | `src/render.rs` | 行式 markdown：标题/列表/引用/表格对齐、代码块交 `bat` |
 | `src/complete.rs` | 斜杠命令与技能名补全、行内提示 |
@@ -23,7 +24,7 @@
 
 ```
 main::run
-  → read_input（rustyline 或管道逐行）
+  → input::Input::read（reedline 或管道逐行）
   → Agent::submit_with_images(prompt, images)
       → Session::append_user / append_image
       → loop:
@@ -47,6 +48,7 @@ main::run
 
 ## 测试基建
 
+- `scripts/tui.py`：在伪终端里跑 yi、发按键、打印屏幕；界面改动用它验证，`|` 表示「发一段、截一次屏」。首次运行会在 `~/.cache/yi-tui/venv` 里装好 pyte，不碰系统 Python。
 - `tests/common/mod.rs`：`start_server(Vec<String>)` 是手写 HTTP/SSE 服务器（标准库 `TcpListener`），记录 `FakeServer.bodies` / `.headers`；响应构造器 `sse_response`、`plain_response`、`tool_response`、`json_response`、`big_usage_response`；`temp_home(tag)` 生成唯一临时目录。
 - 配置通过 `config(port, home, effort)` 显式注入，**不改进程环境变量**；每个用例必须用不同会话路径（文件锁会冲突）。
 - 进程级全局状态要串行化：`tests/cancel.rs` 用 `static GATE: Mutex<()>`，`tests/crash.rs` 只有一个用例（`OnceLock`）。

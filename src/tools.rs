@@ -35,6 +35,16 @@ const GREP_TOTAL: usize = 200;
 const SKIP_DIRS: [&str; 3] = ["node_modules", "target", "vendor"];
 const GREP_LINE_CHARS: usize = 512;
 const GLOB_LIMIT: usize = 200;
+/// 缺配置时给人看的样板：可以直接抄进 db.json。
+const DB_EXAMPLE: &str = r#"{
+  "default": "dev",
+  "profiles": {
+    "dev": { "host": "127.0.0.1", "user": "root", "database": "demo" }
+  }
+}"#;
+
+/// 只读查询最多回多少行：再多模型也读不完，只会挤占上下文。
+const DB_ROW_LIMIT: usize = 200;
 
 /// 工具执行的结果；图片要作为消息附带，不能塞进文本结果里。
 pub enum Outcome {
@@ -54,6 +64,14 @@ pub struct Tools {
     snapshots: HashMap<PathBuf, Snapshot>,
     log_seq: u64,
     lsp: Lsp,
+    /// 计划模式：工作树只读。拦 write/edit，bash 只放行只读命令。
+    plan: bool,
+    /// 本项目的数据库配置；`None` 表示还没配。
+    db: Option<crate::db::DbConfig>,
+    /// 会话里选过的 profile；`None` 表示用配置的 default。
+    db_profile: Option<String>,
+    /// 配置文件的路径，缺配置时用来告诉人写在哪。
+    db_path: PathBuf,
 }
 
 impl Tools {
@@ -70,7 +88,26 @@ impl Tools {
             snapshots: HashMap::new(),
             log_seq: 0,
             lsp: Lsp::new(gopls, phpantom, rust_analyzer),
+            plan: false,
+            db: None,
+            db_profile: None,
+            db_path: PathBuf::new(),
         }
+    }
+
+    pub fn set_plan(&mut self, plan: bool) {
+        self.plan = plan;
+    }
+
+    pub fn set_db(
+        &mut self,
+        config: Option<crate::db::DbConfig>,
+        profile: Option<String>,
+        path: PathBuf,
+    ) {
+        self.db = config;
+        self.db_profile = profile;
+        self.db_path = path;
     }
 
     /// 七个工具的 JSON Schema。顺序固定，保证请求前缀稳定。
@@ -199,7 +236,23 @@ impl Tools {
                         "required": ["pattern"]
                     }
                 }
-            }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "db_query",
+                    "description": "对 MySQL 执行只读查询（SELECT / SHOW / DESCRIBE / EXPLAIN / WITH … SELECT），返回制表符分隔的结果。连接信息取自环境变量 YI_MYSQL_HOST、YI_MYSQL_PORT、YI_MYSQL_USER、YI_MYSQL_DATABASE，密码取自 MYSQL_PWD；只读是工具层的硬限制，要改数据请改用 bash 并先取得用户明确同意。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "sql": { "type": "string", "description": "一条只读语句；不要用分号拼接多条" },
+                            "database": { "type": "string", "description": "库名；省略时用 YI_MYSQL_DATABASE" },
+                            "timeout": { "type": "integer", "description": "秒，默认 15" }
+                        },
+                        "required": ["sql"]
+                    }
+                }
+            },
         ])
     }
 
@@ -252,11 +305,17 @@ impl Tools {
             Ok(args) => args,
             Err(_) => return Outcome::Text("ERROR: 参数不是合法 JSON".to_string()),
         };
+        if self.plan
+            && let Some(refusal) = plan_refusal(&call.name, &args)
+        {
+            return Outcome::Text(refusal);
+        }
         let text = match call.name.as_str() {
             "read" => return self.read(&args),
             "write" => self.write(&args),
             "edit" => self.edit(&args),
             "bash" => self.bash(&args, on),
+            "db_query" => self.db_query(&args, on),
             "grep" => self.grep(&args),
             "glob" => self.glob(&args),
             "lsp" => return Outcome::Text(self.lsp_call(&args)),
@@ -618,6 +677,109 @@ impl Tools {
             });
         let seen = merged.unwrap_or(seen);
         self.snapshots.insert(path, Snapshot { tag, seen });
+    }
+
+    /// 只读查询：语法先过一遍白名单，再用 mysql 客户端跑，密码只从环境变量来。
+    fn db_query(&mut self, args: &Value, on: &mut dyn FnMut(Event)) -> String {
+        let Some(sql) = args.get("sql").and_then(Value::as_str) else {
+            return "ERROR: 缺少 sql".to_string();
+        };
+        if let Err(reason) = read_only_sql(sql) {
+            return format!("ERROR: {reason}；改数据请用 bash，并先取得用户明确同意");
+        }
+        let Some(config) = self.db.as_ref() else {
+            return format!(
+                "ERROR: 本项目还没配数据库。写一份 {}：\n{}\n密码放环境变量（默认 MYSQL_PWD，也可用 profile 里的 password_env 指定）。",
+                self.db_path.display(),
+                DB_EXAMPLE
+            );
+        };
+        let (profile_name, profile) = match crate::db::resolve(config, self.db_profile.as_deref()) {
+            Ok(found) => found,
+            Err(err) => return format!("ERROR: {err}"),
+        };
+        let password_var = profile
+            .password_env
+            .clone()
+            .unwrap_or_else(|| "MYSQL_PWD".to_string());
+        let Some(password) = env_value(&password_var) else {
+            return format!("ERROR: 没有密码：设置环境变量 {password_var}");
+        };
+        let database = args
+            .get("database")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .or_else(|| Some(profile.database.clone()));
+        let timeout = args
+            .get("timeout")
+            .and_then(Value::as_u64)
+            .unwrap_or(15)
+            .clamp(1, 120);
+
+        let mut command = Command::new("mysql");
+        command
+            .arg("--batch")
+            .arg("--raw")
+            .arg("--default-character-set=utf8mb4")
+            .arg("--connect-timeout=5")
+            .arg(format!("--host={}", profile.host))
+            .arg(format!("--port={}", profile.port))
+            .arg(format!("--user={}", profile.user))
+            .env("MYSQL_PWD", password)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0);
+        // 交互式分页器会把输出搅乱；只读查询也不需要它。
+        command.env_remove("MYSQL_PAGER");
+        if let Some(database) = &database {
+            command.arg(format!("--database={database}"));
+        }
+
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(err) => return format!("ERROR: 起不了 mysql：{err}"),
+        };
+        let pid = child.id();
+        if let Some(mut stdin) = child.stdin.take()
+            && let Err(err) = stdin.write_all(sql.as_bytes())
+        {
+            return format!("ERROR: 把 SQL 交给 mysql 失败：{err}");
+        }
+
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(child.wait_with_output());
+        });
+        let deadline = Instant::now() + Duration::from_secs(timeout);
+        loop {
+            if crate::cancel::check() {
+                signal_group(pid, libc::SIGTERM);
+                return "ERROR: 已取消这条查询".to_string();
+            }
+            match rx.recv_timeout(Duration::from_millis(50)) {
+                Ok(Ok(output)) => {
+                    let mut text = render_db_output(output, database.as_deref());
+                    if !text.starts_with("ERROR:") {
+                        text = format!("profile：{profile_name}\n{text}");
+                    }
+                    return text;
+                }
+                Ok(Err(err)) => return format!("ERROR: 等待 mysql 失败：{err}"),
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    on(Event::Tick);
+                    if Instant::now() >= deadline {
+                        signal_group(pid, libc::SIGTERM);
+                        std::thread::sleep(Duration::from_millis(300));
+                        signal_group(pid, libc::SIGKILL);
+                        return format!("ERROR: 超过 {timeout} 秒，已终止查询");
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return "ERROR: mysql 进程异常退出".to_string();
+                }
+            }
+        }
     }
 
     fn bash(&mut self, args: &Value, on: &mut dyn FnMut(Event)) -> String {
@@ -1443,10 +1605,414 @@ fn truncate_chars(text: &str, max: usize) -> String {
     out
 }
 
+/// 计划模式下这个调用要不要拒绝：返回给模型看的说明，`None` 表示放行。
+fn plan_refusal(name: &str, args: &Value) -> Option<String> {
+    match name {
+        "write" | "edit" => Some(
+            "ERROR: 计划模式下工作树只读，不能改文件。把要改的地方写进计划，等用户用 /plan 退出后再动手。"
+                .to_string(),
+        ),
+        "bash" => {
+            let command = args.get("command").and_then(Value::as_str).unwrap_or("");
+            if read_only_command(command) {
+                None
+            } else {
+                Some(format!(
+                    "ERROR: 计划模式下 bash 只放行只读命令（ls、cat、rg、git log/diff/status、go test 这类），这条会被拒绝：{command}\n换个查法，或者等用户用 /plan 退出计划模式。"
+                ))
+            }
+        }
+        _ => None,
+    }
+}
+
+/// 这条 bash 命令看起来是不是只读。
+///
+/// SIMPLIFICATION: 只看每段管道的第一个词，识不破 `$(...)`、脚本文件和有写副作用
+/// 的自定义程序；目标是挡住常见的误改，不是沙箱。白名单窄，撞墙时返回明确的
+/// 拒绝说明，模型会换一种查法。
+fn read_only_command(command: &str) -> bool {
+    // `2>&1` 是管道，不是写文件；先摘掉，免得被下面的 `>` 检查误伤。
+    let cleaned = command.replace("2>&1", "").replace("1>&2", "");
+    if cleaned.contains('>') {
+        return false;
+    }
+    for segment in cleaned.split(['&', '|', ';', '\n']) {
+        let words: Vec<&str> = segment.split_whitespace().collect();
+        let Some(head) = words.first() else {
+            continue;
+        };
+        // 单独一段 `cd 某目录` 不改任何东西。
+        if *head == "cd" {
+            continue;
+        }
+        if !allowed_command(head, &words[1..]) {
+            return false;
+        }
+    }
+    true
+}
+
+fn allowed_command(head: &str, args: &[&str]) -> bool {
+    const READ_ONLY: &[&str] = &[
+        "ls", "cat", "head", "tail", "wc", "file", "stat", "pwd", "which", "rg", "grep", "fd",
+        "find", "echo", "date", "uname", "du", "df", "ps", "env", "git", "go", "cargo",
+    ];
+    match head {
+        "find" => !args
+            .iter()
+            .any(|arg| *arg == "-delete" || arg.starts_with("-exec") || arg.starts_with("-ok")),
+        "git" => matches!(
+            git_subcommand(args),
+            Some(
+                "log"
+                    | "diff"
+                    | "status"
+                    | "show"
+                    | "blame"
+                    | "rev-parse"
+                    | "ls-files"
+                    | "describe"
+                    | "shortlog"
+                    | "grep"
+            )
+        ),
+        "go" => matches!(
+            args.first().copied(),
+            Some("test" | "vet" | "list" | "env" | "version")
+        ),
+        "cargo" => matches!(
+            args.first().copied(),
+            Some("test" | "check" | "clippy" | "tree" | "metadata")
+        ),
+        other => READ_ONLY.contains(&other),
+    }
+}
+
+/// git 的子命令：跳过全局开关，`-C <目录>` 这类要连参数一起跳。
+fn git_subcommand<'a>(args: &[&'a str]) -> Option<&'a str> {
+    let mut index = 0;
+    while index < args.len() {
+        let arg = args[index];
+        if matches!(arg, "-C" | "-c" | "--git-dir" | "--work-tree") {
+            index += 2;
+        } else if arg.starts_with('-') {
+            index += 1;
+        } else {
+            return Some(arg);
+        }
+    }
+    None
+}
+
+fn env_value(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+}
+
+/// 把 mysql 的原始输出整理成模型看的文本：出错只留第一行原因，成功截到固定行数。
+fn render_db_output(output: std::process::Output, database: Option<&str>) -> String {
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !output.status.success() {
+        let reason = stderr
+            .lines()
+            .find(|line| !line.trim().is_empty())
+            .unwrap_or("没有错误信息");
+        return format!("ERROR: mysql：{reason}");
+    }
+    let mut lines: Vec<&str> = stdout.lines().collect();
+    let truncated = lines.len() > DB_ROW_LIMIT + 1;
+    if truncated {
+        lines.truncate(DB_ROW_LIMIT + 1);
+    }
+    let mut body = lines.join("\n");
+    if truncated {
+        body.push_str(&format!("\n…（只显示前 {DB_ROW_LIMIT} 行）"));
+    }
+    if body.trim().is_empty() {
+        body = "（没有结果）".to_string();
+    }
+    match database {
+        Some(database) => format!("库：{database}\n{body}"),
+        None => body,
+    }
+}
+
+/// 只读语句的白名单检查。
+///
+/// SIMPLIFICATION: 只看语句结构，挡不住「SELECT 调用了会写库的存储函数」这种
+/// 极端情况；真正的写入路径留给人明确批准后的 bash。要收紧就把连接换成只读账号。
+fn read_only_sql(sql: &str) -> Result<(), String> {
+    let (tokens, extra) = sql_tokens(sql);
+    if extra {
+        return Err("一次只能跑一条语句".to_string());
+    }
+    let Some((_, first)) = tokens.first() else {
+        return Err("SQL 是空的".to_string());
+    };
+    let first = first.as_str();
+    if !matches!(
+        first,
+        "SELECT" | "SHOW" | "DESCRIBE" | "DESC" | "EXPLAIN" | "WITH"
+    ) {
+        return Err(format!("{first} 不是只读语句"));
+    }
+    if tokens
+        .windows(2)
+        .any(|pair| pair[0].1 == "INTO" && matches!(pair[1].1.as_str(), "OUTFILE" | "DUMPFILE"))
+    {
+        return Err("INTO OUTFILE / DUMPFILE 会写文件".to_string());
+    }
+    if first == "WITH" {
+        // CTE 的括号里可能藏着子查询，只有括号外的语句关键字才算数。
+        let writes = [
+            "INSERT", "UPDATE", "DELETE", "REPLACE", "CREATE", "DROP", "ALTER",
+        ];
+        let mut seen_select = false;
+        for (depth, word) in tokens.iter().skip(1) {
+            if *depth != 0 {
+                continue;
+            }
+            if word == "SELECT" {
+                seen_select = true;
+                break;
+            }
+            if writes.contains(&word.as_str()) {
+                return Err(format!("WITH 后面跟的是 {word}，不是查询"));
+            }
+        }
+        if !seen_select {
+            return Err("WITH 后面没找到 SELECT".to_string());
+        }
+    }
+    Ok(())
+}
+
+/// 扫一遍 SQL：返回（词，括号深度）与「分号后面还有东西」。
+/// 字符串、反引号、注释里的内容不算词，也不参与分号判断。
+fn sql_tokens(sql: &str) -> (Vec<(i32, String)>, bool) {
+    let bytes = sql.as_bytes();
+    let mut tokens = Vec::new();
+    let mut index = 0;
+    let mut depth = 0;
+    let mut ended = false;
+    let mut extra = false;
+    while index < bytes.len() {
+        let ch = bytes[index];
+        match ch {
+            b'\'' | b'"' | b'`' => {
+                let quote = ch;
+                index += 1;
+                while index < bytes.len() {
+                    let current = bytes[index];
+                    if current == b'\\' && quote != b'`' {
+                        index += 2;
+                        continue;
+                    }
+                    if current == quote {
+                        if quote != b'`' && index + 1 < bytes.len() && bytes[index + 1] == quote {
+                            index += 2;
+                            continue;
+                        }
+                        index += 1;
+                        break;
+                    }
+                    index += 1;
+                }
+            }
+            b'-' if index + 1 < bytes.len() && bytes[index + 1] == b'-' => {
+                while index < bytes.len() && bytes[index] != b'\n' {
+                    index += 1;
+                }
+            }
+            b'#' => {
+                while index < bytes.len() && bytes[index] != b'\n' {
+                    index += 1;
+                }
+            }
+            b'/' if index + 1 < bytes.len() && bytes[index + 1] == b'*' => {
+                index += 2;
+                while index + 1 < bytes.len() && !(bytes[index] == b'*' && bytes[index + 1] == b'/')
+                {
+                    index += 1;
+                }
+                index = (index + 2).min(bytes.len());
+            }
+            b'(' => {
+                depth += 1;
+                index += 1;
+            }
+            b')' => {
+                depth -= 1;
+                index += 1;
+            }
+            b';' => {
+                ended = true;
+                index += 1;
+            }
+            byte if byte.is_ascii_alphanumeric() || byte == b'_' => {
+                if ended {
+                    extra = true;
+                }
+                let start = index;
+                while index < bytes.len()
+                    && (bytes[index].is_ascii_alphanumeric() || bytes[index] == b'_')
+                {
+                    index += 1;
+                }
+                tokens.push((
+                    depth,
+                    String::from_utf8_lossy(&bytes[start..index]).to_uppercase(),
+                ));
+            }
+            _ => {
+                index += 1;
+            }
+        }
+    }
+    (tokens, extra)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn db_call(sql: &str) -> ToolCall {
+        ToolCall {
+            id: "db1".to_string(),
+            name: "db_query".to_string(),
+            arguments: json!({ "sql": sql }).to_string(),
+        }
+    }
+
+    #[test]
+    fn db_query_only_accepts_read_only_statements() {
+        assert!(read_only_sql("SELECT 1").is_ok());
+        assert!(read_only_sql("select * from t where name = 'a;b'").is_ok());
+        assert!(read_only_sql("SHOW TABLES").is_ok());
+        assert!(read_only_sql("DESCRIBE users").is_ok());
+        assert!(read_only_sql("EXPLAIN SELECT 1").is_ok());
+        assert!(read_only_sql("/* 说明 */ SELECT 1").is_ok());
+        assert!(read_only_sql("-- 说明\nSELECT 1").is_ok());
+        assert!(read_only_sql("WITH a AS (SELECT 1) SELECT * FROM a").is_ok());
+
+        assert!(read_only_sql("").is_err(), "空语句");
+        assert!(read_only_sql("UPDATE t SET a = 1").is_err());
+        assert!(read_only_sql("DELETE FROM t").is_err());
+        assert!(read_only_sql("DROP TABLE t").is_err());
+        assert!(read_only_sql("SELECT 1; DROP TABLE t").is_err(), "多语句");
+        assert!(read_only_sql("SELECT * INTO OUTFILE '/tmp/x' FROM t").is_err());
+        assert!(
+            read_only_sql("WITH a AS (SELECT 1) DELETE FROM t").is_err(),
+            "WITH 后面接写语句"
+        );
+    }
+
+    #[test]
+    fn db_query_says_where_to_put_the_config_when_there_is_none() {
+        let mut tools = tools(std::path::Path::new("."));
+        tools.set_db(
+            None,
+            None,
+            std::path::PathBuf::from("/tmp/yi-projects/db.json"),
+        );
+        let outcome = tools.execute(&db_call("SELECT 1"), &mut |_| {});
+        match outcome {
+            Outcome::Text(text) => {
+                assert!(text.starts_with("ERROR:"), "{text}");
+                assert!(text.contains("db.json"), "{text}");
+                assert!(text.contains("MYSQL_PWD"), "{text}");
+            }
+            Outcome::Image { .. } => panic!("不该返回图片"),
+        }
+    }
+
+    #[test]
+    fn db_query_refuses_writes_before_it_tries_to_connect() {
+        let mut tools = tools(std::path::Path::new("."));
+        let outcome = tools.execute(&db_call("DELETE FROM t"), &mut |_| {});
+        match outcome {
+            Outcome::Text(text) => {
+                assert!(text.starts_with("ERROR:"), "{text}");
+                assert!(text.contains("只读") || text.contains("不是只读"), "{text}");
+            }
+            Outcome::Image { .. } => panic!("不该返回图片"),
+        }
+    }
+
+    #[test]
+    fn db_output_keeps_only_the_first_error_line() {
+        use std::os::unix::process::ExitStatusExt;
+        let output = std::process::Output {
+            status: std::process::ExitStatus::from_raw(256),
+            stdout: Vec::new(),
+            stderr: "ERROR 1045: Access denied\n第二行细节".as_bytes().to_vec(),
+        };
+        let rendered = render_db_output(output, Some("demo"));
+        assert_eq!(rendered, "ERROR: mysql：ERROR 1045: Access denied");
+    }
+
+    #[test]
+    fn db_output_caps_the_number_of_rows() {
+        use std::os::unix::process::ExitStatusExt;
+        let mut text = String::from("id\tname\n");
+        for index in 0..(DB_ROW_LIMIT + 20) {
+            text.push_str(&format!("{index}\tn{index}\n"));
+        }
+        let output = std::process::Output {
+            status: std::process::ExitStatus::from_raw(0),
+            stdout: text.into_bytes(),
+            stderr: Vec::new(),
+        };
+        let rendered = render_db_output(output, Some("demo"));
+        assert!(rendered.starts_with("库：demo"));
+        assert_eq!(
+            rendered.lines().count(),
+            DB_ROW_LIMIT + 3,
+            "表头 + 200 行 + 截断提示 + 库名"
+        );
+        assert!(rendered.contains("只显示前"));
+    }
+
+    #[test]
+    fn plan_mode_blocks_file_writes() {
+        for name in ["write", "edit"] {
+            let refusal = plan_refusal(name, &json!({"path": "a.go"})).expect("必须拒绝");
+            assert!(refusal.starts_with("ERROR:"), "{refusal}");
+            assert!(refusal.contains("只读"), "{refusal}");
+        }
+        // 只读工具不受影响。
+        assert!(plan_refusal("read", &json!({"path": "a.go"})).is_none());
+    }
+
+    #[test]
+    fn plan_mode_bash_allows_read_only_commands() {
+        let ok = |command: &str| plan_refusal("bash", &json!({"command": command})).is_none();
+        assert!(ok("ls -la"));
+        assert!(ok("git diff --stat"));
+        assert!(ok("git -C sub log --oneline"));
+        assert!(ok("go test ./..."));
+        assert!(ok("cd /tmp && cat go.mod"));
+        assert!(ok("git log | head -20"));
+        assert!(ok("go test ./... 2>&1 | tail -5"));
+        assert!(ok("find . -name '*.go'"));
+    }
+
+    #[test]
+    fn plan_mode_bash_refuses_commands_that_write() {
+        let refused = |command: &str| plan_refusal("bash", &json!({"command": command})).is_some();
+        assert!(refused("rm -rf internal"));
+        assert!(refused("sed -i 's/a/b/' go.mod"));
+        assert!(refused("echo hi > note.txt"));
+        assert!(refused("git checkout main"));
+        assert!(refused("git branch -D old"));
+        assert!(refused("mkdir -p x"));
+        assert!(refused("find . -name '*.go' -delete"));
+        assert!(refused("python3 -c 'open(a,w)'"));
+    }
 
     fn tools(root: &std::path::Path) -> Tools {
         Tools::new(

@@ -2,12 +2,18 @@
 //!
 //! 二进制只是一层薄壳；这里的一切都可以被集成测试直接驱动。
 
+// 生产代码不 panic：把 AGENTS 里那条约定交给 clippy 检查，测试模块放行。
+#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
+
 pub mod agent;
 pub mod cancel;
 pub mod clipboard;
 pub mod complete;
 pub mod config;
 pub mod crash;
+pub mod db;
+pub mod input;
 pub mod jobs;
 pub mod lsp;
 pub mod program_status;

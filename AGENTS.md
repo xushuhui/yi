@@ -1,6 +1,6 @@
 # Repository Guidelines
 
-`yi` 是单人使用的终端编程 agent：Rust 单二进制、单进程、行式界面，一个项目一条会话线。默认供应商 `opencode-go`（模型 `deepseek-v4.1-flash`），另一套是 DeepSeek 官方；七个工具；不做记忆、多供应商抽象、子 agent、MCP、会话树、审批沙箱。
+`yi` 是单人使用的终端编程 agent：Rust 单二进制、单进程、行式界面，一个项目一条会话线。默认供应商 `opencode-go`（模型 `deepseek-v4.1-flash`），另一套是 DeepSeek 官方；八个工具；不做记忆、多供应商抽象、子 agent、MCP、会话树、审批沙箱。
 
 模块职责、测试基建、运行环境等细节见 `docs/agents/codebase.md`，需要时再读。
 
@@ -33,7 +33,7 @@ cargo fmt
 cargo install --path . --root ~/.local --force --offline
 ```
 
-交付前至少跑三条：`cargo fmt`、`cargo clippy --all-targets`（零警告）、`cargo test`。
+交付前至少跑四条：`cargo fmt`、`cargo clippy --all-targets`（零警告）、`cargo test`，最后 `cargo install --path . --root ~/.local --force --offline`——每次改完都装，别让常驻的 yi 跑旧二进制。
 
 ## 风格
 

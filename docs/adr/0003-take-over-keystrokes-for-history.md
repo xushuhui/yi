@@ -2,7 +2,7 @@
 
 ## Status
 
-accepted
+accepted（行编辑器的实现已由 ADR-0011 换成 `reedline`；本 ADR 关于历史、按键归属与 Ctrl-C/D 的决定仍然有效）
 
 ## 背景
 
