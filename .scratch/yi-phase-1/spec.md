@@ -75,7 +75,7 @@ Status: ready-for-agent
 ### 会话存储
 
 - 位置：`~/.yi/sessions/<编码后的项目路径>/session.jsonl`。编码 = 绝对路径把 `/` 换成 `-`（中文原样保留），末尾追加路径的 8 位十六进制哈希，兼顾可读与唯一。
-- 格式：纯文本 JSONL，一行一条。第一行是头：`{"type":"session","version":1,"id","timestamp","cwd","model","effort"}`；其后是 `message`、`compaction`、`effort_change`、`model_change`、`plan_change`、`db_change`、`notice` 七类条目；`notice` 只给人看（失败原因、请求次数达上限、崩溃原因），不进入模型上下文，压缩也不会带走（推理强度与供应商的变更分别追加 `effort_change`、`model_change`，不回改系统消息，也不进入模型上下文）。`model_change` 记供应商 id 与模型 id，重开会话时以最后一条为准，配置文件只作新会话的默认。
+- 格式：纯文本 JSONL，一行一条。第一行是头：`{"type":"session","version":1,"id","timestamp","cwd","model","effort"}`；其后是 `message`、`compaction`、`effort_change`、`model_change`、`plan_change`、`notice` 六类条目；`notice` 只给人看（失败原因、请求次数达上限、崩溃原因），不进入模型上下文，压缩也不会带走（推理强度与供应商的变更分别追加 `effort_change`、`model_change`，不回改系统消息，也不进入模型上下文）。`model_change` 记供应商 id 与模型 id，重开会话时以最后一条为准，配置文件只作新会话的默认。
 - **线性结构，不存 `parentId`，不做树**。否决 omp/pi 的树形条目：分支、fork、会话树全都不做，树形字段就是死重量。
 - 每条 assistant 消息记录 `usage`：未缓存输入、缓存命中输入、输出、推理强度、耗时。
 - 流式输出过程中不落盘；一条消息完成后追加一次。进程崩溃最多丢当前这一条。
@@ -119,7 +119,7 @@ Status: ready-for-agent
 
 ### 工具
 
-九个工具，输入都是扁平 JSON 对象。返回值对模型可见，长度统一截断为 2,000 行或 50 KB（先到者为准）。
+八个工具，输入都是扁平 JSON 对象。返回值对模型可见，长度统一截断为 2,000 行或 50 KB（先到者为准）。
 
 **`read { path, offset?, limit? }`**
 - 文本：返回头部 `[相对路径#TAG]`，随后每行 `行号:内容`。`TAG` 是文件内容摘要的 4 位大写十六进制。默认 300 行，单次上限 3,000 行；没读完时在末尾给一行「共 N 行，用 offset=X 继续读」。
@@ -141,6 +141,7 @@ Status: ready-for-agent
 **`write { path, content }`**：建父目录、覆盖写、返回新的 `[路径#TAG]`。
 
 **`bash { command, cwd?, timeout?, background? }`**
+- 危险命令在执行前要人确认：命中固定清单（`rm`、`dd`、`truncate`、`shred`、`sudo`、`kill` 族、`mkfs*`/`mke2fs`/`newfs_*`/`diskutil eraseDisk`、`find -delete/-exec`、`xargs rm`）时打印 `允许执行危险命令？… [y/N]`；只认 `y`/`Y`，30 秒超时或 Ctrl-C 都拒绝并回 `ERROR:`；标准输入不是终端时直接拒绝。
 - 命令开头若写 `cd <项目根> && `（含带引号的写法），执行前直接剥掉：项目根本来就是工作目录，剥掉语义等价，也免得绝对路径占满整行；指向别的目录的 `cd` 原样保留。
 - 命令里用 `&` 启动的后台进程不会阻塞返回：shell 退出后最多再等 300 毫秒收输出快照，后台进程继续运行，其后续输出不再属于这一轮。
 - 工作目录默认项目根；可用 `cwd` 指定（相对路径按项目根解析，绝对路径原样使用，必须是已存在的目录）。工具说明里写明"命令已在项目根，不要写 `cd`"，让模型用参数而不是前缀。默认超时 300 秒，上限 3,600 秒。
@@ -167,16 +168,10 @@ Status: ready-for-agent
 
 **`task { task, name? }`**
 - 子 agent：同进程线程，独立消息历史与 Provider 会话标识，看不到父对话；返回最后一段文本，包在 `[子 agent <name>]` 里。
-- 只有只读工具：`read`、`grep`、`glob`、`lsp`，以及计划模式的只读 `bash` 白名单；没有 `write` / `edit` / `db_query` / `task`（深度一层）。
+- 只有只读工具：`read`、`grep`、`glob`、`lsp`，以及计划模式的只读 `bash` 白名单；没有 `write` / `edit` / `task`（深度一层）。
 - 同一轮多个 `task` 并行，最多 4 个；结果按行数（400）与字节（16 KB）截断。
 - 不建子会话；中间过程写到会话目录 `logs/task-<调用 id>.log`，写失败不影响结果。
 - 子 agent 最多 30 步；取消标志在每次请求前检查。
-
-**`db_query { sql, database?, timeout? }`**
-- 只读：只接受 `SELECT`、`SHOW`、`DESCRIBE`、`DESC`、`EXPLAIN`、`WITH … SELECT`；分号拼接多条直接拒，`INTO OUTFILE` / `INTO DUMPFILE` 直接拒，`WITH` 的主语句必须是 `SELECT`。写操作留给用户明确批准后的 `bash`。
-- 连接信息按项目放在 `$YI_HOME/projects/<项目编码>/db.json`，用 `profiles` 区分环境，`default` 指定默认；多个项目共用一个库时，项目文件只写 `{"use": "名字"}`，真正的配置在 `$YI_HOME/db/<名字>.json`，引用只允许一层；工具只用当前 profile，模型不能自己选环境。密码只从环境变量读：profile 的 `password_env` 或默认的 `MYSQL_PWD`；文件里出现 `password` 直接报错。缺配置时错误信息给路径与样板。
-- 用系统 `mysql` 客户端以 `--batch --raw` 执行，SQL 从标准输入喂进去（不进命令行、不进日志里的密码位）；默认 15 秒超时，按进程组终止。
-- 结果按制表符分隔，最多 200 行（表头另算），超出时末尾提示截断。
 
 ### 终端界面
 
@@ -191,7 +186,7 @@ Status: ready-for-agent
 - 输入区不加底色：提示符只有 `> `（计划模式为 `plan> `），没有上下边距，也不补齐行尾；输入行和普通输出只靠前缀区分。管道与重定向里同样不加任何字节。
 - 输入：标准输入是终端时交给行编辑器（`reedline`，见 ADR-0011）——上下键翻历史、左右移动、退格、Home/End；不是终端时保持逐行读取，供管道和测试使用。Enter 提交，空行忽略，以 `/` 开头按斜杠命令处理。历史是用户敲的原文，存成会话文件里的 `prompt` 条目，最近 200 条、连续重复只留一条，不进入模型上下文。输入行里 Ctrl-C 放弃当前行（编辑器把缓冲区一并交回，直接丢掉），Ctrl-D 退出；Shift+Tab 切换计划模式（等价于 `/plan`），提示符变成 `plan> `，输入到一半的内容保留（编辑器挂起再恢复）；一轮请求或命令执行期间按 Ctrl-C 取消这一轮（请求与读响应在工作线程，主线程每 100 毫秒检查信号标志与终端发来的 0x03）。
 - 中断：一轮请求或命令执行期间按 Ctrl-C 取消这一轮，会话保留，回到提示符；这段时间其余按键进轮内草稿（见上一条），轮末预填回提示符，由人按回车决定发不发。输入行里 Ctrl-C 放弃当前行（编辑器把缓冲区一并交回，直接丢掉），Ctrl-D 退出。
-- 斜杠命令六个：`/new`、`/plan`、`/db [profile]`、`/effort <auto|low|high|max>`、`/switch <opencode-go|deepseek>`、`/help`。`/db` 不带参数打印配置路径、当前 profile 与可选项；带参数切换并追加 `db_change`，重开仍然生效；模型不能自己换环境。`/plan` 切换计划模式：系统提示词末尾追加 `<plan-mode>` 一段（工作树只读、先查事实再提问、信息够了才给计划、计划不落盘），退出时去掉；打开后 `write` / `edit` 直接被拒，`bash` 只放行只读命令（`ls`、`cat`、`rg`、`git log/diff/status`、`go test` 这类），拒绝时回灌一条 `ERROR:` 说明；开关追加 `plan_change`，重开仍然生效，页脚显示 `plan`。`/switch` 换供应商与模型：参数为空时打印当前模型与可选项；密钥缺失当场报错、不切换；切换只影响本会话并追加 `model_change`，重开仍然生效。
+- 斜杠命令五个：`/new`、`/plan`、`/effort <auto|low|high|max>`、`/switch <opencode-go|deepseek>`、`/help`。`/plan` 切换计划模式：系统提示词末尾追加 `<plan-mode>` 一段（工作树只读、先查事实再提问、信息够了才给计划、计划不落盘），退出时去掉；打开后 `write` / `edit` 直接被拒，`bash` 只放行只读命令（`ls`、`cat`、`rg`、`git log/diff/status`、`go test` 这类），拒绝时回灌一条 `ERROR:` 说明；开关追加 `plan_change`，重开仍然生效，页脚显示 `plan`。`/switch` 换供应商与模型：参数为空时打印当前模型与可选项；密钥缺失当场报错、不切换；切换只影响本会话并追加 `model_change`，重开仍然生效。
 - 多行输入：粘贴多行时整段作为一条消息提交，不按行拆开。
 - 图片输入（见 ADR-0008）：整行是一个图片路径、或正文里写 `@路径`，该图作为一条图片消息跟着这句话发出，终端先打一行「图片：<路径>」。相对项目根解析，只认存在的 png/jpg/jpeg/gif/webp；不缩放，超过 20 MB 拒绝。
 - 补全：Tab 打开菜单，菜单画在输入行下方、原地刷新：左边候选、右边说明，输入继续时按当前内容重算，绝不往滚动区追加。**不做行内灰字**（它只能显示一条，且总画在行尾，光标在中间时会和正文粘在一起）。候选由 `complete::candidates` 计算：以 `/` 开头的按子序列模糊匹配（`/nw` → `/new`），`/skill:<前缀>`（冒号后允许空格）补技能名并带说明（说明截到 90 格），`/switch ` 补供应商，`/effort ` 补四个档位；没有候选以已输入内容开头时只给最佳一条；一次最多 8 条，不再伪造「还有 N 个」的占位行。回车在菜单打开时选定候选，再回车才提交。
@@ -254,10 +249,8 @@ Status: ready-for-agent
 11. 假服务器返回带大 `prompt_tokens` 的用量，超过当前窗口的一半（`deepseek` 预置下是 524,288）→ 会话文件追加 `compaction` 条目；下一次请求只含摘要与 `firstKeptSeq` 之后的消息。
 12. 同一目录启动第二个实例 → 非零退出，提示已存在运行中的会话。
 13. `/switch deepseek`（`DEEPSEEK_API_KEY` 已设）→ 会话追加 `model_change`，横幅与页脚变成 DeepSeek；重开同一目录仍是 DeepSeek。`DEEPSEEK_API_KEY` 未设 → 打印缺密钥、会话里不追加条目。
-14. `db_query "DELETE FROM t"` → 工具结果以 `ERROR:` 开头，连库都不试；`db_query "SELECT 1"` 在项目 db.json 与密码变量配好时返回 `profile：<名字>` 加一行结果；`WHERE name = 'a;b'` 这种带分号的字符串不算多语句；没有 db.json 时报错里带路径与样板。
-15. 项目 `db.json` 写 `{"use": "fm"}` 且 `$YI_HOME/db/fm.json` 存在 → `/db` 显示「共享 fm」和共享文件路径，查询走共享配置；共享文件缺失时报错带路径；共享文件里再写 `use`、`use` 名字带 `/` 或项目文件混写 `use` 与完整配置，都报错。
-16. 一轮里两个 `task` 调用 → 假服务器收到 4 次请求：父请求（含 `task` 工具定义）、两个子请求（各只有系统 + 一条任务，工具表没有 `task` / `write`）、父收尾（含两条 `[子 agent …]` 工具结果）。子 agent 若调用 `write`，工具结果以 `ERROR:` 开头且文件不存在。
-17. `/db` 打印配置路径、当前 profile 与可选项；`/db test` 追加 `db_change`，下一次查询走 test；`/db nope` 报错并列出可选；重启 yi 仍是 test。
+14. 一轮里两个 `task` 调用 → 假服务器收到 4 次请求：父请求（含 `task` 工具定义）、两个子请求（各只有系统 + 一条任务，工具表没有 `task` / `write`）、父收尾（含两条 `[子 agent …]` 工具结果）。子 agent 若调用 `write`，工具结果以 `ERROR:` 开头且文件不存在。
+15. 管道里 `bash "rm x"` → 以 `ERROR:` 开头、文件还在；真终端里执行同一命令会先出现 `[y/N]`，按 `n` 文件还在，按 `y` 文件删除。
 
 LSP 另有独立用例：Go/PHP 各一条跳定义、嵌套目录里的找引用、中文路径下的定位与代码片段、带类型错误的诊断、服务器不回话时 15 秒超时、未知动作不启动服务器、配置文件里的 `gopls`/`phpantom` 被忽略。缺少服务器时用例打印 `SKIP` 并返回，不算失败。
 

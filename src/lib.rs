@@ -12,7 +12,6 @@ pub mod clipboard;
 pub mod complete;
 pub mod config;
 pub mod crash;
-pub mod db;
 pub mod input;
 pub mod jobs;
 pub mod lsp;

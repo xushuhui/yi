@@ -11,8 +11,7 @@
 | `src/agent.rs` | 一轮对话的编排：循环、工具分发、连续失败检测、压缩触发 |
 | `src/provider.rs` | OpenAI 兼容的 HTTP/SSE 客户端；请求体、重试、用量解析、`x-opencode-session` 头 |
 | `src/session.rs` | JSONL 会话：追加、上下文重建、压缩规划、中断修复、`/new` 归档 |
-| `src/tools.rs` | 九个工具与 JSON Schema；锚点快照、bash 日志与进程组；子 agent 的只读工具集 |
-| `src/db.rs` | 按项目的数据库配置（`$YI_HOME/projects/<编码>/db.json`，可用 `{"use": 名字}` 引用 `$YI_HOME/db/<名字>.json`）与 profile 解析 |
+| `src/tools.rs` | 八个工具与 JSON Schema；锚点快照、bash 日志与进程组；子 agent 的只读工具集 |
 | `src/config.rs` | 供应商预置、配置文件、密钥与代理、系统提示词组装 |
 | `src/render.rs` | 行式 markdown：标题/列表/引用/表格对齐、代码块交 `bat` |
 | `src/complete.rs` | 斜杠命令与技能名候选计算；菜单由 `input` 画，不做行内灰字 |
@@ -21,7 +20,7 @@
 | `src/program_status.rs` | OSC 7501 状态上报（Rex 标签页转圈与完成标记），只在真终端发 |
 | `src/lsp.rs` | `gopls` / `phpantom_lsp` / `rust-analyzer` 客户端，按（语言, 项目根）缓存并回收 |
 | `src/skills.rs` | 扫描 `SKILL.md`，生成提示词条目，展开 `/skill:` |
-| `src/cancel.rs` | 本轮取消标志：SIGINT 处理器 + 终端 `0x03` 字节，两条入口同一个原子量 |
+| `src/cancel.rs` | 本轮取消标志（SIGINT + 终端 `0x03`）与危险命令的 y/N 确认 |
 | `src/crash.rs` | panic 钩子，把崩溃位置写成会话里的 `notice` |
 
 ## 数据流

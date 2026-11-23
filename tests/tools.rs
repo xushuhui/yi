@@ -110,6 +110,57 @@ fn edit_applies_when_the_tag_matches() {
 }
 
 #[test]
+fn edit_keeps_crlf_line_endings() {
+    let home = temp_home("crlf-home");
+    let ws = temp_home("crlf-ws");
+    std::fs::write(ws.join("a.txt"), "one\r\ntwo\r\nthree\r\n").unwrap();
+    let tag = file_tag(ws.join("a.txt"));
+    let patch = format!("[a.txt#{tag}]\nPUT 2.=2:\n+TWO\n");
+
+    let server = start_server(vec![
+        tool_response(&[("c1", "read", json!({"path": "a.txt"}))]),
+        plain_response(&["ok"]),
+        tool_response(&[("c2", "edit", json!({ "input": patch }))]),
+        plain_response(&["ok"]),
+    ]);
+    let mut agent = open_agent(server.port, &home, &ws);
+    collect(&mut agent, "读");
+    collect(&mut agent, "改第二行");
+
+    let bytes = std::fs::read(ws.join("a.txt")).unwrap();
+    assert_eq!(
+        String::from_utf8(bytes).unwrap(),
+        "one\r\nTWO\r\nthree\r\n",
+        "CRLF 文件改一行不能把整篇转成 LF"
+    );
+}
+
+#[test]
+fn edit_keeps_a_missing_trailing_newline_missing() {
+    let home = temp_home("noeol-home");
+    let ws = temp_home("noeol-ws");
+    std::fs::write(ws.join("a.txt"), "one\ntwo").unwrap();
+    let tag = file_tag(ws.join("a.txt"));
+    let patch = format!("[a.txt#{tag}]\nPUT 2.=2:\n+TWO\n");
+
+    let server = start_server(vec![
+        tool_response(&[("c1", "read", json!({"path": "a.txt"}))]),
+        plain_response(&["ok"]),
+        tool_response(&[("c2", "edit", json!({ "input": patch }))]),
+        plain_response(&["ok"]),
+    ]);
+    let mut agent = open_agent(server.port, &home, &ws);
+    collect(&mut agent, "读");
+    collect(&mut agent, "改第二行");
+
+    assert_eq!(
+        std::fs::read_to_string(ws.join("a.txt")).unwrap(),
+        "one\nTWO",
+        "原本没有结尾换行，改完也不该凭空补一个"
+    );
+}
+
+#[test]
 fn one_edit_call_lists_every_changed_file_on_one_line() {
     let home = temp_home("multi-edit-home");
     let ws = temp_home("multi-edit-ws");

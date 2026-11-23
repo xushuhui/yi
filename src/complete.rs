@@ -15,7 +15,6 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/help", "显示命令、环境变量和配置字段"),
     ("/new", "归档当前会话，开始新的一条"),
     ("/plan", "切换计划模式：只读调查，不改文件"),
-    ("/db", "查看或切换数据库环境：/db <profile>"),
     ("/effort", "设置推理强度：auto / low / high / max"),
     ("/switch", "切换供应商与模型：opencode-go / deepseek"),
     ("/skill:", "调用一个技能：/skill:<名字> [要求]"),

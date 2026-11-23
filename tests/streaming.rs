@@ -29,8 +29,8 @@ fn streams_text_and_records_the_session() {
     assert_eq!(request["messages"][0]["role"], "system");
     assert_eq!(request["messages"][1]["content"], "hi");
     assert!(
-        request["tools"].as_array().is_some_and(|t| t.len() == 9),
-        "九个工具：read/write/edit/bash/grep/glob/lsp/db_query/task"
+        request["tools"].as_array().is_some_and(|t| t.len() == 8),
+        "八个工具：read/write/edit/bash/grep/glob/lsp/task"
     );
 
     let entries = session_entries(&home);

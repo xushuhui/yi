@@ -351,16 +351,6 @@ fn handle_command(line: &str, agent: &mut Agent, cfg: &Config) {
                 Err(err) => println!("{err}\n"),
             }
         }
-        "/db" => {
-            if argument.is_empty() {
-                print_db(agent);
-            } else {
-                match agent.set_db_profile(argument) {
-                    Ok(()) => println!("数据库 profile → {argument}\n"),
-                    Err(err) => println!("{err}\n"),
-                }
-            }
-        }
         "/effort" => match config::parse_effort(argument) {
             Ok(level) => {
                 if let Err(err) = agent.set_effort(level.clone()) {
@@ -402,45 +392,6 @@ fn handle_command(line: &str, agent: &mut Agent, cfg: &Config) {
     }
 }
 
-/// `/db` 不带参数：把配置路径、当前 profile 和可选项一次说清。
-fn print_db(agent: &Agent) {
-    match agent.db_shared() {
-        Some(name) => println!("数据库配置：共享 {name}（{}）", agent.db_path().display()),
-        None => println!("数据库配置：项目自带（{}）", agent.db_path().display()),
-    }
-    let Some(config) = agent.db() else {
-        println!(
-            "（还没有）写一份，密码放环境变量 MYSQL_PWD：\n{{\n  \"default\": \"dev\",\n  \"profiles\": {{\n    \"dev\": {{ \"host\": \"127.0.0.1\", \"user\": \"root\", \"database\": \"demo\" }}\n  }}\n}}\n"
-        );
-        return;
-    };
-    let chosen = agent.db_profile();
-    match yi::db::resolve(config, chosen) {
-        Ok((name, profile)) => {
-            let password = profile.password_env.as_deref().unwrap_or("MYSQL_PWD");
-            let mark = if chosen.is_none() { "（默认）" } else { "" };
-            println!(
-                "当前：{name}{mark} → {}:{}/{}，用户 {}，密码取 {password}",
-                profile.host, profile.port, profile.database, profile.user
-            );
-        }
-        Err(err) => println!("{err}"),
-    }
-    let names: Vec<String> = config
-        .profiles
-        .keys()
-        .map(|name| {
-            if name == &config.default {
-                format!("{name}（默认）")
-            } else {
-                name.clone()
-            }
-        })
-        .collect();
-    println!("可选：{}", names.join("、"));
-    println!("切换：/db <名字>\n");
-}
-
 fn print_help() {
     println!(
         "\
@@ -452,7 +403,6 @@ fn print_help() {
 斜杠命令：
   /new                      归档当前会话，开始新的一条
   /plan                     切换计划模式：只读调查，不改文件
-  /db [profile]             查看或切换数据库环境（dev / test / prod）
   /effort <档位>            设置推理强度：auto / low / high / max
   /switch <供应商>          切换供应商与模型：opencode-go / deepseek（记在会话里）
   /skill:<名字> [要求]      把某个技能的正文注入这一轮

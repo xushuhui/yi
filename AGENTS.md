@@ -1,6 +1,6 @@
 # Repository Guidelines
 
-`yi` 是单人使用的终端编程 agent：Rust 单二进制、单进程、行式界面，一个项目一条会话线。默认供应商 `opencode-go`（模型 `deepseek-v4.1-flash`），另一套是 DeepSeek 官方；九个工具（含只读子 agent 的 `task`）；不做记忆、多供应商抽象、更深层的子 agent、MCP、会话树、审批沙箱。
+`yi` 是单人使用的终端编程 agent：Rust 单二进制、单进程、行式界面，一个项目一条会话线。默认供应商 `opencode-go`（模型 `deepseek-v4.1-flash`），另一套是 DeepSeek 官方；八个工具（含只读子 agent 的 `task`）；不做记忆、多供应商抽象、更深层的子 agent、MCP、会话树、审批沙箱。
 
 模块职责、测试基建、运行环境等细节见 `docs/agents/codebase.md`，需要时再读。
 
@@ -15,7 +15,8 @@
 ## 硬约束
 
 - 不要调整 `Tools::definitions()` 里的工具顺序；不要随意给请求体加字段（前者破坏缓存，后者可能被供应商 400）。
-- 新增直接依赖要先问：上限 6 个，现在 6 个（`serde`、`serde_json`、`ureq`、`reedline`、`nu-ansi-term`、`libc`），已满；再加先换掉一个。
+- 新增直接依赖要先问：上限 6 个，现在 5 个（`serde`、`serde_json`、`ureq`、`reedline`、`libc`）。
+- 危险命令必须人确认：`rm`、`dd`、`mkfs`、`sudo`、`kill` 等（含 `mke2fs`、`newfs_*`、`diskutil eraseDisk`）走 `cancel::confirm`，30 秒超时、非终端一律拒绝；不要加跳过开关。
 - 生产代码不 panic：`unwrap` / `expect` / `panic!` 只允许出现在 `#[cfg(test)]` 与 `tests/`。
 - 改了 `prompts/*.md` 必须重新 `cargo build` / `cargo install`（两个提示词是 `include_str!` 内嵌的）。
 - 测试不改进程环境变量；每个用例必须用不同的会话路径，否则文件锁冲突。
@@ -33,7 +34,7 @@ cargo fmt
 cargo install --path . --root ~/.local --force --offline
 ```
 
-交付前至少跑四条：`cargo fmt`、`cargo clippy --all-targets`（零警告）、`cargo test`，最后 `cargo install --path . --root ~/.local --force --offline`——每次改完都装，别让常驻的 yi 跑旧二进制。
+交付前至少跑四条：`cargo fmt`、`cargo clippy --all-targets`（零警告）、`cargo test`，最后 `cargo install --path . --root ~/.local --force --offline`——每次改完都装，别让常驻的 yi 跑旧二进制。界面改动还要用 `scripts/tui.py` 在伪终端里真跑一遍（用法见 `docs/agents/codebase.md`），测试通过不算完成。
 
 ## 风格
 

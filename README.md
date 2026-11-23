@@ -55,7 +55,6 @@ cargo install --path .
 - **密钥不写进配置文件**，只从环境变量读：`opencode-go` 用 `OPENCODE_API_KEY`，`deepseek` 用 `DEEPSEEK_API_KEY`。配置文件里写了 `api_key` 会被忽略。
 - 语言服务器命令固定取 `PATH` 里的 `gopls` / `phpantom_lsp`，不写进配置文件。
 - `YI_HOME` 可覆盖数据目录（默认 `~/.yi`）。
-- 数据库连接按项目放在 `~/.yi/projects/<项目编码>/db.json`，里面用 profile 区分 dev / test / prod；密码只从环境变量读（默认 `MYSQL_PWD`，也可在 profile 里用 `password_env` 指定变量名），文件里写 `password` 会直接报错。
 - 代理只认这两个变量：`YI_PROXY_<供应商>`（如 `YI_PROXY_OPENCODE_GO`）优先，其次 `YI_PROXY`；通用 `HTTPS_PROXY` / `ALL_PROXY` 不读。本机与内网地址、`NO_PROXY` 命中的地址直连。`socks5://` 会直接报错，请写 `http://127.0.0.1:端口`。
 - 每个请求都会带 `User-Agent: yi/<版本>` 和 `x-opencode-session: <会话标识>`。后者是 opencode-go 的要求：缺了它接口直接返回 400 `MissingSessionID`；DeepSeek 官方会忽略它。
 
@@ -110,36 +109,10 @@ func main() { ... }
 | --- | --- |
 | `/new` | 把当前会话归档、开一条新的 |
 | `/plan` | 切换计划模式：工作树只读，模型会先查清事实、信息不足时向你提问，再给可执行的计划；再敲一次退出 |
-| `/db [profile]` | 不带参数：显示数据库配置路径、当前环境和可选环境；带参数：切换环境（记在会话里） |
 | `/effort <档位>` | 切换推理强度：`auto`、`low`、`high`、`max` |
 | `/switch <供应商>` | 换供应商与模型：`opencode-go`、`deepseek`；记在本会话，重开仍然生效 |
 | `/skill:<名字> [要求]` | 手动调用某个技能，把它的正文注入这一轮 |
 | `/help` | 显示命令、环境变量和配置字段 |
-
-### 数据库：一个项目一份，按环境切
-
-配置在 `~/.yi/projects/<项目编码>/db.json`，不进你的工作仓库：
-
-```json
-{
-  "default": "dev",
-  "profiles": {
-    "dev":  { "host": "127.0.0.1", "user": "fm", "database": "fm_dev" },
-    "test": { "host": "10.0.0.8", "port": 3307, "user": "fm", "database": "fm_test",
-              "password_env": "MYSQL_PWD_FM_TEST" }
-  }
-}
-```
-
-`/db` 看当前连哪、有哪些可选；`/db test` 切过去，重启 yi 仍然记得。模型只能看到当前 profile，换环境由人决定。
-
-多个项目共用一个库时，把上面这份配置放到 `~/.yi/db/fm.json`，各项目的 `db.json` 只写一行：
-
-```json
-{ "use": "fm" }
-```
-
-引用只允许一层（共享文件里不能再写 `use`），`/db` 会显示「共享 fm」和实际路径。
 
 ### 一个项目一条会话
 
@@ -166,21 +139,33 @@ func main() { ... }
 
 ## 工具
 
-模型只拿到九个工具。所有路径都相对项目根（启动目录）。
+模型只拿到八个工具。所有路径都相对项目根（启动目录）。
 
 | 工具 | 做什么 |
 | --- | --- |
 | `read` | 读文本文件（带行号和内容校验锚点），或列目录一层；也接受图片路径（png/jpg/jpeg/webp/gif，≤ 20 MB），图片直接作为输入发给模型 |
 | `write` | 新建或覆盖文件，自动创建父目录 |
 | `edit` | 按行号打补丁，只能改这次会话里真正读过的行 |
-| `bash` | 在项目根执行 shell 命令（可用 `cwd` 换目录），返回合并后的输出尾部，默认 300 秒超时；`cmd &` 起的后台进程不会拖住返回；带 `background: true` 时命令丢后台立刻返回，跑完的输出在下一轮对话开始时自动带上（同时最多 3 条，退出 yi 时一起杀掉） |
+| `bash` | 危险命令（`rm`、`dd`、`mkfs`/`mke2fs`/`newfs_*`、`diskutil eraseDisk`、`sudo`、`kill` 等）执行前要按 `y` 确认，30 秒不答算拒绝；没有可交互终端时直接拒绝。其余同下：在项目根执行 shell 命令（可用 `cwd` 换目录），返回合并后的输出尾部，默认 300 秒超时；`cmd &` 起的后台进程不会拖住返回；带 `background: true` 时命令丢后台立刻返回，跑完的输出在下一轮对话开始时自动带上（同时最多 3 条，退出 yi 时一起杀掉） |
 | `grep` | 正则搜内容，返回 `文件:行号:内容`；底层是 `rg`，固定跳过 `node_modules`、`target`、`vendor` |
 | `glob` | 按文件名通配查找；底层是 `rg --files`，遵守 `.gitignore`，同样固定跳过 `node_modules`、`target`、`vendor` |
 | `lsp` | 查 Go/PHP 的跳定义、找引用 |
 | `task` | 派一个只读子 agent 做独立调查或评审：它有自己的上下文、看不到当前对话，只返回最终回答；同轮的多个 `task` 并行执行（最多 4 个），子 agent 不能再派 |
-| `db_query` | 对 MySQL 跑只读查询（`SELECT` / `SHOW` / `DESCRIBE` / `EXPLAIN` / `WITH … SELECT`），结果按制表符分隔、最多 200 行；连哪个库由本项目的配置文件和当前 profile 决定，密码取自环境变量。写操作工具层直接拒，改数据请用 `bash` |
 
 一轮对话不限制总步数：只要每次调用有变化就继续做，长任务不会被步数掐断。但如果同一个调用（工具名和参数完全相同）连续失败 3 次，会停止调用工具，让模型说明现状后再结束——这是唯一会自动中断的情况。
+
+### 危险命令：执行前停下来问你
+
+`bash` 命中危险清单时，状态行会擦掉并换成：
+
+```
+允许执行危险命令？rm -rf build [y/N]
+```
+
+- 只有 `y` / `Y` 放行；其它键、Ctrl-C、30 秒没回答都算拒绝，命令不执行，模型收到一条 `ERROR:`；
+- 管道的标准输入不是终端，没法按 `y`，所以危险命令一律拒绝；
+- 清单是固定的：删除、覆盖、关机、提权、`find -delete`、`xargs rm`；`git` 与重定向 `>` 不在里面，`git` 仍按你消息里的明确授权走；
+- 这是护栏不是沙箱：`bash -c 'rm …'`、别名、脚本文件绕得过去。
 
 ### 子 agent：给评审一个干净上下文
 
@@ -239,7 +224,7 @@ cargo fmt
 
 - `src/agent.rs` 是核心：一轮对话的循环、工具分发、压缩。
 - `src/provider.rs` 是 DeepSeek 的流式 HTTP/SSE 客户端。
-- `src/tools.rs` 是九个工具的实现；`src/lsp.rs` 是语言服务器客户端。
+- `src/tools.rs` 是八个工具的实现；`src/lsp.rs` 是语言服务器客户端。
 - `src/session.rs` 负责 JSONL 会话文件的追加与重建。
 - 第一期规格与验收用例在 [.scratch/yi-phase-1/spec.md](.scratch/yi-phase-1/spec.md)。
 - 当初为什么这么设计、开发中踩过哪些坑，见 [docs/dev-notes.md](docs/dev-notes.md)。
