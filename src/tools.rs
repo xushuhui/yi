@@ -34,6 +34,10 @@ const GREP_TOTAL: usize = 200;
 /// 遍历时一律跳过的目录：依赖与构建产物，即使没写进 .gitignore 也不该被搜、被列。
 const SKIP_DIRS: [&str; 3] = ["node_modules", "target", "vendor"];
 const GREP_LINE_CHARS: usize = 512;
+/// 搜索结果的默认条数与单个摘要的字数上限：控制回灌给模型的长度。
+const SEARCH_DEFAULT_COUNT: u64 = 5;
+const SEARCH_MAX_COUNT: u64 = 10;
+const SEARCH_SUMMARY_CHARS: usize = 500;
 const GLOB_LIMIT: usize = 200;
 /// 危险命令的第一个词：命中就要人确认。git 不在这里，按全局规则由用户在消息里授权。
 const DANGEROUS_HEADS: [&str; 10] = [
@@ -60,6 +64,15 @@ pub struct Tools {
     lsp: Lsp,
     /// 计划模式：工作树只读。拦 write/edit，bash 只放行只读命令。
     plan: bool,
+    /// 搜索接口的可用状态：没配 key 时是 `None`，工具表里就不出现 `web_search`。
+    search: Option<Search>,
+}
+
+/// 搜索一次要用的东西：key、地址、以及复用的 HTTP 客户端。
+struct Search {
+    key: String,
+    url: String,
+    agent: ureq::Agent,
 }
 
 impl Tools {
@@ -77,16 +90,34 @@ impl Tools {
             log_seq: 0,
             lsp: Lsp::new(gopls, phpantom, rust_analyzer),
             plan: false,
+            search: None,
         }
+    }
+
+    /// 配上搜索接口；不调用就一直隐藏 `web_search`。
+    pub fn set_search(&mut self, key: String, url: String) {
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .user_agent(format!("yi/{}", env!("CARGO_PKG_VERSION")))
+            .timeout_connect(Some(Duration::from_secs(10)))
+            .timeout_per_read(Some(Duration::from_secs(20)))
+            .build()
+            .into();
+        self.search = Some(Search { key, url, agent });
+    }
+
+    pub fn search_enabled(&self) -> bool {
+        self.search.is_some()
     }
 
     pub fn set_plan(&mut self, plan: bool) {
         self.plan = plan;
     }
 
-    /// 七个工具的 JSON Schema。顺序固定，保证请求前缀稳定。
-    pub fn definitions() -> Value {
-        json!([
+    /// 工具表的 JSON Schema。顺序固定，保证请求前缀稳定。
+    /// `web_search` 取决于有没有搜索密钥，所以放在最后追加。
+    pub fn definitions(web_search: bool) -> Value {
+        let mut tools = json!([
             {
                 "type": "function",
                 "function": {
@@ -226,7 +257,31 @@ impl Tools {
                     }
                 }
             },
-        ])
+        ]);
+        if web_search && let Some(items) = tools.as_array_mut() {
+            items.push(json!({
+                "type": "function",
+                "function": {
+                    "name": "web_search",
+                    "description": "搜索互联网，返回标题、链接、日期和摘要。适合查最新的版本号、报错、文档；本地代码里的东西用 grep / read，不要用搜索。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "query": {
+                                "type": "string",
+                                "description": "搜索词，最多 128 字；支持 site:、-site:、after:、before:、lang: 和引号短语"
+                            },
+                            "count": {
+                                "type": "integer",
+                                "description": "返回几条，默认 5，最多 10"
+                            }
+                        },
+                        "required": ["query"]
+                    }
+                }
+            }));
+        }
+        tools
     }
 
     /// 一行人类可读的调用摘要，用于终端回显。
@@ -266,6 +321,7 @@ impl Tools {
             // bash 只给命令本身，界面会加上 `$` 前缀；不截断，长命令照原样显示。
             "bash" => self.strip_redundant_cd(&pick("command")),
             "grep" => format!("grep {}", pick("pattern")),
+            "web_search" => format!("web_search {}", pick("query")),
             "glob" => format!("glob {}", pick("pattern")),
             "lsp" => format!("lsp {} {}", pick("action"), pick("path")),
             // task 优先显示标签；没给就用任务第一行，太长会撑坏状态行。
@@ -303,7 +359,7 @@ impl Tools {
 
     /// 子 agent 能看到的工具定义：只读集合，没有 write / edit / task。
     pub fn subagent_definitions() -> Value {
-        let all = Self::definitions();
+        let all = Self::definitions(false);
         let keep = ["read", "grep", "glob", "lsp", "bash"];
         let picked: Vec<Value> = all
             .as_array()
@@ -340,6 +396,7 @@ impl Tools {
             "bash" => self.bash(&args, on),
             "grep" => self.grep(&args),
             "glob" => self.glob(&args),
+            "web_search" => self.web_search(&args),
             "lsp" => return Outcome::Text(self.lsp_call(&args)),
             other => format!("ERROR: 未知工具 {other}"),
         };
@@ -1156,6 +1213,70 @@ impl Tools {
         }
     }
 
+    /// 搜索：调 DeepSeek 官方的 `/v1/tools/search`，把结果压成固定几行。
+    ///
+    /// 只回标题、链接、日期和一段摘要；正文（`content`）不在这里带回来，
+    /// 一次搜索的代价按次算，不按条数算。
+    fn web_search(&self, args: &Value) -> String {
+        let Some(search) = self.search.as_ref() else {
+            return "ERROR: 没有配置 DEEPSEEK_API_KEY，web_search 不可用".to_string();
+        };
+        let Some(query) = args
+            .get("query")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|query| !query.is_empty())
+        else {
+            return "ERROR: 缺少 query".to_string();
+        };
+        let chars = query.chars().count();
+        if chars > 128 {
+            return format!("ERROR: query 有 {chars} 字，上限 128 字");
+        }
+        let count = match args.get("count").and_then(Value::as_u64) {
+            None => SEARCH_DEFAULT_COUNT,
+            Some(count) if (1..=SEARCH_MAX_COUNT).contains(&count) => count,
+            Some(count) => {
+                return format!("ERROR: count 必须是 1 到 {SEARCH_MAX_COUNT}，收到 {count}");
+            }
+        };
+
+        let body = json!({ "query": query, "count": count });
+        let sent = search
+            .agent
+            .post(&search.url)
+            .header("Authorization", &format!("Bearer {}", search.key))
+            .header("Content-Type", "application/json")
+            .send_json(&body);
+        let resp = match sent {
+            Ok(resp) => resp,
+            Err(err) => return format!("ERROR: 搜索请求失败：{err}"),
+        };
+        let code = resp.status().as_u16();
+        let text = resp
+            .into_body()
+            .read_to_string()
+            .unwrap_or_else(|_| String::new());
+        if !(200..300).contains(&code) {
+            return format!("ERROR: 搜索接口返回 HTTP {code}：{}", api_message(&text));
+        }
+        let parsed: Value = match serde_json::from_str(&text) {
+            Ok(value) => value,
+            Err(_) => {
+                return format!(
+                    "ERROR: 搜索接口返回的不是 JSON：{}",
+                    truncate_chars(&text, 200)
+                );
+            }
+        };
+        let no_results = Vec::new();
+        let results = parsed
+            .get("results")
+            .and_then(Value::as_array)
+            .unwrap_or(&no_results);
+        format_search_results(query, results)
+    }
+
     fn lsp_call(&mut self, args: &Value) -> String {
         let Some(action) = args.get("action").and_then(Value::as_str) else {
             return "ERROR: 缺少 action".to_string();
@@ -1545,6 +1666,69 @@ fn truncate_chars(text: &str, max: usize) -> String {
     let mut out: String = text.chars().take(max).collect();
     out.push('…');
     out
+}
+
+/// 搜索结果回灌给模型的固定格式：编号、标题（日期）、链接、摘要。
+fn format_search_results(query: &str, results: &[Value]) -> String {
+    if results.is_empty() {
+        return format!("没有找到结果（{query}）");
+    }
+    let mut out = format!("搜索 {query}：{} 条", results.len());
+    for (index, result) in results.iter().enumerate() {
+        let title = result.get("title").and_then(Value::as_str).unwrap_or("");
+        let url = result.get("url").and_then(Value::as_str).unwrap_or("");
+        // 只留日期部分：完整 RFC 3339 对模型没额外信息。
+        let date: String = result
+            .get("date")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .chars()
+            .take(10)
+            .collect();
+        let summary = result
+            .get("summary")
+            .and_then(Value::as_str)
+            .filter(|summary| !summary.trim().is_empty())
+            .or_else(|| result.get("snippet").and_then(Value::as_str))
+            .unwrap_or("");
+
+        let mut entry = format!("\n{}. {title}", index + 1);
+        if !date.is_empty() {
+            entry.push_str(&format!("（{date}）"));
+        }
+        entry.push_str(&format!("\n   {url}"));
+        let summary = flatten(summary, SEARCH_SUMMARY_CHARS);
+        if !summary.is_empty() {
+            entry.push_str(&format!("\n   {summary}"));
+        }
+        out.push_str(&entry);
+    }
+    out.trim_end().to_string()
+}
+
+/// 摘要里常有换行和连续空白：先压成一行再截断，保证一条结果占固定的几行。
+fn flatten(text: &str, limit: usize) -> String {
+    let mut flat = String::new();
+    for word in text.split_whitespace() {
+        if !flat.is_empty() {
+            flat.push(' ');
+        }
+        flat.push_str(word);
+    }
+    truncate_chars(&flat, limit)
+}
+
+/// 从错误响应里取出人话：优先 `error.message`，拿不到就回原文的前 200 字。
+fn api_message(text: &str) -> String {
+    let Ok(value) = serde_json::from_str::<Value>(text) else {
+        return truncate_chars(text.trim(), 200);
+    };
+    value
+        .get("error")
+        .and_then(|error| error.get("message"))
+        .and_then(Value::as_str)
+        .map(|message| truncate_chars(message, 200))
+        .unwrap_or_else(|| truncate_chars(text.trim(), 200))
 }
 
 /// 文件的换行风格：CRLF 占多数就用 CRLF，否则 LF。

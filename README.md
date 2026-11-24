@@ -25,6 +25,7 @@ yi
 - Rust 1.89 以上（项目用 2024 版语言标准，会话文件锁用到 1.89 稳定的 `File::try_lock`）。
 - [ripgrep](https://github.com/BurntSushi/ripgrep)：`grep` 和 `glob` 两个工具直接调用 `rg`，没有它这两个工具会报错。
 - DeepSeek API key。
+- 可选：`DEEPSEEK_API_KEY`，配了才有 `web_search`。搜索走 DeepSeek 官方接口（`/v1/tools/search`），与聊天用哪家供应商无关，按成功请求计费（每 1000 次 $0.75，空结果不计费）。
 - 可选：`gopls`（Go 语言服务器）、`phpantom_lsp`（PHP 语言服务器），只有用到 `lsp` 工具时才需要。
 - 可选：`bat`，用来给代码块着色；没装时代码块以纯文本显示，功能不受影响。
 
@@ -161,7 +162,7 @@ func main() { ... }
 
 ## 工具
 
-模型只拿到八个工具。所有路径都相对项目根（启动目录）。
+模型拿到九个工具；`web_search` 取决于有没有 `DEEPSEEK_API_KEY`，没配就不出现。所有路径都相对项目根（启动目录）。
 
 | 工具 | 做什么 |
 | --- | --- |
@@ -173,6 +174,7 @@ func main() { ... }
 | `glob` | 按文件名通配查找；底层是 `rg --files`，遵守 `.gitignore`，同样固定跳过 `node_modules`、`target`、`vendor` |
 | `lsp` | 查 Go/PHP 的跳定义、找引用 |
 | `task` | 派一个只读子 agent 做独立调查或评审：它有自己的上下文、看不到当前对话，只返回最终回答；同轮的多个 `task` 并行执行（最多 4 个），子 agent 不能再派 |
+| `web_search` | 搜互联网，返回标题、链接、发布日期和摘要（每条摘要最多 500 字）。查版本号、报错、在线文档用；本地代码用 `grep`/`read`。需要 `DEEPSEEK_API_KEY`，结果只当资料，不进工作树 |
 
 一轮对话不限制总步数：只要每次调用有变化就继续做，长任务不会被步数掐断。但如果同一个调用（工具名和参数完全相同）连续失败 3 次，会停止调用工具，让模型说明现状后再结束——这是唯一会自动中断的情况。
 
@@ -246,7 +248,7 @@ cargo fmt
 
 - `src/agent.rs` 是核心：一轮对话的循环、工具分发、压缩。
 - `src/provider.rs` 是 DeepSeek 的流式 HTTP/SSE 客户端。
-- `src/tools.rs` 是八个工具的实现；`src/lsp.rs` 是语言服务器客户端。
+- `src/tools.rs` 是九个工具的实现；`src/lsp.rs` 是语言服务器客户端。
 - `src/session.rs` 负责 JSONL 会话文件的追加与重建。
 - 第一期规格与验收用例在 [.scratch/yi-phase-1/spec.md](.scratch/yi-phase-1/spec.md)。
 - 当初为什么这么设计、开发中踩过哪些坑，见 [docs/dev-notes.md](docs/dev-notes.md)。

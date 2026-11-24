@@ -11,7 +11,7 @@
 | `src/agent.rs` | 一轮对话的编排：循环、工具分发、连续失败检测、压缩触发 |
 | `src/provider.rs` | OpenAI 兼容的 HTTP/SSE 客户端；请求体、重试、用量解析、`x-opencode-session` 头 |
 | `src/session.rs` | JSONL 会话：追加、上下文重建、压缩规划、中断修复、`/new` 归档 |
-| `src/tools.rs` | 八个工具与 JSON Schema；锚点快照、bash 日志与进程组；子 agent 的只读工具集 |
+| `src/tools.rs` | 九个工具与 JSON Schema；锚点快照、bash 日志与进程组；子 agent 的只读工具集 |
 | `src/config.rs` | 供应商预置、配置文件、密钥与代理、系统提示词组装 |
 | `src/render.rs` | 行式 markdown：标题/列表/引用/表格对齐、代码块交 `bat` |
 | `src/complete.rs` | 斜杠命令与技能名候选计算；菜单由 `input` 画，不做行内灰字 |

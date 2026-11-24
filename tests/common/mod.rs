@@ -177,11 +177,39 @@ pub fn config(port: u16, home: &Path, effort: Option<&str>) -> Config {
         // 假服务器在本机，走的是回环地址，代理本来就该被绕过。
         proxy: None,
         effort: effort.map(str::to_string),
+        search_key: None,
+        search_url: "http://127.0.0.1:9/v1/tools/search".to_string(),
         home: home.to_path_buf(),
         gopls: "gopls".to_string(),
         phpantom: "phpantom_lsp".to_string(),
         rust_analyzer: "rust-analyzer".to_string(),
     }
+}
+
+/// 配好搜索的配置：搜索地址指向同一个假服务器，方便用一段 JSON 顶替搜索结果。
+pub fn config_with_search(port: u16, home: &Path, search_port: u16) -> Config {
+    let mut cfg = config(port, home, None);
+    cfg.search_key = Some("search-key".to_string());
+    cfg.search_url = format!("http://127.0.0.1:{search_port}/v1/tools/search");
+    cfg
+}
+
+/// 一个普通的 JSON 响应，用来假装搜索接口（不是 SSE）。
+pub fn raw_json_response(body: &str) -> String {
+    format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    )
+}
+
+/// 一个指定状态码的 JSON 响应，用来测搜索接口报错。
+pub fn raw_json_status_response(status: u16, body: &str) -> String {
+    format!(
+        "HTTP/1.1 {status} Error\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    )
 }
 
 pub fn session_path(home: &Path) -> PathBuf {

@@ -1077,3 +1077,156 @@ fn grep_and_glob_skip_vendored_and_build_directories() {
     assert!(!glob_out.contains("target/"), "{glob_out}");
     assert!(!glob_out.contains("vendor/"), "{glob_out}");
 }
+
+fn open_agent_with_search(port: u16, home: &Path, workspace: &Path, search_port: u16) -> Agent {
+    Agent::new(
+        &config_with_search(port, home, search_port),
+        &workspace.to_string_lossy(),
+        &session_path(home),
+    )
+    .expect("打开会话")
+}
+
+fn tool_names(definitions: Value) -> Vec<String> {
+    definitions
+        .as_array()
+        .expect("工具表是数组")
+        .iter()
+        .map(|tool| {
+            tool["function"]["name"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect()
+}
+
+#[test]
+fn web_search_is_listed_only_when_a_key_exists() {
+    let without = tool_names(yi::tools::Tools::definitions(false));
+    let with = tool_names(yi::tools::Tools::definitions(true));
+    assert!(!without.iter().any(|name| name == "web_search"));
+    assert!(with.iter().any(|name| name == "web_search"));
+    // 顺序固定：搜索放最后，前面的工具位置不动。
+    assert_eq!(with.last().map(String::as_str), Some("web_search"));
+}
+
+#[test]
+fn web_search_formats_results_and_caps_the_summary() {
+    let home = temp_home("search-home");
+    let ws = temp_home("search-ws");
+    let long_summary = format!("第一句。{}", "细节".repeat(400));
+    let body = json!({
+        "results": [
+            {
+                "title": "Rust 1.89",
+                "url": "https://example.com/rust",
+                "date": "2026-08-01T12:00:00+00:00",
+                "summary": "稳定了 File::try_lock\n换行会被压成空格",
+                "snippet": "不该出现的备用摘要"
+            },
+            {
+                "title": "第二篇",
+                "url": "https://example.com/two",
+                "date": null,
+                "summary": long_summary
+            }
+        ]
+    })
+    .to_string();
+    let server = start_server(vec![
+        tool_response(&[("c1", "web_search", json!({"query": "rust 1.89"}))]),
+        raw_json_response(&body),
+        plain_response(&["ok"]),
+    ]);
+    let mut agent = open_agent_with_search(server.port, &home, &ws, server.port);
+    collect(&mut agent, "查一下");
+
+    let search_body = {
+        let bodies = server.bodies.lock();
+        bodies
+            .iter()
+            .find(|body| body.get("query").is_some())
+            .cloned()
+    }
+    .expect("假服务器要收到搜索请求");
+    assert_eq!(search_body["query"], "rust 1.89");
+    assert_eq!(search_body["count"], 5);
+
+    // 请求里确实带着 web_search：配置了密钥才会出现。
+    let chat_body = {
+        let bodies = server.bodies.lock();
+        bodies
+            .iter()
+            .find(|body| body.get("tools").is_some())
+            .cloned()
+    }
+    .expect("假服务器要收到聊天请求");
+    let names: Vec<&str> = chat_body["tools"]
+        .as_array()
+        .expect("tools 是数组")
+        .iter()
+        .filter_map(|tool| tool["function"]["name"].as_str())
+        .collect();
+    assert!(names.contains(&"web_search"), "{names:?}");
+
+    let out = last_tool_output(&home);
+    assert!(out.starts_with("搜索 rust 1.89：2 条"), "{out}");
+    assert!(out.contains("1. Rust 1.89（2026-08-01）"), "{out}");
+    assert!(out.contains("https://example.com/rust"), "{out}");
+    assert!(
+        out.contains("稳定了 File::try_lock 换行会被压成空格"),
+        "{out}"
+    );
+    assert!(!out.contains("不该出现的备用摘要"), "{out}");
+    assert!(out.contains("2. 第二篇"), "{out}");
+    assert!(!out.contains("\n\n"), "结果之间不要空行：{out}");
+
+    let summary = out
+        .lines()
+        .find(|line| line.trim_start().starts_with("第一句"))
+        .expect("第二条的摘要要在");
+    let summary = summary.trim();
+    assert!(
+        summary.chars().count() <= 501,
+        "摘要截断失效：{}",
+        summary.chars().count()
+    );
+    assert!(summary.ends_with('…'), "{summary}");
+}
+
+#[test]
+fn web_search_returns_api_errors_as_tool_text() {
+    let home = temp_home("search-err-home");
+    let ws = temp_home("search-err-ws");
+    let body = json!({
+        "error": {"message": "insufficient balance", "type": "invalid_request_error"}
+    })
+    .to_string();
+    let server = start_server(vec![
+        tool_response(&[("c1", "web_search", json!({"query": "anything"}))]),
+        raw_json_status_response(402, &body),
+        plain_response(&["ok"]),
+    ]);
+    let mut agent = open_agent_with_search(server.port, &home, &ws, server.port);
+    collect(&mut agent, "搜一下");
+
+    let out = last_tool_output(&home);
+    assert!(out.starts_with("ERROR: 搜索接口返回 HTTP 402"), "{out}");
+    assert!(out.contains("insufficient balance"), "{out}");
+}
+
+#[test]
+fn web_search_rejects_a_count_out_of_range_without_a_request() {
+    let home = temp_home("search-count-home");
+    let ws = temp_home("search-count-ws");
+    let server = start_server(vec![
+        tool_response(&[("c1", "web_search", json!({"query": "x", "count": 99}))]),
+        plain_response(&["ok"]),
+    ]);
+    let mut agent = open_agent_with_search(server.port, &home, &ws, server.port);
+    collect(&mut agent, "搜一下");
+
+    let out = last_tool_output(&home);
+    assert!(out.starts_with("ERROR: count 必须是 1 到 10"), "{out}");
+}

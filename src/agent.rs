@@ -93,6 +93,9 @@ impl Agent {
             cfg.rust_analyzer.clone(),
         );
         tools.set_plan(plan);
+        if let Some(key) = cfg.search_key.clone() {
+            tools.set_search(key, cfg.search_url.clone());
+        }
         Ok(Agent {
             provider: Provider::new(cfg, &session_id),
             session,
@@ -248,7 +251,7 @@ impl Agent {
                     .append_notice(&format!("图片没放进会话：{err}"));
             }
         }
-        let definitions = Tools::definitions();
+        let definitions = Tools::definitions(self.tools.search_enabled());
         let mut total = Usage::default();
 
         // 同一个「工具名 + 参数」连续失败计数；成功一次或换了调用就清零。

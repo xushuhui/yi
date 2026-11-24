@@ -1,6 +1,6 @@
 # Repository Guidelines
 
-`yi` 是单人使用的终端编程 agent：Rust 单二进制、单进程、行式界面，一个项目一条会话线。默认供应商 `opencode-go`（模型 `deepseek-v4.1-flash`），另一套是 DeepSeek 官方；八个工具（含只读子 agent 的 `task`）；不做记忆、多供应商抽象、更深层的子 agent、MCP、会话树、审批沙箱。
+`yi` 是单人使用的终端编程 agent：Rust 单二进制、单进程、行式界面，一个项目一条会话线。默认供应商 `opencode-go`（模型 `deepseek-v4.1-flash`），另一套是 DeepSeek 官方；九个工具（含只读子 agent 的 `task`、按密钥出现的 `web_search`）；不做记忆、多供应商抽象、更深层的子 agent、MCP、会话树、审批沙箱。
 
 模块职责、测试基建、运行环境等细节见 `docs/agents/codebase.md`，需要时再读。
 

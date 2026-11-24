@@ -26,6 +26,9 @@ pub struct Preset {
     pub env_key: &'static str,
 }
 
+/// DeepSeek 官方的搜索接口：和聊天用的是同一把 key，按次计费。
+pub const SEARCH_URL: &str = "https://api.deepseek.com/v1/tools/search";
+
 pub const PRESETS: [Preset; 2] = [
     Preset {
         id: "opencode-go",
@@ -76,6 +79,11 @@ pub struct Config {
     /// `None` = `auto`，请求里不发送 `reasoning_effort`。
     pub effort: Option<String>,
     pub home: PathBuf,
+    /// 搜索用的密钥：固定读 `DEEPSEEK_API_KEY`，与聊天走哪家供应商无关。
+    /// `None` 表示没配，`web_search` 不会进工具表。
+    pub search_key: Option<String>,
+    /// 搜索接口地址；固定指向 DeepSeek 官方，测试里换成假服务器。
+    pub search_url: String,
     /// 语言服务器命令：固定取 PATH 里的同名程序，不从配置文件读；保留字段只为测试能换成假服务器。
     pub gopls: String,
     pub phpantom: String,
@@ -116,6 +124,8 @@ impl Config {
             context_window: chosen.context_window,
             proxy: None,
             effort: None,
+            search_key: None,
+            search_url: SEARCH_URL.to_string(),
             home: home.clone(),
             gopls: "gopls".to_string(),
             phpantom: "phpantom_lsp".to_string(),
@@ -133,6 +143,12 @@ impl Config {
             )));
         }
         cfg.api_key = key.trim().to_string();
+
+        // 搜索密钥与聊天供应商解耦：聊天走 opencode-go 时也可能配了 DeepSeek 的 key。
+        cfg.search_key = std::env::var("DEEPSEEK_API_KEY")
+            .ok()
+            .map(|key| key.trim().to_string())
+            .filter(|key| !key.is_empty());
 
         Ok(cfg)
     }
@@ -403,6 +419,8 @@ mod tests {
             context_window: 1_048_576,
             proxy: None,
             effort: None,
+            search_key: None,
+            search_url: SEARCH_URL.to_string(),
             home: PathBuf::from("/tmp"),
             gopls: "gopls".into(),
             phpantom: "phpantom_lsp".into(),
@@ -447,6 +465,8 @@ mod tests {
             context_window: 1_048_576,
             proxy: None,
             effort: None,
+            search_key: None,
+            search_url: SEARCH_URL.to_string(),
             home: PathBuf::from("/tmp"),
             gopls: "gopls".into(),
             phpantom: "phpantom_lsp".into(),
@@ -477,6 +497,8 @@ mod tests {
             context_window: 1_048_576,
             proxy: None,
             effort: None,
+            search_key: None,
+            search_url: SEARCH_URL.to_string(),
             home: PathBuf::from("/tmp"),
             gopls: "gopls".into(),
             phpantom: "phpantom_lsp".into(),
@@ -564,6 +586,8 @@ mod tests {
             context_window: 1_048_576,
             proxy: None,
             effort: None,
+            search_key: None,
+            search_url: SEARCH_URL.to_string(),
             home: home.to_path_buf(),
             gopls: "gopls".into(),
             phpantom: "phpantom_lsp".into(),

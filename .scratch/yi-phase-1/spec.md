@@ -119,7 +119,7 @@ Status: ready-for-agent
 
 ### 工具
 
-八个工具，输入都是扁平 JSON 对象。返回值对模型可见，长度统一截断为 2,000 行或 50 KB（先到者为准）。
+九个工具，输入都是扁平 JSON 对象（`web_search` 只在配了 `DEEPSEEK_API_KEY` 时出现）。返回值对模型可见，长度统一截断为 2,000 行或 50 KB（先到者为准）。
 
 **`read { path, offset?, limit? }`**
 - 文本：返回头部 `[相对路径#TAG]`，随后每行 `行号:内容`。`TAG` 是文件内容摘要的 4 位大写十六进制。默认 300 行，单次上限 3,000 行；没读完时在末尾给一行「共 N 行，用 offset=X 继续读」。
@@ -172,6 +172,14 @@ Status: ready-for-agent
 - 同一轮多个 `task` 并行，最多 4 个；结果按行数（400）与字节（16 KB）截断。
 - 不建子会话；中间过程写到会话目录 `logs/task-<调用 id>.log`，写失败不影响结果。
 - 子 agent 最多 30 步；取消标志在每次请求前检查。
+
+**`web_search { query, count? }`**
+- 调 DeepSeek 官方 `POST https://api.deepseek.com/v1/tools/search`，Bearer 认证用 `DEEPSEEK_API_KEY`；与聊天走哪家供应商无关。
+- `query` 必填，1–128 字；支持 `site:`、`-site:`、`lang:`、`after:`、`before:`、引号短语与 `-` 排除。`count` 默认 5，范围 1–10，越界直接回 `ERROR:` 且不发请求。
+- 输出固定几行：`搜索 <query>：N 条`，随后每条 `编号. 标题（YYYY-MM-DD）`、缩进两格的 URL、缩进两格的摘要；摘要取 `summary`，为空时退回 `snippet`，压成一行并截到 500 字（超出以 `…` 结尾）。
+- 0 条结果回 `没有找到结果（<query>）`；HTTP 非 2xx 回 `ERROR: 搜索接口返回 HTTP <码>：<error.message>`；网络失败回 `ERROR: 搜索请求失败：…`；均不中断循环。
+- 不带 `content`（正文），一次请求按次计费；不缓存、不重试。
+- 没配密钥时不出现在工具表；计划模式放行（只读网络）。
 
 ### 终端界面
 
@@ -251,6 +259,7 @@ Status: ready-for-agent
 13. `/switch deepseek`（`DEEPSEEK_API_KEY` 已设）→ 会话追加 `model_change`，横幅与页脚变成 DeepSeek；重开同一目录仍是 DeepSeek。`DEEPSEEK_API_KEY` 未设 → 打印缺密钥、会话里不追加条目。
 14. 一轮里两个 `task` 调用 → 假服务器收到 4 次请求：父请求（含 `task` 工具定义）、两个子请求（各只有系统 + 一条任务，工具表没有 `task` / `write`）、父收尾（含两条 `[子 agent …]` 工具结果）。子 agent 若调用 `write`，工具结果以 `ERROR:` 开头且文件不存在。
 15. 管道里 `bash "rm x"` → 以 `ERROR:` 开头、文件还在；真终端里执行同一命令会先出现 `[y/N]`，按 `n` 文件还在，按 `y` 文件删除。
+16. 模型调 `web_search` → 假服务器收到 `POST` 与 `{"query":…,"count":5}` 的请求体；工具结果含 `搜索 …：2 条`、标题、日期、URL 与压成一行的摘要；摘要超过 500 字时以 `…` 结尾；接口返回 402 → 工具结果以 `ERROR:` 开头且循环继续；`count: 99` → 直接 `ERROR:`，假服务器收不到请求；没配 `DEEPSEEK_API_KEY` 时请求体里的工具表没有 `web_search`。
 
 LSP 另有独立用例：Go/PHP 各一条跳定义、嵌套目录里的找引用、中文路径下的定位与代码片段、带类型错误的诊断、服务器不回话时 15 秒超时、未知动作不启动服务器、配置文件里的 `gopls`/`phpantom` 被忽略。缺少服务器时用例打印 `SKIP` 并返回，不算失败。
 
@@ -261,7 +270,7 @@ LSP 另有独立用例：Go/PHP 各一条跳定义、嵌套目录里的找引用
 - 记忆与自学习、任何形式的跨会话知识沉淀。
 - 多供应商、多模型、模型角色划分。
 - 子 agent、并行任务、MCP、扩展与钩子系统。
-- `web_search`——属于第二期；`todo` 暂不做。
+- `web_search` 的网页正文抓取（`/v1/tools/fetch`）与图片搜索；`todo` 暂不做。
 - TypeScript 的 LSP：机器上没有独立服务器，按“不安装新 LSP”的决定不做。
 - 会话列表、分支、fork、会话树、跨项目恢复。
 - 从剪贴板直接粘贴图片数据（Ctrl+V）：现在只支持「整行是图片路径」或 `@路径` 提及，拖拽到终端产生的也是路径文本。
