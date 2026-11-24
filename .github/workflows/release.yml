@@ -1,0 +1,68 @@
+name: release
+
+# 打 v* 标签时编三份二进制，挂到同名的 GitHub Release 上。
+# 安装脚本 install.sh 从 releases/latest/download 取文件。
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # 显式写版本，不用 latest：latest 会随 GitHub 换镜像漂移。
+          - os: macos-15
+            target: aarch64-apple-darwin
+          # Intel 机器只有带 -intel 的标签；macos-13 已于 2025-12 下线。
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+          # 用 22.04 而不是 24.04：glibc 更老，装到旧发行版上也能跑。
+          # 22.04 已进入弃用期（2027-04 下线），到时再评估换 24.04。
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      # 镜像自带的 Rust 版本会随镜像更新漂移；这里先拉到当前 stable。
+      - name: Toolchain
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+      - name: Build
+        run: |
+          rustup target add "${{ matrix.target }}"
+          cargo build --release --locked --target "${{ matrix.target }}"
+      - name: Name the artifact
+        run: |
+          cp "target/${{ matrix.target }}/release/yi" "yi-${{ matrix.target }}"
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "yi-${{ matrix.target }}" > "yi-${{ matrix.target }}.sha256"
+          else
+            shasum -a 256 "yi-${{ matrix.target }}" > "yi-${{ matrix.target }}.sha256"
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: yi-${{ matrix.target }}
+          path: yi-${{ matrix.target }}*
+
+  publish:
+    needs: build
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Upload to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release view "$TAG" >/dev/null 2>&1 \
+            || gh release create "$TAG" --verify-tag --title "$TAG" --generate-notes
+          gh release upload "$TAG" dist/* --clobber

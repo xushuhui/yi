@@ -21,7 +21,7 @@ yi
 
 ## 环境要求
 
-- macOS 或 Linux。
+- macOS 或 Linux。Mac 上 Apple Silicon（M 系列）和 Intel（酷睿）都支持：没有预编译包，装的时候在本机编译，Intel 机器不需要 Rosetta；首次编译会久一些（`ring` 要编一份本机汇编）。
 - Rust 1.89 以上（项目用 2024 版语言标准，会话文件锁用到 1.89 稳定的 `File::try_lock`）。
 - [ripgrep](https://github.com/BurntSushi/ripgrep)：`grep` 和 `glob` 两个工具直接调用 `rg`，没有它这两个工具会报错。
 - DeepSeek API key。
@@ -30,6 +30,26 @@ yi
 
 ## 安装
 
+### 方式一：下载二进制（不需要 Rust）
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/xushuhui/yi/main/install.sh | sh
+```
+
+脚本按系统和架构挑文件（Darwin/Linux，arm64/x86_64），从 GitHub Releases 下载，校验 sha256，装进 `~/.local/bin/yi`，最后提示 `PATH` 和 `rg` 的事。
+
+可调的环境变量：
+
+- `YI_VERSION=v0.1.0`：装指定版本，默认 `latest`；
+- `YI_INSTALL_DIR=/usr/local/bin`：换安装目录（写这里可能要 `sudo`）；
+- `YI_BASE_URL=…`：换发布源（镜像或自建），目录结构与 GitHub Releases 一致。
+
+macOS 上 `curl` 下载不会像浏览器那样打 quarantine 标记，通常直接能跑；万一提示「无法验证开发者」，执行 `xattr -dr com.apple.quarantine ~/.local/bin/yi`。
+
+发布由标签触发：`git tag v0.1.0 && git push origin v0.1.0`。GitHub Actions 会编 `aarch64-apple-darwin`、`x86_64-apple-darwin`、`x86_64-unknown-linux-gnu` 三份，连同 `.sha256` 挂到 Release。
+
+### 方式二：从源码装（需要 Rust）
+
 ```sh
 git clone git@github.com:xushuhui/yi.git
 cd yi
@@ -37,6 +57,8 @@ cargo install --path .
 ```
 
 `cargo install` 会把可执行文件放到 `~/.cargo/bin/yi`；确认这个目录在 `PATH` 里。
+
+Intel Mac 用的是同一条命令：`rustup` 默认就装本机架构的 `x86_64-apple-darwin` 标准库，不需要额外的 target 或交叉编译参数。
 
 ## 配置
 
