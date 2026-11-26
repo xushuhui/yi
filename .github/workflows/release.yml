@@ -54,6 +54,10 @@ jobs:
     needs: build
     runs-on: ubuntu-22.04
     steps:
+      # gh release 需要在一个 git 仓库里跑（--generate-notes 会读提交历史），
+      # 这个 job 只下载产物、没有 checkout，少了这一步就是
+      # 「fatal: not a git repository」。
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           path: dist
