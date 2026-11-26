@@ -185,6 +185,16 @@ impl Agent {
         self.session.replay(turns)
     }
 
+    /// `/tree` 的数据：当前会话里的用户消息与它们在树里的位置。
+    pub fn tree(&self) -> Vec<crate::session::TreeNode> {
+        self.session.tree()
+    }
+
+    /// 回退到第 `ordinal` 条用户消息之前；返回那条消息的原文，供输入行预填。
+    pub fn rewind(&mut self, ordinal: usize) -> Result<String> {
+        self.session.rewind(ordinal)
+    }
+
     /// 会话是否被压缩过。
     pub fn compacted(&self) -> bool {
         self.session.compacted()

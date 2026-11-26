@@ -136,7 +136,9 @@ fn run() -> Result<()> {
                 }
             }
         } else if prompt.starts_with('/') {
-            handle_command(prompt, &mut agent, &cfg);
+            if let Some(text) = handle_command(prompt, &mut agent, &cfg) {
+                draft = text;
+            }
             continue;
         } else {
             prompt.to_string()
@@ -330,7 +332,7 @@ fn show_cursor() {
     }
 }
 
-fn handle_command(line: &str, agent: &mut Agent, cfg: &Config) {
+fn handle_command(line: &str, agent: &mut Agent, cfg: &Config) -> Option<String> {
     let mut parts = line.splitn(2, char::is_whitespace);
     let command = parts.next().unwrap_or("");
     let argument = parts.next().unwrap_or("").trim();
@@ -352,13 +354,10 @@ fn handle_command(line: &str, agent: &mut Agent, cfg: &Config) {
             }
         }
         "/effort" => match config::parse_effort(argument) {
-            Ok(level) => {
-                if let Err(err) = agent.set_effort(level.clone()) {
-                    println!("{err}\n");
-                    return;
-                }
-                println!("推理强度 → {}\n", level.as_deref().unwrap_or("auto"));
-            }
+            Ok(level) => match agent.set_effort(level.clone()) {
+                Ok(()) => println!("推理强度 → {}\n", level.as_deref().unwrap_or("auto")),
+                Err(err) => println!("{err}\n"),
+            },
             Err(err) => println!("{err}\n"),
         },
         "/switch" => {
@@ -370,11 +369,11 @@ fn handle_command(line: &str, agent: &mut Agent, cfg: &Config) {
                     agent.model_display(),
                     known.join(" / ")
                 );
-                return;
+                return None;
             }
             if argument == agent.provider_id() {
                 println!("已经是 {argument}\n");
-                return;
+                return None;
             }
             match cfg
                 .with_provider(argument)
@@ -388,8 +387,63 @@ fn handle_command(line: &str, agent: &mut Agent, cfg: &Config) {
                 Err(err) => println!("{err}\n"),
             }
         }
+        "/tree" => return tree_command(argument, agent),
         other => println!("未知命令 {other}；用 /help 查看\n"),
     }
+    None
+}
+
+/// `/tree`：不带参数列树；带序号回退到那条用户消息之前。
+fn tree_command(argument: &str, agent: &mut Agent) -> Option<String> {
+    if argument.is_empty() {
+        let nodes = agent.tree();
+        if nodes.is_empty() {
+            println!("会话里还没有用户消息。\n");
+            return None;
+        }
+        println!("会话树（● 当前路径 · ○ 其它分支 · ⑂ 分支点）：");
+        for node in &nodes {
+            let mark = if node.on_path { '●' } else { '○' };
+            let branch = if node.branch_point { '⑂' } else { ' ' };
+            let blocked = node
+                .blocked
+                .map(|reason| format!("（{reason}）"))
+                .unwrap_or_default();
+            println!(
+                "{:>3}  {mark}{branch} {}  {}{blocked}",
+                node.ordinal,
+                clock(node.timestamp),
+                node.preview
+            );
+        }
+        println!("/tree <序号> 回到那条消息之前；旧路径保留，可以再切回。\n");
+        return None;
+    }
+    let Ok(ordinal) = argument.parse::<usize>() else {
+        println!("序号要是数字，例如 /tree 3\n");
+        return None;
+    };
+    match agent.rewind(ordinal) {
+        Ok(text) => {
+            println!("已回到第 {ordinal} 条之前；原来的路径还在，/tree 可以切回。\n");
+            Some(text)
+        }
+        Err(err) => {
+            println!("{err}\n");
+            None
+        }
+    }
+}
+
+/// 毫秒时间戳 → 本地 `HH:MM`；取不到时给占位，不让列表断掉。
+fn clock(ms: u64) -> String {
+    let seconds = (ms / 1000) as libc::time_t;
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    let filled = unsafe { libc::localtime_r(&seconds, &mut tm) };
+    if filled.is_null() {
+        return "--:--".to_string();
+    }
+    format!("{:02}:{:02}", tm.tm_hour, tm.tm_min)
 }
 
 fn print_help() {
@@ -405,6 +459,7 @@ fn print_help() {
   /plan                     切换计划模式：只读调查，不改文件
   /effort <档位>            设置推理强度：auto / low / high / max
   /switch <供应商>          切换供应商与模型：opencode-go / deepseek（记在会话里）
+  /tree [序号]              查看会话岔路；带序号回到那条消息之前（旧路径保留）
   /skill:<名字> [要求]      把某个技能的正文注入这一轮
   /help                     显示这份帮助
 

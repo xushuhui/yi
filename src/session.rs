@@ -116,6 +116,14 @@ pub enum Entry {
         #[serde(rename = "tokensBefore")]
         tokens_before: u64,
     },
+    /// 回退到一个分支点：`to_seq` 是目标条目的序号（0 表示空会话）。
+    /// 它把「当前路径」切到旧分支上，文件本身不动。
+    Rewind {
+        seq: u64,
+        timestamp: u64,
+        #[serde(rename = "toSeq")]
+        to_seq: u64,
+    },
     /// 用户敲进终端的原文（技能展开前的样子），只用来做上键历史。
     Prompt {
         seq: u64,
@@ -138,6 +146,7 @@ impl Entry {
             | Entry::ModelChange { seq, .. }
             | Entry::PlanChange { seq, .. }
             | Entry::Compaction { seq, .. }
+            | Entry::Rewind { seq, .. }
             | Entry::Prompt { seq, .. }
             | Entry::Notice { seq, .. } => *seq,
         }
@@ -150,6 +159,22 @@ pub enum Replay {
     User(String),
     Assistant(String),
     Tool(ToolCall),
+}
+
+/// `/tree` 的一行：一条用户消息，以及它在树里的位置。
+#[derive(Clone, Debug)]
+pub struct TreeNode {
+    /// 给人看的编号，从 1 开始；`/tree <ordinal>` 用它。
+    pub ordinal: usize,
+    pub seq: u64,
+    pub timestamp: u64,
+    /// 首行前 60 字；回退时预填的是原文，不是这个。
+    pub preview: String,
+    pub on_path: bool,
+    /// 有两条以上子条目：从这里分出了岔路。
+    pub branch_point: bool,
+    /// 不能回退的原因（已压缩 / 跨压缩边界）。
+    pub blocked: Option<&'static str>,
 }
 
 /// 上键能翻多少条历史。
@@ -278,19 +303,15 @@ impl Session {
         if turns == 0 {
             return Vec::new();
         }
-        let mut boundary = 0;
-        if let Some(Entry::Compaction { first_kept_seq, .. }) = self
-            .entries
-            .iter()
-            .rev()
-            .find(|entry| matches!(entry, Entry::Compaction { .. }))
-        {
-            boundary = *first_kept_seq;
-        }
+        let boundary = self.boundary();
 
         let mut items = Vec::new();
         let mut typed = None;
-        for entry in self.entries.iter().filter(|entry| entry.seq() > boundary) {
+        for index in self.active_path() {
+            let entry = &self.entries[index];
+            if entry.seq() <= boundary {
+                continue;
+            }
             match entry {
                 Entry::Prompt { text, .. } => typed = Some(text.clone()),
                 Entry::Message { message, .. } => match message {
@@ -321,6 +342,7 @@ impl Session {
                 | Entry::ModelChange { .. }
                 | Entry::PlanChange { .. }
                 | Entry::Compaction { .. }
+                | Entry::Rewind { .. }
                 | Entry::Notice { .. } => {}
             }
         }
@@ -347,25 +369,206 @@ impl Session {
             .any(|entry| matches!(entry, Entry::Compaction { .. }))
     }
 
+    /// 最近一次压缩的保留起点；0 表示没压缩过。
+    fn boundary(&self) -> u64 {
+        self.entries
+            .iter()
+            .rev()
+            .find_map(|entry| match entry {
+                Entry::Compaction { first_kept_seq, .. } => Some(*first_kept_seq),
+                _ => None,
+            })
+            .unwrap_or(0)
+    }
+
+    /// 一条记录的父是谁：`rewind` 指向它切过去的分支点，其余都是前一条。
+    fn parent_seq(&self, index: usize) -> u64 {
+        if let Entry::Rewind { to_seq, .. } = &self.entries[index] {
+            return *to_seq;
+        }
+        if index == 0 {
+            0
+        } else {
+            self.entries[index - 1].seq()
+        }
+    }
+
+    /// 一条用户消息之前最近的那条用户消息；没有就回到 0。
+    ///
+    /// 中间夹着的 assistant、工具结果、prompt、rewind 都跳过——分支是从
+    /// 「上一句话」分出来的，不是从某条工具结果分出来的。
+    fn previous_user(&self, index: usize) -> u64 {
+        let mut parent = self.parent_seq(index);
+        let mut guard = 0;
+        while parent != 0 {
+            let Some(parent_index) = self.index_of(parent) else {
+                break;
+            };
+            match &self.entries[parent_index] {
+                Entry::Message {
+                    seq,
+                    message: Message::User { .. },
+                    ..
+                } => return *seq,
+                _ => parent = self.parent_seq(parent_index),
+            }
+            guard += 1;
+            if guard > self.entries.len() {
+                break;
+            }
+        }
+        0
+    }
+
+    fn index_of(&self, seq: u64) -> Option<usize> {
+        self.entries
+            .binary_search_by_key(&seq, |entry| entry.seq())
+            .ok()
+    }
+
+    /// 当前路径：从最后一条记录沿父链走到根，返回 root→leaf 的下标。
+    ///
+    /// 父链只往序号小的方向走，损坏的文件最多让路径提前结束，不会死循环。
+    pub fn active_path(&self) -> Vec<usize> {
+        let Some(mut index) = self.entries.len().checked_sub(1) else {
+            return Vec::new();
+        };
+        let mut path = Vec::new();
+        loop {
+            path.push(index);
+            let parent = self.parent_seq(index);
+            if parent == 0 {
+                break;
+            }
+            match self.index_of(parent) {
+                Some(next) if next < index => index = next,
+                _ => break,
+            }
+        }
+        path.reverse();
+        path
+    }
+
+    /// `/tree` 的一行：一条用户消息在树里的位置。
+    pub fn tree(&self) -> Vec<TreeNode> {
+        let boundary = self.boundary();
+        let on_path: HashSet<u64> = self
+            .active_path()
+            .into_iter()
+            .map(|index| self.entries[index].seq())
+            .collect();
+        // 同一个「上一句话」后面接了两条以上用户消息，那句话就是分叉点。
+        let mut branches: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
+        for index in 0..self.entries.len() {
+            if !matches!(
+                &self.entries[index],
+                Entry::Message {
+                    message: Message::User { .. },
+                    ..
+                }
+            ) {
+                continue;
+            }
+            *branches.entry(self.previous_user(index)).or_default() += 1;
+        }
+
+        let mut nodes = Vec::new();
+        for (index, entry) in self.entries.iter().enumerate() {
+            let Entry::Message {
+                seq,
+                timestamp,
+                message: Message::User { content },
+            } = entry
+            else {
+                continue;
+            };
+            // 后台作业的回灌不是人打的字，不进树。
+            if content.starts_with("[后台作业 ") {
+                continue;
+            }
+            let parent = self.parent_seq(index);
+            let blocked = if *seq <= boundary {
+                Some("已压缩")
+            } else if parent < boundary {
+                Some("跨压缩边界")
+            } else {
+                None
+            };
+            nodes.push(TreeNode {
+                ordinal: nodes.len() + 1,
+                seq: *seq,
+                timestamp: *timestamp,
+                preview: one_line(&self.raw_user_text(index, content), 60),
+                on_path: on_path.contains(seq),
+                branch_point: branches.get(seq).is_some_and(|count| *count >= 2),
+                blocked,
+            });
+        }
+        nodes
+    }
+
+    /// 回退到第 `ordinal` 条用户消息之前，返回它的原文（给输入行预填）。
+    ///
+    /// 只追加一条 `rewind`，旧分支原样留在文件里。
+    pub fn rewind(&mut self, ordinal: usize) -> Result<String> {
+        let nodes = self.tree();
+        let node = ordinal
+            .checked_sub(1)
+            .and_then(|index| nodes.get(index))
+            .ok_or_else(|| Error::Config(format!("没有第 {ordinal} 条；先敲 /tree 看编号")))?;
+        if let Some(reason) = node.blocked {
+            return Err(Error::Config(format!("第 {ordinal} 条不能回退：{reason}")));
+        }
+        let index = self
+            .index_of(node.seq)
+            .ok_or_else(|| Error::Config("会话文件里的序号对不上".to_string()))?;
+        let target = self.parent_seq(index);
+        if target != 0 && self.index_of(target).is_none() {
+            return Err(Error::Config("会话文件里的父链断了".to_string()));
+        }
+        let text = self.raw_user_text(
+            index,
+            match &self.entries[index] {
+                Entry::Message {
+                    message: Message::User { content },
+                    ..
+                } => content,
+                _ => "",
+            },
+        );
+        self.append(Entry::Rewind {
+            seq: self.next_seq,
+            timestamp: now_ms(),
+            to_seq: target,
+        })?;
+        Ok(text)
+    }
+
+    /// 用户消息对应的原文：技能调用那一轮取敲进终端的原文，其余取正文。
+    fn raw_user_text(&self, index: usize, content: &str) -> String {
+        if index > 0
+            && let Entry::Prompt { text, .. } = &self.entries[index - 1]
+        {
+            return text.clone();
+        }
+        content.to_string()
+    }
+
     pub fn context(&self) -> Context<'_> {
         let mut summary = None;
-        let mut boundary = 0u64;
-        if let Some(Entry::Compaction {
-            summary: text,
-            first_kept_seq,
-            ..
-        }) = self
+        let boundary = self.boundary();
+        if let Some(Entry::Compaction { summary: text, .. }) = self
             .entries
             .iter()
             .rev()
             .find(|entry| matches!(entry, Entry::Compaction { .. }))
         {
             summary = Some(text.as_str());
-            boundary = *first_kept_seq;
         }
         let messages: Vec<&Message> = self
-            .entries
-            .iter()
+            .active_path()
+            .into_iter()
+            .map(|index| &self.entries[index])
             .filter(|entry| entry.seq() > boundary)
             .filter_map(|entry| match entry {
                 Entry::Message { message, .. } => Some(message),
@@ -427,8 +630,9 @@ impl Session {
         let boundary = previous.as_ref().map(|(_, seq)| *seq).unwrap_or(0);
 
         let messages: Vec<&Entry> = self
-            .entries
-            .iter()
+            .active_path()
+            .into_iter()
+            .map(|index| &self.entries[index])
             .filter(|entry| entry.seq() > boundary && matches!(entry, Entry::Message { .. }))
             .collect();
         if messages.len() < 4 {
@@ -667,8 +871,8 @@ impl Session {
         // 缺的那几条可以在末尾补上（顺序仍然合法）。中途断开的交给 context() 丢弃。
         let mut answered: HashSet<String> = HashSet::new();
         let mut missing: Vec<String> = Vec::new();
-        for entry in self.entries.iter().rev() {
-            let Entry::Message { message, .. } = entry else {
+        for index in self.active_path().into_iter().rev() {
+            let Entry::Message { message, .. } = &self.entries[index] else {
                 continue;
             };
             match message {
@@ -707,6 +911,23 @@ impl Session {
         self.file.flush()?;
         Ok(())
     }
+}
+
+/// 把一段文字压成一行并截断，用于 `/tree` 的预览。
+fn one_line(text: &str, limit: usize) -> String {
+    let mut flat = String::new();
+    for word in text.split_whitespace() {
+        if !flat.is_empty() {
+            flat.push(' ');
+        }
+        flat.push_str(word);
+    }
+    if flat.chars().count() <= limit {
+        return flat;
+    }
+    let mut out: String = flat.chars().take(limit.saturating_sub(1)).collect();
+    out.push('…');
+    out
 }
 
 fn now_ms() -> u64 {
