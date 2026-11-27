@@ -7,18 +7,45 @@
 use std::io::Write;
 use std::process::{Command, Stdio};
 
-const RESET: &str = "\x1b[0m";
+pub const RESET: &str = "\x1b[0m";
 const BOLD: &str = "\x1b[1m";
-const DIM: &str = "\x1b[2m";
 const ITALIC: &str = "\x1b[3m";
-const RED: &str = "\x1b[31m";
-const CYAN: &str = "\x1b[36m";
-const YELLOW: &str = "\x1b[33m";
-const GREEN_BRIGHT: &str = "\x1b[92m";
+
+/// 一套语义色，值是真彩色转义序列。
+///
+/// 只写「标题用哪个色、错误用哪个色」，不写具体界面元素；换配色只改这里。
+/// 颜色值为 Dracula 的原始 RGB（与 omp 的 `dark-dracula` 主题一致）。
+#[derive(Clone, Copy)]
+pub struct Theme {
+    pub heading: &'static str,
+    pub marker: &'static str,
+    pub link: &'static str,
+    pub inline_code: &'static str,
+    /// 附注、引用条、状态行、工具成功行这类退到背景里的文字。
+    pub muted: &'static str,
+    /// 表格分隔线：比 muted 更暗，只用来画线。
+    pub rule: &'static str,
+    pub success: &'static str,
+    pub error: &'static str,
+    pub warning: &'static str,
+}
+
+pub const DRACULA: Theme = Theme {
+    heading: "\x1b[38;2;189;147;249m",     // #BD93F9 purple
+    marker: "\x1b[38;2;255;121;198m",      // #FF79C6 pink
+    link: "\x1b[38;2;139;233;253m",        // #8BE9FD cyan
+    inline_code: "\x1b[38;2;241;250;140m", // #F1FA8C yellow
+    muted: "\x1b[38;2;98;114;164m",        // #6272A4 comment
+    rule: "\x1b[38;2;68;71;90m",           // #44475A currentLine
+    success: "\x1b[38;2;80;250;123m",      // #50FA7B green
+    error: "\x1b[38;2;255;85;85m",         // #FF5555 red
+    warning: "\x1b[38;2;255;184;108m",     // #FFB86C orange
+};
 
 /// 终端够不够宽、能不能着色，由调用方判断一次，之后固定。
 pub struct Renderer {
     color: bool,
+    theme: Theme,
     use_bat: bool,
     /// 还没换行的半行。
     pending: String,
@@ -42,6 +69,7 @@ impl Renderer {
     pub fn with_highlighter(color: bool, use_bat: bool) -> Renderer {
         Renderer {
             color,
+            theme: DRACULA,
             use_bat,
             pending: String::new(),
             in_code: false,
@@ -136,13 +164,13 @@ impl Renderer {
             return String::new();
         }
         let rows = std::mem::take(&mut self.table);
-        render_table(&rows, self.color, self.width).unwrap_or_else(|| {
+        render_table(&rows, self.color, self.width, &self.theme).unwrap_or_else(|| {
             rows.iter()
                 .map(|row| {
                     if is_table_rule(row.trim_start()) {
-                        format!("{DIM}{row}{RESET}")
+                        format!("{}{row}{RESET}", self.theme.rule)
                     } else {
-                        inline(row, self.color)
+                        inline(row, self.color, &self.theme)
                     }
                 })
                 .collect::<Vec<_>>()
@@ -173,45 +201,54 @@ impl Renderer {
         // 标题：去掉井号，前两级上色。
         if let Some((level, text)) = heading(trimmed) {
             let style = if level <= 2 {
-                format!("{BOLD}{CYAN}")
+                format!("{BOLD}{}", self.theme.heading)
             } else {
                 BOLD.to_string()
             };
-            return Some(format!("{style}{}{RESET}", inline(text, self.color)));
+            return Some(format!(
+                "{style}{}{RESET}",
+                inline(text, self.color, &self.theme)
+            ));
         }
         // 分隔线：整行调暗。
         if is_rule(trimmed) {
-            return Some(format!("{DIM}{line}{RESET}"));
+            return Some(format!("{}{line}{RESET}", self.theme.muted));
         }
         // 单独出现的表格分隔行（没有表头的残片）同样调暗。
         if is_table_rule(trimmed) {
-            return Some(format!("{DIM}{line}{RESET}"));
+            return Some(format!("{}{line}{RESET}", self.theme.rule));
         }
         // 引用：把 `>` 换成竖线，只把竖线调暗。
         if let Some(rest) = trimmed.strip_prefix('>') {
             let indent = &line[..line.len() - trimmed.len()];
-            return Some(format!("{indent}{DIM}│{RESET}{}", inline(rest, self.color)));
+            return Some(format!(
+                "{indent}{}│{RESET}{}",
+                self.theme.muted,
+                inline(rest, self.color, &self.theme)
+            ));
         }
         // 列表：项目符号换成圆点。
         if let Some((indent, rest)) = bullet(line) {
             return Some(format!(
-                "{indent}{CYAN}•{RESET} {}",
-                inline(rest, self.color)
+                "{indent}{}•{RESET} {}",
+                self.theme.marker,
+                inline(rest, self.color, &self.theme)
             ));
         }
         // 有序列表：序号上色，内容照常。
         if let Some((indent, marker, rest)) = ordered(line) {
             return Some(format!(
-                "{indent}{CYAN}{marker}{RESET} {}",
-                inline(rest, self.color)
+                "{indent}{}{marker}{RESET} {}",
+                self.theme.marker,
+                inline(rest, self.color, &self.theme)
             ));
         }
-        Some(inline(line, self.color))
+        Some(inline(line, self.color, &self.theme))
     }
 
     fn code_header(&self, lang: &str) -> String {
         let label = if lang.is_empty() { "代码" } else { lang };
-        format!("{DIM}── {label} \u{2500}\u{2500}{RESET}")
+        format!("{}── {label} \u{2500}\u{2500}{RESET}", self.theme.muted)
     }
 
     fn code_block(&self, lang: &str, code: &str) -> String {
@@ -274,7 +311,7 @@ enum Align {
 }
 
 /// 把攒好的表格画成对齐的列；不成表或宽过终端就返回 `None`，由调用方原样吐回。
-fn render_table(rows: &[String], color: bool, width: usize) -> Option<String> {
+fn render_table(rows: &[String], color: bool, width: usize, theme: &Theme) -> Option<String> {
     if rows.len() < 2 || !is_table_rule(rows[1].trim_start()) {
         return None;
     }
@@ -299,7 +336,7 @@ fn render_table(rows: &[String], color: bool, width: usize) -> Option<String> {
             continue;
         }
         for (index, cell) in row.iter().enumerate() {
-            let text = inline(cell, color);
+            let text = inline(cell, color, theme);
             widths[index] = widths[index].max(display_width(&text));
         }
     }
@@ -323,7 +360,7 @@ fn render_table(rows: &[String], color: bool, width: usize) -> Option<String> {
         let wrapped: Vec<Vec<String>> = (0..columns)
             .map(|index| {
                 let raw = row.get(index).map(String::as_str).unwrap_or("");
-                wrap_cell(raw, widths[index], color)
+                wrap_cell(raw, widths[index], color, theme)
             })
             .collect();
         let height = wrapped.iter().map(Vec::len).max().unwrap_or(1);
@@ -337,7 +374,7 @@ fn render_table(rows: &[String], color: bool, width: usize) -> Option<String> {
                     .get(line_index)
                     .map(String::as_str)
                     .unwrap_or("");
-                let text = inline(raw, color);
+                let text = inline(raw, color, theme);
                 let used = display_width(&text);
                 line.push_str(&pad(&text, used, *width, aligns[index]));
             }
@@ -349,7 +386,7 @@ fn render_table(rows: &[String], color: bool, width: usize) -> Option<String> {
                 .map(|width| "\u{2500}".repeat(*width))
                 .collect::<Vec<_>>()
                 .join("  ");
-            out.push(format!("{DIM}{rule}{RESET}"));
+            out.push(format!("{}{rule}{RESET}", theme.rule));
         }
     }
     Some(out.join("\n"))
@@ -375,7 +412,7 @@ fn shrink_widths(natural: &[usize], room: usize) -> Vec<usize> {
 /// 按显示宽度折行，但不在行内标记（反引号、粗体）中间断开。
 ///
 /// 宽度按「去掉标记之后」算：`**粗体**` 在屏幕上只占粗体那两个字的宽度。
-fn wrap_cell(raw: &str, width: usize, color: bool) -> Vec<String> {
+fn wrap_cell(raw: &str, width: usize, color: bool, theme: &Theme) -> Vec<String> {
     if width == 0 {
         return vec![String::new()];
     }
@@ -383,7 +420,7 @@ fn wrap_cell(raw: &str, width: usize, color: bool) -> Vec<String> {
     let mut current = String::new();
     let mut used = 0usize;
     for token in markdown_tokens(raw) {
-        let token_width = display_width(&inline(&token, color));
+        let token_width = display_width(&inline(&token, color, theme));
         if used > 0 && used + token_width > width {
             lines.push(std::mem::take(&mut current));
             used = 0;
@@ -575,7 +612,7 @@ fn ordered(line: &str) -> Option<(&str, &str, &str)> {
 }
 
 /// 行内样式：`代码`、**粗体**、*斜体*、[文字](链接)。
-fn inline(text: &str, color: bool) -> String {
+fn inline(text: &str, color: bool, theme: &Theme) -> String {
     if !color {
         return text.to_string();
     }
@@ -588,7 +625,7 @@ fn inline(text: &str, color: bool) -> String {
             && let Some(end) = find(&chars, index + 1, &['`'])
         {
             let body: String = chars[index + 1..end].iter().collect();
-            out.push_str(&format!("{YELLOW}{body}{RESET}"));
+            out.push_str(&format!("{}{body}{RESET}", theme.inline_code));
             index = end + 1;
             continue;
         }
@@ -605,7 +642,7 @@ fn inline(text: &str, color: bool) -> String {
         {
             out.push_str(&body);
             if bold_target(&body) != target {
-                out.push_str(&format!("{DIM}（{target}）{RESET}"));
+                out.push_str(&format!("{}（{target}）{RESET}", theme.link));
             }
             index = next;
             continue;
@@ -688,15 +725,15 @@ fn highlight(code: &str, lang: &str) -> Option<String> {
 /// 命令本身的着色：命令词绿色、`-` 开头的参数青色、引号里的内容黄色、
 /// 管道和分号调暗。只用于显示，命令怎么执行完全不变。
 /// 一行淡淡的附注（例如「图片：/path」）。
-pub fn dim_line(text: &str, color: bool) -> String {
+pub fn dim_line(text: &str, color: bool, theme: &Theme) -> String {
     if color {
-        format!("{DIM}{text}{RESET}")
+        format!("{}{text}{RESET}", theme.muted)
     } else {
         text.to_string()
     }
 }
 
-pub fn shell_line(command: &str, color: bool) -> String {
+pub fn shell_line(command: &str, color: bool, theme: &Theme) -> String {
     if !color {
         return command.to_string();
     }
@@ -727,7 +764,7 @@ pub fn shell_line(command: &str, color: bool) -> String {
             continue;
         }
 
-        out.push_str(&color_shell_line(line));
+        out.push_str(&color_shell_line(line, theme));
         if had_newline {
             out.push('\n');
         }
@@ -744,7 +781,7 @@ pub fn shell_line(command: &str, color: bool) -> String {
 }
 
 /// 单行 shell 着色：命令词绿色、`-` 选项青色、引号内容黄色、`;`/`|` 调暗。
-fn color_shell_line(command: &str) -> String {
+fn color_shell_line(command: &str, theme: &Theme) -> String {
     let chars: Vec<char> = command.chars().collect();
     let mut out = String::new();
     let mut index = 0;
@@ -763,13 +800,13 @@ fn color_shell_line(command: &str) -> String {
                 end += 1;
             }
             let text: String = chars[index..(end + 1).min(chars.len())].iter().collect();
-            out.push_str(&format!("{YELLOW}{text}{RESET}"));
+            out.push_str(&format!("{}{text}{RESET}", theme.inline_code));
             index = end + 1;
             expect_command = false;
             continue;
         }
         if matches!(ch, ';' | '|' | '&') {
-            out.push_str(&format!("{DIM}{ch}{RESET}"));
+            out.push_str(&format!("{}{ch}{RESET}", theme.muted));
             expect_command = true;
             index += 1;
             continue;
@@ -783,10 +820,10 @@ fn color_shell_line(command: &str) -> String {
         }
         let word: String = chars[index..end].iter().collect();
         if expect_command && !word.contains('=') {
-            out.push_str(&format!("{GREEN_BRIGHT}{word}{RESET}"));
+            out.push_str(&format!("{}{word}{RESET}", theme.success));
             expect_command = false;
         } else if word.starts_with('-') {
-            out.push_str(&format!("{CYAN}{word}{RESET}"));
+            out.push_str(&format!("{}{word}{RESET}", theme.link));
         } else {
             out.push_str(&word);
         }
@@ -870,20 +907,20 @@ fn extension(ext: &str) -> Option<&'static str> {
 }
 
 /// 工具失败的一行提示：红色 `✗`、工具名、原因。成功不打印这一行。
-pub fn tool_line(name: &str, note: &str, color: bool) -> String {
+pub fn tool_line(name: &str, note: &str, color: bool, theme: &Theme) -> String {
     if !color {
         return format!("✗ {name} {note}");
     }
     let note = note.strip_prefix("ERROR: ").unwrap_or(note);
-    format!("{RED}✗ {name}{RESET} {note}")
+    format!("{}✗ {name}{RESET} {note}", theme.error)
 }
 
 /// 不算失败的一行提示：暗色工具名加说明，例如「bash 没有匹配（退出码 1）」。
-pub fn tool_note(name: &str, note: &str, color: bool) -> String {
+pub fn tool_note(name: &str, note: &str, color: bool, theme: &Theme) -> String {
     if !color {
         return format!("{name} {note}");
     }
-    format!("{DIM}{name}{RESET} {note}")
+    format!("{}{name}{RESET} {note}", theme.muted)
 }
 
 #[cfg(test)]
@@ -906,9 +943,12 @@ mod tests {
     fn headings_and_inline_styles_are_rendered() {
         let mut renderer = plain();
         let out = renderer.push("## 小结 和 `code` 与 **重点**\n");
-        assert!(out.contains(BOLD) && out.contains(CYAN), "{out}");
+        assert!(out.contains(BOLD) && out.contains(DRACULA.heading), "{out}");
         assert!(!out.contains("##"), "井号要去掉：{out}");
-        assert!(out.contains(&format!("{YELLOW}code{RESET}")), "{out}");
+        assert!(
+            out.contains(&format!("{}code{RESET}", DRACULA.inline_code)),
+            "{out}"
+        );
         assert!(out.contains(&format!("{BOLD}重点{RESET}")), "{out}");
     }
 
@@ -942,10 +982,14 @@ mod tests {
     #[test]
     fn lists_quotes_and_tables_get_styles() {
         let mut renderer = plain();
-        let out = renderer.push("- 第一条\n> 引用\n|---|---|\n");
+        let out = renderer.push("- 第一条\n> 引用\n");
         assert!(out.contains('•'), "{out}");
         assert!(out.contains('│'), "{out}");
-        assert!(out.contains(DIM), "表格分隔线要调暗：{out}");
+        assert!(out.contains(DRACULA.muted), "引用条要压暗：{out}");
+
+        // 表格要整块到齐才输出，用空行把它催出来。
+        let table = renderer.push("| a | b |\n|---|---|\n| 1 | 2 |\n\n");
+        assert!(table.contains(DRACULA.rule), "表格分隔线要调暗：{table}");
     }
 
     #[test]
@@ -1083,7 +1127,7 @@ mod tests {
     #[test]
     fn a_heredoc_body_is_kept_verbatim() {
         let command = "python3 - <<'PY'\nimport os\nprint('x')\nPY";
-        let out = shell_line(command, true);
+        let out = shell_line(command, true, &DRACULA);
         assert_eq!(strip_ansi(&out), command, "着色不能改动原文");
     }
 
@@ -1092,47 +1136,63 @@ mod tests {
         if !bat_available() {
             return;
         }
-        let out = shell_line("python3 - <<'PY'\nimport os\nPY", true);
+        let out = shell_line("python3 - <<'PY'\nimport os\nPY", true, &DRACULA);
         let body = out.split('\n').nth(1).unwrap_or("");
         assert!(body.contains('\x1b'), "正文应当有语法颜色：{body:?}");
     }
 
     #[test]
     fn an_unterminated_heredoc_still_prints_its_body() {
-        let out = shell_line("cat <<'EOF'\nhello", true);
+        let out = shell_line("cat <<'EOF'\nhello", true, &DRACULA);
         assert!(strip_ansi(&out).contains("hello"), "{out}");
     }
 
     #[test]
     fn shell_line_separates_command_flags_and_strings() {
-        let out = shell_line("git status --short; echo \"done\" | sed -n '1p'", true);
-        assert!(out.contains(&format!("{GREEN_BRIGHT}git{RESET}")), "{out}");
-        assert!(out.contains(&format!("{CYAN}--short{RESET}")), "{out}");
-        assert!(out.contains(&format!("{YELLOW}\"done\"{RESET}")), "{out}");
+        let out = shell_line(
+            "git status --short; echo \"done\" | sed -n '1p'",
+            true,
+            &DRACULA,
+        );
         assert!(
-            out.contains(&format!("{GREEN_BRIGHT}echo{RESET}")),
+            out.contains(&format!("{}git{RESET}", DRACULA.success)),
+            "{out}"
+        );
+        assert!(
+            out.contains(&format!("{}--short{RESET}", DRACULA.link)),
+            "{out}"
+        );
+        assert!(
+            out.contains(&format!("{}\"done\"{RESET}", DRACULA.inline_code)),
+            "{out}"
+        );
+        assert!(
+            out.contains(&format!("{}echo{RESET}", DRACULA.success)),
             "分号后是新命令：{out}"
         );
-        assert!(out.contains(&format!("{DIM};{RESET}")), "{out}");
+        assert!(out.contains(&format!("{};{RESET}", DRACULA.muted)), "{out}");
         // 关闭颜色时原样返回。
-        assert_eq!(shell_line("git status", false), "git status");
+        assert_eq!(shell_line("git status", false, &DRACULA), "git status");
     }
 
     #[test]
     fn a_tool_note_is_dim_and_carries_no_failure_mark() {
-        let line = tool_note("bash", "没有匹配（退出码 1）", true);
-        assert_eq!(line, format!("{DIM}bash{RESET} 没有匹配（退出码 1）"));
+        let line = tool_note("bash", "没有匹配（退出码 1）", true, &DRACULA);
+        assert_eq!(
+            line,
+            format!("{}bash{RESET} 没有匹配（退出码 1）", DRACULA.muted)
+        );
         assert!(!line.contains('✗'), "{line}");
         assert_eq!(
-            tool_note("bash", "没有匹配（退出码 1）", false),
+            tool_note("bash", "没有匹配（退出码 1）", false, &DRACULA),
             "bash 没有匹配（退出码 1）"
         );
     }
 
     #[test]
     fn a_tool_failure_gets_a_red_line() {
-        let line = tool_line("bash", "ERROR: 退出码 1", true);
-        assert!(line.contains(RED), "{line}");
+        let line = tool_line("bash", "ERROR: 退出码 1", true, &DRACULA);
+        assert!(line.contains(DRACULA.error), "{line}");
         assert!(!line.contains("ERROR: "), "去掉前缀只留原因：{line}");
     }
 }

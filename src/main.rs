@@ -59,6 +59,7 @@ fn run() -> Result<()> {
     let mut title = Title::new(io::stdout().is_terminal(), project);
     // 只在真终端里上色；管道输出、NO_COLOR 时保持原样。
     let color = io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
+    let theme = render::DRACULA;
     // 行编辑器只给真人用：标准输入是管道时一个字节都不加。
     let interactive = io::stdin().is_terminal();
     // 剪贴板图片落在数据目录里，不落 /tmp：会话只记路径，重启后还要能读到。
@@ -85,7 +86,7 @@ fn run() -> Result<()> {
     println!("输入 /help 查看命令，Ctrl-D 退出。\n");
     // 只给真人看：管道与重定向里保持逐字节稳定。
     if io::stdout().is_terminal() {
-        print_replay(&agent, color);
+        print_replay(&agent, color, &theme);
     }
 
     // 上一轮里敲的字：轮末取出来放回提示符，免得白打。
@@ -153,7 +154,7 @@ fn run() -> Result<()> {
                 Some(path) => images.insert(0, path),
                 None => println!(
                     "{}",
-                    render::dim_line("剪贴板里没有图片，这一轮只发文字", color)
+                    render::dim_line("剪贴板里没有图片，这一轮只发文字", color, &theme)
                 ),
             }
         }
@@ -164,7 +165,7 @@ fn run() -> Result<()> {
         for path in &images {
             println!(
                 "{}",
-                render::dim_line(&format!("图片：{}", path.display()), color)
+                render::dim_line(&format!("图片：{}", path.display()), color, &theme)
             );
         }
         // 干活期间藏光标：状态行原地刷新，光标停在行尾会被当成「又在等你输入」。
@@ -217,9 +218,9 @@ fn run() -> Result<()> {
                 print!("{half}");
                 let short: String = note.chars().take(160).collect();
                 if failed {
-                    println!("{}", render::tool_line(&name, &short, color));
+                    println!("{}", render::tool_line(&name, &short, color, &theme));
                 } else {
-                    println!("{}", render::tool_note(&name, &short, color));
+                    println!("{}", render::tool_note(&name, &short, color, &theme));
                 }
                 // 工具跑完必然是再一次模型往返。
                 status.set("等待模型");
@@ -254,15 +255,17 @@ fn run() -> Result<()> {
                 let branch = git_branch(&cwd);
                 println!(
                     "{}",
-                    footer(
-                        &usage,
-                        agent.window(),
-                        &short_project(&cwd),
-                        branch.as_deref(),
-                        agent.plan(),
-                        agent.provider_display(),
-                        agent.model_display(),
-                    )
+                    footer(Footer {
+                        usage: &usage,
+                        window: agent.window(),
+                        place: &short_project(&cwd),
+                        branch: branch.as_deref(),
+                        plan: agent.plan(),
+                        provider: agent.provider_display(),
+                        model: agent.model_display(),
+                        color,
+                        theme: &theme,
+                    })
                 );
                 println!();
             }
@@ -481,18 +484,18 @@ fn print_help() {
 /// 启动时把上次的对话放出来：最近三轮，最多两百行。
 ///
 /// 只放模型当前还记得的部分（压缩边界之后），免得它「忘了」屏幕上却还写着。
-fn print_replay(agent: &Agent, color: bool) {
+fn print_replay(agent: &Agent, color: bool, theme: &render::Theme) {
     use yi::session::Replay;
 
     let items = agent.replay(3);
     if items.is_empty() {
         return;
     }
-    println!("{}", render::dim_line("—— 上次的对话 ——", color));
+    println!("{}", render::dim_line("—— 上次的对话 ——", color, theme));
     if agent.compacted() {
         println!(
             "{}",
-            render::dim_line("早前对话已压缩，更早的内容不再显示", color)
+            render::dim_line("早前对话已压缩，更早的内容不再显示", color, theme)
         );
     }
 
@@ -517,7 +520,7 @@ fn print_replay(agent: &Agent, color: bool) {
     if keep_from > 0 {
         println!(
             "{}",
-            render::dim_line(&format!("（前面还有 {keep_from} 条没显示）"), color)
+            render::dim_line(&format!("（前面还有 {keep_from} 条没显示）"), color, theme)
         );
     }
 
@@ -543,15 +546,30 @@ fn print_replay(agent: &Agent, color: bool) {
 /// 页脚一行：项目、分支、上下文占比、供应商、模型。
 ///
 /// 缓存与本轮用量是内部数据，只写进会话文件，不占屏幕。
-fn footer(
-    usage: &Usage,
+struct Footer<'a> {
+    usage: &'a Usage,
     window: u64,
-    place: &str,
-    branch: Option<&str>,
+    place: &'a str,
+    branch: Option<&'a str>,
     plan: bool,
-    provider: &str,
-    model: &str,
-) -> String {
+    provider: &'a str,
+    model: &'a str,
+    color: bool,
+    theme: &'a render::Theme,
+}
+
+fn footer(f: Footer<'_>) -> String {
+    let Footer {
+        usage,
+        window,
+        place,
+        branch,
+        plan,
+        provider,
+        model,
+        color,
+        theme,
+    } = f;
     // 百分比用最后一次请求的输入量：那才是「上下文现在多大」。
     // 整轮累加的 prompt 会随步数增长，和多轮工具调用的实际上下文无关。
     let percent = usage.context_prompt * 100 / window.max(1);
@@ -563,7 +581,11 @@ fn footer(
     }
     // 计划模式是个持续状态，页脚常驻提示，免得忘了自己还在只读里。
     if plan {
-        out.push_str(" · plan");
+        if color {
+            out.push_str(&format!(" · {}plan{}", theme.warning, render::RESET));
+        } else {
+            out.push_str(" · plan");
+        }
     }
     // 缓存命中率按本轮累计的输入算：命中多少、未命中多少，一眼看得出前缀有没有被保住。
     let input = usage.cache_hit + usage.input_uncached;
@@ -706,6 +728,7 @@ struct Status {
     enabled: bool,
     /// 上色时整行压暗，避免和正文抢注意力。
     dim: bool,
+    theme: render::Theme,
     stage: Option<(String, std::time::Instant)>,
     /// 这一行现在是否真的画在屏幕上：擦之前得先知道有没有东西可擦。
     drawn: bool,
@@ -717,6 +740,7 @@ impl Status {
         Self {
             enabled,
             dim,
+            theme: render::DRACULA,
             stage: None,
             drawn: false,
             last_draw: std::time::Instant::now(),
@@ -780,6 +804,7 @@ impl Status {
                     self.dim,
                     &draft,
                     width,
+                    &self.theme,
                 )
             }
             None if draft.is_empty() => {
@@ -795,12 +820,12 @@ impl Status {
                 let width = render::terminal_width().unwrap_or(80);
                 let mut line = String::from("\r\x1b[K");
                 if self.dim {
-                    line.push_str("\x1b[2m");
+                    line.push_str(self.theme.muted);
                 }
                 line.push_str("> ");
                 line.push_str(&tail_cells(&draft, width.saturating_sub(3)));
                 if self.dim {
-                    line.push_str("\x1b[0m");
+                    line.push_str(render::RESET);
                 }
                 line
             }
@@ -816,11 +841,18 @@ impl Status {
 ///
 /// 行尾挂你轮内敲的草稿，随状态行一起重画；宽度不够时只留草稿的尾巴，
 /// 因为最新的字在最右边。
-fn status_line(label: &str, secs: f32, dim: bool, draft: &str, width: usize) -> String {
+fn status_line(
+    label: &str,
+    secs: f32,
+    dim: bool,
+    draft: &str,
+    width: usize,
+    theme: &render::Theme,
+) -> String {
     let head = format!("{label} {secs:.1}s");
     let mut out = String::from("\r\x1b[K");
     if dim {
-        out.push_str("\x1b[2m");
+        out.push_str(theme.muted);
     }
     out.push_str(&head);
     if !draft.is_empty() {
@@ -832,7 +864,7 @@ fn status_line(label: &str, secs: f32, dim: bool, draft: &str, width: usize) -> 
         }
     }
     if dim {
-        out.push_str("\x1b[0m");
+        out.push_str(render::RESET);
     }
     out
 }
@@ -886,22 +918,29 @@ mod tests {
 
     #[test]
     fn the_status_line_rewrites_itself_in_place() {
-        let plain = status_line("等待模型", 3.24, false, "", 80);
+        let plain = status_line("等待模型", 3.24, false, "", 80, &render::DRACULA);
         assert_eq!(plain, "\r\x1b[K等待模型 3.2s");
-        let dim = status_line("运行 bash", 12.46, true, "", 80);
-        assert_eq!(dim, "\r\x1b[K\x1b[2m运行 bash 12.5s\x1b[0m");
+        let dim = status_line("运行 bash", 12.46, true, "", 80, &render::DRACULA);
+        assert_eq!(
+            dim,
+            format!(
+                "\r\x1b[K{}运行 bash 12.5s{}",
+                render::DRACULA.muted,
+                render::RESET
+            )
+        );
     }
 
     #[test]
     fn the_status_line_carries_the_draft_you_typed() {
-        let line = status_line("等待模型", 3.2, false, "帮我看看这个", 80);
+        let line = status_line("等待模型", 3.2, false, "帮我看看这个", 80, &render::DRACULA);
         assert_eq!(line, "\r\x1b[K等待模型 3.2s · > 帮我看看这个");
     }
 
     #[test]
     fn a_long_draft_keeps_its_tail_because_that_is_where_you_type() {
         let draft = "一二三四五六七八九十".repeat(5);
-        let line = status_line("等待模型", 3.2, false, &draft, 30);
+        let line = status_line("等待模型", 3.2, false, &draft, 30, &render::DRACULA);
         assert!(render::display_width(&line) <= 30, "不超宽：{line:?}");
         assert!(line.ends_with("九十"), "保留最新的字：{line:?}");
         assert!(line.contains('…'), "截断要有省略号：{line:?}");
@@ -938,15 +977,17 @@ mod tests {
     #[test]
     fn footer_percent_uses_the_last_request_not_the_whole_turn() {
         // 这一轮累计输入 1,000,000，但最后一次请求只有窗口的一半。
-        let line = footer(
-            &usage(524_288, 500_000, 500_000),
-            1_048_576,
-            "~/gp/yi",
-            Some("main"),
-            false,
-            "OpenCode Go",
-            "DeepSeek V4.1 Flash",
-        );
+        let line = footer(Footer {
+            usage: &usage(524_288, 500_000, 500_000),
+            window: 1_048_576,
+            place: "~/gp/yi",
+            branch: Some("main"),
+            plan: false,
+            provider: "OpenCode Go",
+            model: "DeepSeek V4.1 Flash",
+            color: false,
+            theme: &render::DRACULA,
+        });
         assert_eq!(
             line,
             "[~/gp/yi main · 50% · 缓存 50% · OpenCode Go · DeepSeek V4.1 Flash]"
@@ -955,29 +996,33 @@ mod tests {
 
     #[test]
     fn footer_shows_the_cache_hit_rate_of_the_turn() {
-        let line = footer(
-            &usage(100, 9_000, 1_000),
-            1_048_576,
-            "~/gp/yi",
-            None,
-            false,
-            "DeepSeek",
-            "DeepSeek Flash",
-        );
+        let line = footer(Footer {
+            usage: &usage(100, 9_000, 1_000),
+            window: 1_048_576,
+            place: "~/gp/yi",
+            branch: None,
+            plan: false,
+            provider: "DeepSeek",
+            model: "DeepSeek Flash",
+            color: false,
+            theme: &render::DRACULA,
+        });
         assert!(line.contains("缓存 10%"), "命中 1000 / 输入 10000：{line}");
     }
 
     #[test]
     fn footer_omits_the_branch_when_there_is_none() {
-        let line = footer(
-            &usage(0, 0, 0),
-            1_048_576,
-            "~/gp/yi",
-            None,
-            false,
-            "DeepSeek",
-            "DeepSeek Flash",
-        );
+        let line = footer(Footer {
+            usage: &usage(0, 0, 0),
+            window: 1_048_576,
+            place: "~/gp/yi",
+            branch: None,
+            plan: false,
+            provider: "DeepSeek",
+            model: "DeepSeek Flash",
+            color: false,
+            theme: &render::DRACULA,
+        });
         assert_eq!(line, "[~/gp/yi · 0% · DeepSeek · DeepSeek Flash]");
     }
 
