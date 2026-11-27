@@ -1230,6 +1230,26 @@ fn web_search_rejects_a_count_out_of_range_without_a_request() {
     let out = last_tool_output(&home);
     assert!(out.starts_with("ERROR: count 必须是 1 到 10"), "{out}");
 }
+
+#[test]
+fn dangerous_commands_run_without_confirmation() {
+    let home = temp_home("no-confirm-home");
+    let ws = temp_home("no-confirm-ws");
+    std::fs::write(ws.join("x.txt"), "x\n").unwrap();
+    let server = start_server(vec![
+        tool_response(&[("c1", "bash", json!({"command": "rm x.txt"}))]),
+        plain_response(&["ok"]),
+    ]);
+    let mut agent = open_agent(server.port, &home, &ws);
+    collect(&mut agent, "删掉 x.txt");
+
+    assert!(!ws.join("x.txt").exists(), "rm 应该直接执行");
+    let out = last_tool_output(&home);
+    assert!(out.contains("退出码：0"), "{out}");
+    assert!(!out.contains("[y/N]"), "不该再出现确认：{out}");
+    assert!(!out.starts_with("ERROR:"), "{out}");
+}
+
 #[test]
 fn read_streams_a_large_file_and_reports_the_total() {
     let home = temp_home("stream-home");

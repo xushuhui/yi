@@ -7,7 +7,6 @@
 //! 中间，而按行缓冲又意味着不按回车就一个字节都拿不到。自己收字节，才能既立刻
 //! 拿到、又把回显交给状态行（`Status`）去画——草稿因此不会和正文打架。
 
-use std::io::Write;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -15,15 +14,6 @@ static CANCELLED: AtomicBool = AtomicBool::new(false);
 
 /// 轮内最多攒这么多字节：够写一句话，又不会被误按的粘贴撑爆。
 const MAX_DRAFT_BYTES: usize = 4000;
-
-/// 一次危险操作的确认结果。
-pub enum Approval {
-    Approved,
-    Denied,
-    Timeout,
-    /// 标准输入不是终端：没人能回答，按拒绝处理。
-    NoTerminal,
-}
 
 /// 本轮是否已被要求中断。
 pub fn requested() -> bool {
@@ -54,68 +44,6 @@ extern "C" fn handler(_signal: libc::c_int) {
 pub fn check() -> bool {
     poll_terminal();
     requested()
-}
-
-/// 危险命令执行前问一句 y/N。
-///
-/// 只认 `y` / `Y`；其它任何键都算拒绝。等够 `seconds` 秒没人回答也算拒绝。
-/// 状态行是原地重画的，先擦掉再画问题，免得两段文字叠在一起。
-pub fn confirm(question: &str, seconds: u64) -> Approval {
-    unsafe {
-        if libc::isatty(libc::STDIN_FILENO) != 1 {
-            return Approval::NoTerminal;
-        }
-    }
-    print!("\r\x1b[K{question} [y/N] ");
-    let _ = std::io::stdout().flush();
-
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(seconds);
-    loop {
-        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-        if remaining.is_zero() {
-            println!();
-            return Approval::Timeout;
-        }
-        let mut fd = libc::pollfd {
-            fd: libc::STDIN_FILENO,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        let timeout = remaining.as_millis().min(i32::MAX as u128) as i32;
-        let ready = unsafe { libc::poll(&mut fd, 1, timeout) };
-        if ready == 0 {
-            println!();
-            return Approval::Timeout;
-        }
-        if ready < 0 {
-            // 信号打断：Ctrl-C 的路径，按拒绝处理。
-            if requested() {
-                println!();
-                return Approval::Denied;
-            }
-            continue;
-        }
-        let mut byte = [0u8; 1];
-        let read = unsafe { libc::read(libc::STDIN_FILENO, byte.as_mut_ptr().cast(), 1) };
-        if read <= 0 {
-            continue;
-        }
-        return match byte[0] {
-            b'y' | b'Y' => {
-                println!();
-                Approval::Approved
-            }
-            0x03 => {
-                request();
-                println!();
-                Approval::Denied
-            }
-            _ => {
-                println!();
-                Approval::Denied
-            }
-        };
-    }
 }
 
 /// 轮内打的字，给状态行显示用。

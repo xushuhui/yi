@@ -16,7 +16,7 @@
 
 - 不要调整 `Tools::definitions()` 里的工具顺序；不要随意给请求体加字段（前者破坏缓存，后者可能被供应商 400）。
 - 新增直接依赖要先问：上限 6 个，现在 5 个（`serde`、`serde_json`、`ureq`、`reedline`、`libc`）。
-- 危险命令必须人确认：`rm`、`dd`、`mkfs`、`sudo`、`kill` 等（含 `mke2fs`、`newfs_*`、`diskutil eraseDisk`）走 `cancel::confirm`，30 秒超时、非终端一律拒绝；不要加跳过开关。
+- `bash` 不按命令名拦截（ADR-0016）：删除、提权之类的命令直接执行，没有 `[y/N]` 确认，也不要再加回来；计划模式的只读白名单保持不变。
 - 生产代码不 panic：`unwrap` / `expect` / `panic!` 只允许出现在 `#[cfg(test)]` 与 `tests/`。
 - 改了 `prompts/*.md` 必须重新 `cargo build` / `cargo install`（两个提示词是 `include_str!` 内嵌的）。
 - 测试不改进程环境变量；每个用例必须用不同的会话路径，否则文件锁冲突。

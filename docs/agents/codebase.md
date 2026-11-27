@@ -20,7 +20,7 @@
 | `src/program_status.rs` | OSC 7501 状态上报（Rex 标签页转圈与完成标记），只在真终端发 |
 | `src/lsp.rs` | `gopls` / `phpantom_lsp` / `rust-analyzer` 客户端，按（语言, 项目根）缓存并回收 |
 | `src/skills.rs` | 扫描 `SKILL.md`，生成提示词条目，展开 `/skill:` |
-| `src/cancel.rs` | 本轮取消标志（SIGINT + 终端 `0x03`）与危险命令的 y/N 确认 |
+| `src/cancel.rs` | 本轮取消标志（SIGINT + 终端 `0x03`）与轮内草稿 |
 | `src/crash.rs` | panic 钩子，把崩溃位置写成会话里的 `notice` |
 
 ## 数据流
