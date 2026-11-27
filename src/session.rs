@@ -206,10 +206,25 @@ impl Session {
             ))
         })?;
 
-        let text = std::fs::read_to_string(path)?;
-        let mut lines = text.lines().filter(|line| !line.trim().is_empty());
+        // 先扫一遍找最后一条压缩的边界：第二遍读到旧条目时可以立刻丢正文，
+        // 不必把整份会话（可能几十上百 MB）先读进内存。
+        let boundary = scan_boundary(path)?;
 
-        let Some(first) = lines.next() else {
+        use std::io::BufRead;
+        let file_reader = std::fs::File::open(path)?;
+        let mut lines = std::io::BufReader::new(file_reader).lines();
+
+        let mut first = None;
+        for line in &mut lines {
+            let line = line?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            first = Some(line);
+            break;
+        }
+
+        let Some(first) = first else {
             let header = Header {
                 kind: "session".to_string(),
                 version: 1,
@@ -230,19 +245,27 @@ impl Session {
             return Ok(session);
         };
 
-        let header: Header = serde_json::from_str(first)?;
+        let header: Header = serde_json::from_str(&first)?;
         let mut entries = Vec::new();
         for line in lines {
-            entries.push(serde_json::from_str::<Entry>(line)?);
+            let line = line?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let mut entry: Entry = serde_json::from_str(&line)?;
+            trim_entry(&mut entry, boundary);
+            entries.push(entry);
         }
         let next_seq = entries.iter().map(Entry::seq).max().unwrap_or(0) + 1;
-        Ok(Session {
+        let mut session = Session {
             path: path.to_path_buf(),
             file,
             header,
             entries,
             next_seq,
-        })
+        };
+        session.trim_compacted();
+        Ok(session)
     }
 
     /// 会话标识：第一次打开时生成，之后固定。发给供应商做路由与缓存亲和。
@@ -367,6 +390,20 @@ impl Session {
         self.entries
             .iter()
             .any(|entry| matches!(entry, Entry::Compaction { .. }))
+    }
+
+    /// 压缩之后丢掉边界之前的正文：历史仍留在文件里，但不再占内存。
+    ///
+    /// 用户消息和 prompt 原文保留——`/tree` 要用它们显示旧分支；
+    /// assistant 的正文、推理、工具调用和工具结果都清空，它们本来就不在上下文里。
+    fn trim_compacted(&mut self) {
+        let boundary = self.boundary();
+        if boundary == 0 {
+            return;
+        }
+        for entry in &mut self.entries {
+            trim_entry(entry, boundary);
+        }
     }
 
     /// 最近一次压缩的保留起点；0 表示没压缩过。
@@ -704,7 +741,9 @@ impl Session {
             summary,
             first_kept_seq,
             tokens_before,
-        })
+        })?;
+        self.trim_compacted();
+        Ok(())
     }
 
     pub fn append_user(&mut self, content: &str) -> Result<()> {
@@ -928,6 +967,59 @@ fn one_line(text: &str, limit: usize) -> String {
     let mut out: String = flat.chars().take(limit.saturating_sub(1)).collect();
     out.push('…');
     out
+}
+
+/// 扫一遍会话文件，取最后一条压缩的保留起点；没有压缩就是 0。
+///
+/// 只解析 `compaction` 那几行，别的行用子串判断跳过，不把整份历史反序列化两次。
+fn scan_boundary(path: &Path) -> Result<u64> {
+    use std::io::BufRead;
+    let file = std::fs::File::open(path)?;
+    let mut boundary = 0;
+    for line in std::io::BufReader::new(file).lines() {
+        let line = line?;
+        // 只解析疑似压缩的行：真实写入是紧凑 JSON，这里放宽到子串包含。
+        if !line.contains("compaction") {
+            continue;
+        }
+        if let Ok(Entry::Compaction { first_kept_seq, .. }) = serde_json::from_str::<Entry>(&line) {
+            boundary = boundary.max(first_kept_seq);
+        }
+    }
+    Ok(boundary)
+}
+
+/// 边界之前只留「谁说过什么」，正文、推理、工具调用与工具结果就地释放。
+fn trim_entry(entry: &mut Entry, boundary: u64) {
+    if boundary == 0 || entry.seq() > boundary {
+        return;
+    }
+    let Entry::Message { message, .. } = entry else {
+        return;
+    };
+    match message {
+        Message::User { .. } | Message::Image { .. } => {}
+        Message::Assistant {
+            content,
+            reasoning,
+            tool_calls,
+            usage,
+        } => {
+            if !content.is_empty() {
+                *content = String::new();
+            }
+            *reasoning = None;
+            if !tool_calls.is_empty() {
+                *tool_calls = Vec::new();
+            }
+            *usage = None;
+        }
+        Message::Tool { content, .. } => {
+            if !content.is_empty() {
+                *content = String::new();
+            }
+        }
+    }
 }
 
 fn now_ms() -> u64 {
@@ -1205,5 +1297,86 @@ mod tests {
         );
         assert!(answered(&ctx).is_empty(), "孤立的工具结果也要丢掉");
         assert_eq!(ctx.messages.len(), 2, "只留两句用户消息");
+    }
+
+    #[test]
+    fn compaction_drops_old_bodies_but_keeps_user_text() {
+        let dir = std::env::temp_dir().join(format!("yi-trim-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("session.jsonl");
+        let mut session = Session::open(&path, "/tmp", "m", "auto").expect("打开会话");
+        session.append_user("第一句").expect("用户");
+        session
+            .append_assistant(
+                "回答一".into(),
+                Some("推理".into()),
+                vec![call("a")],
+                Usage::default(),
+            )
+            .expect("助手");
+        session
+            .append_tool_result("a", "工具结果".into())
+            .expect("结果");
+        session.append_user("第二句").expect("用户");
+        session
+            .append_assistant("回答二".into(), None, Vec::new(), Usage::default())
+            .expect("助手");
+
+        // 保留从「第二句」开始；它之前的正文都该被清掉。
+        let second_user_seq = 4;
+        session
+            .append_compaction("摘要".into(), second_user_seq, 100)
+            .expect("压缩");
+
+        let trimmed: Vec<&Entry> = session
+            .entries
+            .iter()
+            .filter(|entry| entry.seq() <= second_user_seq)
+            .collect();
+        for entry in trimmed {
+            match entry {
+                Entry::Message {
+                    message:
+                        Message::Assistant {
+                            content,
+                            reasoning,
+                            tool_calls,
+                            usage,
+                            ..
+                        },
+                    ..
+                } => {
+                    assert!(content.is_empty(), "助手正文要释放");
+                    assert!(reasoning.is_none(), "推理要释放");
+                    assert!(tool_calls.is_empty(), "工具调用要释放");
+                    assert!(usage.is_none(), "用量要释放");
+                }
+                Entry::Message {
+                    message: Message::Tool { content, .. },
+                    ..
+                } => assert!(content.is_empty(), "工具结果要释放"),
+                Entry::Message {
+                    message: Message::User { content },
+                    ..
+                } => assert!(!content.is_empty(), "用户原文要保留给 /tree"),
+                _ => {}
+            }
+        }
+
+        // 边界之后的消息一个字都不能动。
+        let kept = session
+            .entries
+            .iter()
+            .find_map(|entry| match entry {
+                Entry::Message {
+                    seq,
+                    message: Message::Assistant { content, .. },
+                    ..
+                } if *seq > second_user_seq && seq != &0 => Some(content.clone()),
+                _ => None,
+            })
+            .expect("边界后的助手消息");
+        assert_eq!(kept, "回答二");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

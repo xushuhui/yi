@@ -1230,3 +1230,53 @@ fn web_search_rejects_a_count_out_of_range_without_a_request() {
     let out = last_tool_output(&home);
     assert!(out.starts_with("ERROR: count 必须是 1 到 10"), "{out}");
 }
+#[test]
+fn read_streams_a_large_file_and_reports_the_total() {
+    let home = temp_home("stream-home");
+    let ws = temp_home("stream-ws");
+    let mut text = String::new();
+    for i in 1..=50_000 {
+        text.push_str(&format!("line {i}\n"));
+    }
+    std::fs::write(ws.join("f.txt"), &text).unwrap();
+    let tag = tag_of_str(&text);
+    let server = start_server(vec![
+        tool_response(&[(
+            "c1",
+            "read",
+            json!({"path": "f.txt", "offset": 40000, "limit": 5}),
+        )]),
+        plain_response(&["ok"]),
+    ]);
+    let mut agent = open_agent(server.port, &home, &ws);
+    collect(&mut agent, "读中间一段");
+
+    let out = last_tool_output(&home);
+    assert!(out.starts_with(&format!("[f.txt#{tag}]")), "{out}");
+    assert!(out.contains("40000:line 40000"), "{out}");
+    assert!(out.contains("40004:line 40004"), "{out}");
+    assert!(
+        !out.contains("40005:line 40005"),
+        "limit 之外不该出现：{out}"
+    );
+    assert!(out.contains("共 50000 行"), "{out}");
+    assert!(out.contains("offset=40005"), "{out}");
+}
+
+#[test]
+fn read_keeps_crlf_out_of_the_displayed_rows() {
+    let home = temp_home("crlf-read-home");
+    let ws = temp_home("crlf-read-ws");
+    std::fs::write(ws.join("a.txt"), "one\r\ntwo\r\n").unwrap();
+    let tag = tag_of_str("one\r\ntwo\r\n");
+    let server = start_server(vec![
+        tool_response(&[("c1", "read", json!({"path": "a.txt"}))]),
+        plain_response(&["ok"]),
+    ]);
+    let mut agent = open_agent(server.port, &home, &ws);
+    collect(&mut agent, "读它");
+
+    let out = last_tool_output(&home);
+    assert!(out.starts_with(&format!("[a.txt#{tag}]")), "{out}");
+    assert!(out.contains("1:one\n2:two"), "显示时不带 \\r：{out:?}");
+}

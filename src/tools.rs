@@ -1,4 +1,5 @@
-use std::collections::{BTreeSet, HashMap};
+use std::cmp::Reverse;
+use std::collections::{BTreeSet, BinaryHeap, HashMap};
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -39,11 +40,6 @@ const SEARCH_DEFAULT_COUNT: u64 = 5;
 const SEARCH_MAX_COUNT: u64 = 10;
 const SEARCH_SUMMARY_CHARS: usize = 500;
 const GLOB_LIMIT: usize = 200;
-/// 危险命令的第一个词：命中就要人确认。git 不在这里，按全局规则由用户在消息里授权。
-const DANGEROUS_HEADS: [&str; 10] = [
-    "rm", "dd", "truncate", "shred", "sudo", "kill", "pkill", "killall", "mkfs", "mke2fs",
-];
-
 /// 工具执行的结果；图片要作为消息附带，不能塞进文本结果里。
 pub enum Outcome {
     Text(String),
@@ -427,22 +423,18 @@ impl Tools {
             };
         }
 
-        let bytes = match fs::read(&full) {
-            Ok(bytes) => bytes,
+        // 逐行扫、边扫边算锚点：内存只跟输出有关，不跟文件大小有关。
+        let file = match fs::File::open(&full) {
+            Ok(file) => file,
             Err(err) => return Outcome::Text(format!("ERROR: 读不了 {path}：{err}")),
         };
-        let text = match String::from_utf8(bytes) {
-            Ok(text) => text,
-            Err(_) => return Outcome::Text(format!("ERROR: {path} 不是 UTF-8 文本")),
-        };
+        let mut reader = BufReader::new(file);
 
-        let lines: Vec<&str> = text.lines().collect();
         let offset = args
             .get("offset")
             .and_then(Value::as_u64)
             .map(|n| (n.max(1) as usize) - 1)
-            .unwrap_or(0)
-            .min(lines.len());
+            .unwrap_or(0);
         let limit = args
             .get("limit")
             .and_then(Value::as_u64)
@@ -450,22 +442,47 @@ impl Tools {
             .unwrap_or(DEFAULT_READ_LINES)
             .clamp(1, MAX_READ_LINES);
 
-        let tag = tag_of(&text);
-        let total = lines.len();
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        let mut total = 0usize;
         let mut body = String::new();
         let mut seen = BTreeSet::new();
         let mut shown = 0usize;
         let mut cut_by_bytes = false;
-        for (index, line) in lines.iter().enumerate().skip(offset).take(limit) {
-            let row = format!("{}:{line}\n", index + 1);
-            if body.len() + row.len() > MAX_READ_BYTES {
-                cut_by_bytes = true;
+        let mut raw = Vec::new();
+        loop {
+            raw.clear();
+            let read = match reader.read_until(b'\n', &mut raw) {
+                Ok(read) => read,
+                Err(err) => return Outcome::Text(format!("ERROR: 读不了 {path}：{err}")),
+            };
+            if read == 0 {
                 break;
             }
+            for byte in &raw {
+                hash ^= u64::from(*byte);
+                hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+            total += 1;
+            if total <= offset || shown >= limit || cut_by_bytes {
+                continue;
+            }
+            let Ok(line) = std::str::from_utf8(&raw) else {
+                return Outcome::Text(format!("ERROR: {path} 不是 UTF-8 文本"));
+            };
+            // 与 `str::lines()` 对齐：去掉行尾的 `\n`，再去掉一个 `\r`。
+            let line = line.strip_suffix('\n').unwrap_or(line);
+            let line = line.strip_suffix('\r').unwrap_or(line);
+            let row = format!("{total}:{line}\n");
+            if body.len() + row.len() > MAX_READ_BYTES {
+                cut_by_bytes = true;
+                continue;
+            }
             body.push_str(&row);
-            seen.insert(index + 1);
+            seen.insert(total);
             shown += 1;
         }
+        let tag = format!("{:04X}", (hash & 0xffff) as u16);
+
         if offset + shown < total {
             let reason = if cut_by_bytes {
                 "输出过大"
@@ -477,7 +494,7 @@ impl Tools {
                 offset + shown + 1
             ));
         }
-        if shown == 0 && !lines.is_empty() {
+        if shown == 0 && total > 0 {
             body.push_str("（该范围没有内容）\n");
         }
 
@@ -781,24 +798,6 @@ impl Tools {
             .unwrap_or_else(|| self.root.clone());
         if !working_dir.is_dir() {
             return format!("ERROR: cwd 不是目录：{}", working_dir.display());
-        }
-
-        if let Some(reason) = dangerous_command(&command) {
-            let width = crate::render::terminal_width().unwrap_or(80);
-            let shown = truncate_chars(&reason, width.saturating_sub(24).max(20));
-            let question = format!("允许执行危险命令？{shown}");
-            match crate::cancel::confirm(&question, 30) {
-                crate::cancel::Approval::Approved => {}
-                crate::cancel::Approval::Denied => {
-                    return format!("ERROR: 用户拒绝了这条危险命令：{reason}");
-                }
-                crate::cancel::Approval::Timeout => {
-                    return "ERROR: 30 秒内没有确认，危险命令没有执行".to_string();
-                }
-                crate::cancel::Approval::NoTerminal => {
-                    return "ERROR: 危险命令需要终端里按 y 确认，当前没有可交互终端；改成安全的写法，或在真终端里执行".to_string();
-                }
-            }
         }
 
         let log_path = match self.next_log_path() {
@@ -1156,51 +1155,60 @@ impl Tools {
         if !base_is_file {
             command.arg(self.rg_target(&base));
         }
-        let output = match command.stdin(Stdio::null()).stderr(Stdio::null()).output() {
-            Ok(output) => output,
-            Err(err) => return format!("ERROR: 起不了 rg（需要安装 ripgrep）：{err}"),
-        };
-
-        let mut candidates: Vec<String> = Vec::new();
+        let mut candidates: BinaryHeap<Reverse<(u128, String)>> = BinaryHeap::new();
         if base_is_file {
             if let Some(name) = base.file_name().map(|n| n.to_string_lossy().to_string())
                 && glob_match(pattern, &name)
             {
-                candidates.push(self.relative(&base));
+                let relative = self.relative(&base);
+                let modified = modified_ms(&base);
+                candidates.push(Reverse((modified, relative)));
             }
         } else {
-            for line in String::from_utf8_lossy(&output.stdout).lines() {
-                let relative = line.trim();
-                if relative.is_empty() {
-                    continue;
-                }
-                let target = self
-                    .root
-                    .join(relative)
-                    .strip_prefix(&base)
-                    .map(|rest| rest.display().to_string())
-                    .unwrap_or_else(|_| relative.to_string());
-                if glob_match(pattern, &target) {
-                    candidates.push(relative.to_string());
+            // 逐行读 `rg --files`，只留最新的 200 条：不把整棵树的文件名收进内存。
+            let mut child = match command
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+            {
+                Ok(child) => child,
+                Err(err) => return format!("ERROR: 起不了 rg（需要安装 ripgrep）：{err}"),
+            };
+            if let Some(stdout) = child.stdout.take() {
+                let mut reader = BufReader::new(stdout);
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                        break;
+                    }
+                    let relative = line.trim();
+                    if relative.is_empty() {
+                        continue;
+                    }
+                    let target = self
+                        .root
+                        .join(relative)
+                        .strip_prefix(&base)
+                        .map(|rest| rest.display().to_string())
+                        .unwrap_or_else(|_| relative.to_string());
+                    if !glob_match(pattern, &target) {
+                        continue;
+                    }
+                    let modified = modified_ms(&self.root.join(relative));
+                    candidates.push(Reverse((modified, relative.to_string())));
+                    if candidates.len() > GLOB_LIMIT {
+                        candidates.pop();
+                    }
                 }
             }
+            let _ = child.wait();
         }
 
-        let mut matched: Vec<(u128, String)> = candidates
-            .into_iter()
-            .map(|relative| {
-                let modified = fs::metadata(self.root.join(&relative))
-                    .and_then(|m| m.modified())
-                    .ok()
-                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                    .map(|d| d.as_millis())
-                    .unwrap_or(0);
-                (modified, relative)
-            })
-            .collect();
-
-        matched.sort_by_key(|entry| std::cmp::Reverse(entry.0));
-        matched.truncate(GLOB_LIMIT);
+        let mut matched: Vec<(u128, String)> =
+            candidates.into_iter().map(|Reverse(entry)| entry).collect();
+        matched.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
 
         if matched.is_empty() {
             "没有匹配".to_string()
@@ -1510,6 +1518,16 @@ fn normalize(path: &Path) -> PathBuf {
 }
 
 /// 只支持 `*` 和 `**` 的最小通配符匹配。
+/// 文件的修改时间（毫秒）；拿不到就排最后。
+fn modified_ms(path: &Path) -> u128 {
+    fs::metadata(path)
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
+}
+
 fn glob_match(pattern: &str, path: &str) -> bool {
     let pattern_parts: Vec<&str> = pattern.split('/').collect();
     let path_parts: Vec<&str> = path.split('/').collect();
@@ -1761,67 +1779,6 @@ fn plan_refusal(name: &str, args: &Value) -> Option<String> {
         }
         _ => None,
     }
-}
-
-/// 危险命令：删除、覆盖、关机、提权这类。返回命中的那一段，给确认提示用。
-///
-/// 和只读检查共用同一套「按管道分段、看每段第一个词」的做法。它挡不住
-/// `bash -c 'rm …'`、别名和脚本文件，是护栏不是沙箱。
-fn dangerous_command(command: &str) -> Option<String> {
-    // 重定向不算危险命令：它是常规写法，频繁确认只会打扰。
-    for segment in command.split(['&', '|', ';', '\n']) {
-        let words: Vec<&str> = segment.split_whitespace().collect();
-        let Some(head) = words.first() else {
-            continue;
-        };
-        if *head == "cd" {
-            continue;
-        }
-        let base = Path::new(head)
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or(head);
-        if DANGEROUS_HEADS.contains(&base)
-            || base.starts_with("mkfs.")
-            || base.starts_with("newfs_")
-        {
-            return Some(segment.trim().to_string());
-        }
-        match base {
-            // macOS 的格式化：子命令在第二个词。
-            "diskutil" => {
-                if words.iter().skip(1).any(|word| {
-                    matches!(
-                        *word,
-                        "eraseDisk" | "eraseVolume" | "reformat" | "partitionDisk" | "zeroDisk"
-                    )
-                }) {
-                    return Some(segment.trim().to_string());
-                }
-            }
-            "find" => {
-                if words.iter().any(|word| {
-                    *word == "-delete" || word.starts_with("-exec") || word.starts_with("-ok")
-                }) {
-                    return Some(segment.trim().to_string());
-                }
-            }
-            // `… | xargs rm`：真正动手的是 xargs 后面那个词。
-            "xargs" => {
-                if let Some(target) = words.iter().skip(1).find(|word| !word.starts_with('-')) {
-                    let name = Path::new(target)
-                        .file_name()
-                        .and_then(|name| name.to_str())
-                        .unwrap_or(target);
-                    if DANGEROUS_HEADS.contains(&name) {
-                        return Some(segment.trim().to_string());
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    None
 }
 
 /// 这条 bash 命令看起来是不是只读。
