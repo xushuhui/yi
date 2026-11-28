@@ -97,8 +97,17 @@ pub fn kill_all() {
 mod tests {
     use super::*;
 
+    /// 作业表是进程级全局状态：这两条用例都会占用条目，必须串行跑，
+    /// 否则并行的「满员」用例会把另一条挤到「最多同时跑 3 条」。
+    static TABLE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn hold_table() -> std::sync::MutexGuard<'static, ()> {
+        TABLE.lock().unwrap_or_else(|err| err.into_inner())
+    }
+
     #[test]
     fn finished_jobs_are_handed_over_once() {
+        let _table = hold_table();
         let id = register("echo hi", 1).expect("登记成功");
         // 作业表是进程级全局状态，并行跑时别的用例也会交作业；只认自己这条。
         let early = take_finished();
@@ -114,6 +123,7 @@ mod tests {
 
     #[test]
     fn registration_stops_at_the_concurrency_limit() {
+        let _table = hold_table();
         let first = register("sleep 1", 2).expect("第一条");
         // 前面的用例可能留下作业，这里只验证「满员后拒绝」这条规则。
         let mut ids = vec![first];

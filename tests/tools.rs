@@ -13,12 +13,25 @@ use yi::agent::Agent;
 use yi::provider::Event;
 
 fn open_agent(port: u16, home: &Path, workspace: &Path) -> Agent {
-    Agent::new(
-        &config(port, home, None),
-        &workspace.to_string_lossy(),
-        &session_path(home),
-    )
-    .expect("打开会话")
+    // 同一个会话文件先 drop 再重开时，别的用例线程可能正在 spawn 子进程：
+    // 子进程在 fork 与 exec 之间会短暂继承会话文件的锁，这里就会拿到 WouldBlock。
+    // 真实进程每次启动只开一次会话，不会撞上；测试里等子进程 exec 完即可。
+    let mut last = String::new();
+    for _ in 0..1000 {
+        match Agent::new(
+            &config(port, home, None),
+            &workspace.to_string_lossy(),
+            &session_path(home),
+        ) {
+            Ok(agent) => return agent,
+            Err(err) if err.to_string().contains("已经有 yi 在运行") => {
+                last = err.to_string();
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            Err(err) => panic!("打开会话：{err}"),
+        }
+    }
+    panic!("打开会话：{last}")
 }
 
 fn tool_outputs(home: &Path) -> Vec<String> {
