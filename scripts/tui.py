@@ -8,9 +8,15 @@
 用法：
     scripts/tui.py --keys 'abc\\x1b[Z|d\\r'
     scripts/tui.py --keys '你好\\r' --reply '收到。' --shots 1
+    scripts/tui.py --keys '看看\\r' --tool 'read:{"path":"Cargo.toml","limit":3}' --reply '读完了'
+    scripts/tui.py --keys '一\\r|二\\r' --replies '答一|答二' --bg
+    scripts/tui.py --keys '开始\\r' --reply '第一段|第二段' --chunk-delay 0.2
 
 按键里的 `|` 是「停下来截一次屏」的位置；`\\r`、`\\n`、`\\t`、`\\x1b[Z`
 这些转义会被还原，中文原样发送。默认按当前目录、跑 ~/.local/bin/yi。
+
+`--tool` 可以重复：每个工具调用占一次请求，按给出的顺序消费，用完后才回文本。
+`--bg` 把屏幕上每一行的非默认底色按列区间打出来（验证消息底色带用）。
 
 依赖 pyte（把 ANSI 转义还原成二维屏幕）；没装会提示安装命令。
 """
@@ -56,50 +62,97 @@ def load_pyte():
     os.execve(python, [python, os.path.abspath(__file__), *sys.argv[1:]], env)
 
 
-def fake_llm(reply, port_holder):
-    """本地假装 OpenAI 兼容端点：流式回一句文本，附一份用量。"""
+def fake_llm(replies, tools, chunk_delay, port_holder):
+    """本地假装 OpenAI 兼容端点：先按顺序回工具调用，再按顺序回文本。
+
+    `tools` 是 `(名称, 参数字典)` 的队列，每次请求弹一个；`replies` 每次
+    文本请求用一条，用完就一直用最后一条。`chunk_delay > 0` 时把回复里的
+    `|` 当分段边界，段与段之间停一下，方便在流式中间按键（中断、底色重绘）。
+    """
     server = socket.socket()
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server.bind(("127.0.0.1", 0))
     server.listen(8)
     port_holder.append(server.getsockname()[1])
+    pending = {"tools": list(tools), "replies": list(replies), "index": 0}
+    lock = threading.Lock()
 
     def frame(obj):
         return ("data: " + json.dumps(obj, ensure_ascii=False) + "\n\n").encode()
 
-    body = (
-        b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n"
-        + frame({"choices": [{"index": 0, "delta": {"content": reply}}]})
-        + frame(
-            {
-                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-                "usage": {
-                    "prompt_tokens": 10,
-                    "completion_tokens": 1,
-                    "prompt_cache_hit_tokens": 0,
-                    "prompt_cache_miss_tokens": 10,
-                },
-            }
-        )
-        + b"data: [DONE]\n\n"
-    )
+    usage = {
+        "prompt_tokens": 10,
+        "completion_tokens": 1,
+        "prompt_cache_hit_tokens": 0,
+        "prompt_cache_miss_tokens": 10,
+    }
+
+    def next_response():
+        with lock:
+            index = pending["index"]
+            pending["index"] += 1
+            if pending["tools"]:
+                name, arguments = pending["tools"].pop(0)
+                call = {
+                    "index": 0,
+                    "id": f"call_{index}",
+                    "type": "function",
+                    "function": {"name": name, "arguments": json.dumps(arguments, ensure_ascii=False)},
+                }
+                return [
+                    frame({"choices": [{"index": 0, "delta": {"tool_calls": [call]}}]}),
+                    frame(
+                        {
+                            "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
+                            "usage": usage,
+                        }
+                    ),
+                ]
+            if pending["replies"]:
+                reply = pending["replies"].pop(0)
+            else:
+                reply = replies[-1]
+            parts = reply.split("|") if chunk_delay > 0 else [reply]
+            frames = [
+                frame({"choices": [{"index": 0, "delta": {"content": part}}]}) for part in parts
+            ]
+            frames.append(
+                frame(
+                    {
+                        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                        "usage": usage,
+                    }
+                )
+            )
+            return frames
 
     def handle(client):
-        data = b""
-        while b"\r\n\r\n" not in data:
-            chunk = client.recv(65536)
-            if not chunk:
-                return
-            data += chunk
-        head, rest = data.split(b"\r\n\r\n", 1)
-        length = 0
-        for line in head.split(b"\r\n"):
-            if line.lower().startswith(b"content-length:"):
-                length = int(line.split(b":", 1)[1])
-        while len(rest) < length:
-            rest += client.recv(65536)
-        client.sendall(body)
-        client.close()
+        try:
+            data = b""
+            while b"\r\n\r\n" not in data:
+                chunk = client.recv(65536)
+                if not chunk:
+                    return
+                data += chunk
+            head, rest = data.split(b"\r\n\r\n", 1)
+            length = 0
+            for line in head.split(b"\r\n"):
+                if line.lower().startswith(b"content-length:"):
+                    length = int(line.split(b":", 1)[1])
+            while len(rest) < length:
+                rest += client.recv(65536)
+            client.sendall(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n"
+            )
+            for part in next_response():
+                client.sendall(part)
+                if chunk_delay > 0:
+                    time.sleep(chunk_delay)
+            client.sendall(b"data: [DONE]\n\n")
+        except OSError:
+            return
+        finally:
+            client.close()
 
     while True:
         client, _ = server.accept()
@@ -136,7 +189,19 @@ def main():
     parser.add_argument("--bin", default=None, help="yi 可执行文件，默认 ~/.local/bin/yi")
     parser.add_argument("--cwd", default=".", help="工作目录")
     parser.add_argument("--keys", default="", help="要发送的按键；| 表示停一次截屏")
-    parser.add_argument("--reply", default="收到。", help="假模型返回的文本")
+    parser.add_argument("--reply", default="收到。", help="假模型返回的文本（默认这一条）")
+    parser.add_argument("--replies", default="", help="多轮回复，用 | 分隔；按请求顺序消费")
+    parser.add_argument(
+        "--tool",
+        action="append",
+        default=[],
+        metavar="名称:JSON",
+        help="先回一次工具调用，可重复；例如 read:{\"path\":\"Cargo.toml\"}",
+    )
+    parser.add_argument(
+        "--chunk-delay", type=float, default=0.0, help="流式分段间隔（秒）；回复里的 | 分段"
+    )
+    parser.add_argument("--bg", action="store_true", help="打印每行的非默认底色区间")
     parser.add_argument("--rows", type=int, default=24)
     parser.add_argument("--cols", type=int, default=100)
     parser.add_argument("--delay", type=float, default=0.8, help="每段按键后等多久")
@@ -152,9 +217,19 @@ def main():
             sys.exit(f"找不到 yi：{binary}")
         binary = found
 
+    replies = args.replies.split("|") if args.replies else [args.reply]
+    tools = []
+    for spec in args.tool:
+        name, _, raw = spec.partition(":")
+        try:
+            tools.append((name.strip(), json.loads(raw or "{}")))
+        except json.JSONDecodeError as err:
+            sys.exit(f"--tool 的 JSON 不合法：{spec}（{err}）")
     home = tempfile.mkdtemp(prefix="yi-tui-")
     port_holder = []
-    threading.Thread(target=fake_llm, args=(args.reply, port_holder), daemon=True).start()
+    threading.Thread(
+        target=fake_llm, args=(replies, tools, args.chunk_delay, port_holder), daemon=True
+    ).start()
     while not port_holder:
         time.sleep(0.01)
     with open(os.path.join(home, "config.json"), "w", encoding="utf-8") as fh:
@@ -198,11 +273,30 @@ def main():
             if "\x1b[6n" in text:
                 os.write(fd, f"\x1b[{screen.cursor.y + 1};{screen.cursor.x + 1}R".encode())
 
+    def background_runs():
+        """每行的非默认底色按列区间打印出来，验证色带是否铺满整行。"""
+        for y in range(args.rows):
+            row = screen.buffer[y]
+            runs = []
+            start = 0
+            current = row[0].bg
+            for x in range(1, args.cols):
+                if row[x].bg != current:
+                    runs.append((start, x - 1, current))
+                    start = x
+                    current = row[x].bg
+            runs.append((start, args.cols - 1, current))
+            visible = [f"{a}-{b}:{color}" for a, b, color in runs if color != "default"]
+            if visible:
+                print(f"{y:>2} bg {' '.join(visible)}")
+
     def show(tag):
         print(f"=== {tag}")
         for index, row in enumerate(screen.display):
             if row.strip():
                 print(f"{index:>2} |{row.rstrip()}")
+        if args.bg:
+            background_runs()
 
     try:
         pump(2.0)

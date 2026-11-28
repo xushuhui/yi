@@ -1,0 +1,25 @@
+name: ci
+
+# 每次推送和 PR 都跑仓库自己的检查脚本，与本地交付用同一套命令。
+# 只放 macOS：发布流水线已经覆盖 Linux 构建，但测试矩阵还没在 Linux 上
+# 验证过；先在 macOS 上把护栏立起来，不制造一条注定发红的流水线。
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      # 镜像自带的 Rust 会随镜像更新漂移；与发布流水线一样先拉到 stable。
+      - name: Toolchain
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+          rustup component add rustfmt clippy
+      - name: Check
+        run: scripts/check.sh

@@ -2,7 +2,7 @@
 
 `yi` 是单人使用的终端编程 agent：Rust 单二进制、单进程、行式界面，一个项目一条会话线。默认供应商 `opencode-go`（模型 `deepseek-v4.1-flash`），另一套是 DeepSeek 官方；九个工具（含只读子 agent 的 `task`、按密钥出现的 `web_search`）；不做记忆、多供应商抽象、更深层的子 agent、MCP、跨压缩边界的分支回退、审批沙箱。
 
-模块职责、测试基建、运行环境等细节见 `docs/agents/codebase.md`，需要时再读。
+模块职责、测试基建、运行环境等细节见 `docs/agents/codebase.md`；要对齐 omp 的界面或接口时看 `docs/agents/omp-internals.md`。
 
 ## 架构要点
 
@@ -14,8 +14,8 @@
 
 ## 硬约束
 
-- 不要调整 `Tools::definitions()` 里的工具顺序；不要随意给请求体加字段（前者破坏缓存，后者可能被供应商 400）。
-- 新增直接依赖要先问：上限 6 个，现在 5 个（`serde`、`serde_json`、`ureq`、`reedline`、`libc`）。
+- 不要调整 `Tools::definitions()` 里的工具顺序；不要随意给请求体加字段（前者破坏缓存，后者可能被供应商 400）。顺序由 `tests/repo_rules.rs` 锁定。
+- 新增直接依赖要先问：上限 6 个，现在 5 个（`serde`、`serde_json`、`ureq`、`reedline`、`libc`）；`tests/repo_rules.rs` 数 `[dependencies]` 卡住上限。
 - `bash` 不按命令名拦截（ADR-0016）：删除、提权之类的命令直接执行，没有 `[y/N]` 确认，也不要再加回来；计划模式的只读白名单保持不变。
 - 生产代码不 panic：`unwrap` / `expect` / `panic!` 只允许出现在 `#[cfg(test)]` 与 `tests/`。
 - 改了 `prompts/*.md` 必须重新 `cargo build` / `cargo install`（两个提示词是 `include_str!` 内嵌的）。
@@ -34,7 +34,7 @@ cargo fmt
 cargo install --path . --root ~/.local --force --offline
 ```
 
-交付前至少跑四条：`cargo fmt`、`cargo clippy --all-targets`（零警告）、`cargo test`，最后 `cargo install --path . --root ~/.local --force --offline`——每次改完都装，别让常驻的 yi 跑旧二进制。界面改动还要用 `scripts/tui.py` 在伪终端里真跑一遍（用法见 `docs/agents/codebase.md`），测试通过不算完成。
+交付前跑 `scripts/check.sh`：fmt → clippy（`-D warnings`，零警告）→ 全量测试，失败即非零退出；要装到 `~/.local` 就在后面加 `--install`（每次改完都装，别让常驻的 yi 跑旧二进制）。只改文档或想快速自查时用 `scripts/check.sh fast`。界面改动还要用 `scripts/tui.py` 在伪终端里真跑一遍（`--bg` 能打出每行底色、`--tool` 能脚本化工具调用；用法见 `docs/agents/codebase.md`），测试通过不算完成。
 
 ## 风格
 

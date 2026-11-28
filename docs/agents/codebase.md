@@ -56,6 +56,7 @@ main::run
 - `tests/common/mod.rs`：`start_server(Vec<String>)` 是手写 HTTP/SSE 服务器（标准库 `TcpListener`），记录 `FakeServer.bodies` / `.headers`；响应构造器 `sse_response`、`plain_response`、`tool_response`、`json_response`、`big_usage_response`；`temp_home(tag)` 生成唯一临时目录。
 - 配置通过 `config(port, home, effort)` 显式注入，**不改进程环境变量**；每个用例必须用不同会话路径（文件锁会冲突）。
 - 进程级全局状态要串行化：`tests/cancel.rs` 用 `static GATE: Mutex<()>`，`tests/crash.rs` 只有一个用例（`OnceLock`）。
+- 同一进程里 `drop` 会话后立刻重开同一个文件会偶发 `WouldBlock`：别的用例线程正在 spawn 子进程时，子进程在 `fork` 与 `exec` 之间会短暂继承会话文件的 `flock`（实测窗口 1–2 毫秒）。真机上一次进程只开一次会话，不受影响；测试要重开就换一个 `temp_home`，或在测试辅助函数里对“已经有 yi 在运行”做有界重试（见 `tests/tools.rs` 的 `open_agent`）。
 - 需要外部程序时先探测再跳过：`gopls_available()` / `rust_analyzer_available()` 失败就打印 `SKIP: ...` 后 return。
 - 用例名是英文完整句子描述行为（`edit_rejects_a_stale_anchor`），一个用例证明一条行为；断言消息用中文并带实际值。
 - 已知较慢：`lsp_reports_a_timeout_instead_of_hanging`（约 15 秒）、`bash_timeout_*`；没有 `#[ignore]`。
