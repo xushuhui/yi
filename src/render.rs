@@ -28,19 +28,166 @@ pub struct Theme {
     pub success: &'static str,
     pub error: &'static str,
     pub warning: &'static str,
+    /// 用户消息区块的底色（omp 的 `userMessageBg`）。
+    pub user_bg: &'static str,
+    /// 回复区与整页的底色（omp 的页面背景）。
+    pub page_bg: &'static str,
 }
 
 pub const DRACULA: Theme = Theme {
     heading: "\x1b[38;2;189;147;249m",     // #BD93F9 purple
     marker: "\x1b[38;2;255;121;198m",      // #FF79C6 pink
     link: "\x1b[38;2;139;233;253m",        // #8BE9FD cyan
-    inline_code: "\x1b[38;2;241;250;140m", // #F1FA8C yellow
+    inline_code: "\x1b[38;2;255;121;198m", // #FF79C6 pink
     muted: "\x1b[38;2;98;114;164m",        // #6272A4 comment
     rule: "\x1b[38;2;68;71;90m",           // #44475A currentLine
     success: "\x1b[38;2;80;250;123m",      // #50FA7B green
     error: "\x1b[38;2;255;85;85m",         // #FF5555 red
     warning: "\x1b[38;2;255;184;108m",     // #FFB86C orange
+    user_bg: "\x1b[48;2;31;32;41m",        // #1F2029 userMsgBg
+    page_bg: "\x1b[48;2;40;42;54m",        // #282A36 页面底色
 };
+
+/// 回复区的底色输出层：跨多次 `paint` 记住当前行位置，换行前补满右侧留白。
+///
+/// 为什么不能先拼整段再打印：回答是流式的，来一段就得打一段；而终端的背景色
+/// 只对真正写出的格子生效，所以每行结束必须自己补空格，否则色带会断在句子末尾。
+pub struct Band {
+    bg: &'static str,
+    width: usize,
+    column: usize,
+    fresh: bool,
+    live: bool,
+    enabled: bool,
+}
+
+impl Band {
+    pub fn new(bg: &'static str, width: usize, enabled: bool) -> Band {
+        Band {
+            bg,
+            width,
+            column: 0,
+            fresh: true,
+            live: false,
+            enabled: enabled && width > 4,
+        }
+    }
+
+    /// 一整行空底色带，用来分隔用户块和回复块。
+    pub fn blank(&mut self) -> String {
+        if !self.enabled {
+            return String::new();
+        }
+        let mut out = String::from(self.bg);
+        out.push_str(&" ".repeat(self.width));
+        out.push_str(RESET);
+        out.push_str("\r\n");
+        out.push_str(self.bg);
+        self.column = 0;
+        self.fresh = true;
+        self.live = true;
+        out
+    }
+
+    pub fn paint(&mut self, text: &str) -> String {
+        if !self.enabled {
+            return text.to_string();
+        }
+        let parts: Vec<&str> = text.split('\n').collect();
+        let last = parts.len() - 1;
+        let mut out = String::new();
+        for (index, part) in parts.iter().enumerate() {
+            if self.fresh {
+                if part.is_empty() && index == last {
+                    break;
+                }
+                out.push_str(self.bg);
+                out.push(' ');
+                self.column = 1;
+                self.fresh = false;
+                self.live = true;
+            }
+            if !part.is_empty() {
+                // 行内的 `RESET` 会把背景一起清掉，紧跟着补回来。
+                out.push_str(&part.replace(RESET, &format!("{RESET}{}", self.bg)));
+                self.column += display_width(part);
+            }
+            if index != last {
+                if self.column < self.width {
+                    out.push_str(&" ".repeat(self.width - self.column));
+                }
+                out.push_str(RESET);
+                out.push('\n');
+                out.push_str(self.bg);
+                self.column = 0;
+                self.fresh = true;
+                self.live = true;
+            }
+        }
+        out
+    }
+
+    /// 收尾：补齐最后半行、复位背景。返回空串表示行已闭合。
+    pub fn close(&mut self) -> String {
+        if !self.enabled {
+            return String::new();
+        }
+        let mut out = String::new();
+        if !self.fresh {
+            if self.column < self.width {
+                out.push_str(&" ".repeat(self.width - self.column));
+            }
+            out.push_str(RESET);
+            out.push('\n');
+            self.fresh = true;
+        } else if self.live {
+            out.push_str(RESET);
+        }
+        self.column = 0;
+        self.live = false;
+        out
+    }
+}
+
+/// 把刚提交的输入行重画成一块底色带：文字上下各留一行底色，左右各留一格。
+///
+/// 光标在输入行下面一行；`rows` 是输入行在终端里折出来的行数，靠显示宽度
+/// 估算。行数估多了会多出几条空色带（无伤），估少了文字会挤进下留白行，
+/// 所以伪终端里对长句、中文和边界宽度都单独验过。
+pub fn user_block(line: &str, prompt: &str, theme: &Theme, width: usize) -> String {
+    if width < 8 {
+        return String::new();
+    }
+    // reedline 只画「提示符 + 正文」，左边那格留白是我们重画时才加的，
+    // 所以行数要按原样算，否则边界宽度会把上面一行也擦掉。
+    let used = display_width(prompt) + display_width(line);
+    let rows = used.div_ceil(width).max(1);
+    let padded = 1 + used;
+    let block = rows + 2;
+    let mut out = String::new();
+    // 从输入行下面一行上移到块首（上留白行）。
+    out.push_str(&format!("\x1b[{}A\r", rows + 1));
+    for row in 0..block {
+        out.push_str(theme.user_bg);
+        out.push_str(&" ".repeat(width));
+        out.push_str(RESET);
+        if row + 1 < block {
+            out.push_str("\r\n");
+        }
+    }
+    // 回到块首，再下移一行到文字行。
+    out.push_str(&format!("\x1b[{}A\r\x1b[1B", block - 1));
+    out.push_str(theme.user_bg);
+    out.push(' ');
+    let text = format!("{}{prompt}{}{line}", theme.muted, RESET);
+    out.push_str(&text.replace(RESET, &format!("{RESET}{}", theme.user_bg)));
+    if padded < width {
+        out.push_str(&" ".repeat(width - padded));
+    }
+    out.push_str(RESET);
+    out.push_str("\r\n");
+    out
+}
 
 /// 终端够不够宽、能不能着色，由调用方判断一次，之后固定。
 pub struct Renderer {
@@ -640,9 +787,10 @@ fn inline(text: &str, color: bool, theme: &Theme) -> String {
         if rest[0] == '['
             && let Some((body, target, next)) = link(&chars, index)
         {
-            out.push_str(&body);
+            // 与 omp 一致：链接文字青色，地址退成灰蓝。
+            out.push_str(&format!("{}{body}{RESET}", theme.link));
             if bold_target(&body) != target {
-                out.push_str(&format!("{}（{target}）{RESET}", theme.link));
+                out.push_str(&format!("{}（{target}）{RESET}", theme.muted));
             }
             index = next;
             continue;
@@ -950,6 +1098,76 @@ mod tests {
             "{out}"
         );
         assert!(out.contains(&format!("{BOLD}重点{RESET}")), "{out}");
+    }
+
+    #[test]
+    fn a_band_pads_each_line_and_resets_the_background() {
+        let mut band = Band::new(DRACULA.page_bg, 12, true);
+        let out = band.paint("abc\ndef");
+        assert!(
+            out.starts_with(&format!("{} abc", DRACULA.page_bg)),
+            "{out:?}"
+        );
+        // 左侧一格 + 三个字，补满整行，再复位换行。
+        assert!(
+            out.contains(&format!("abc{}{RESET}\n", " ".repeat(8))),
+            "{out:?}"
+        );
+        assert!(out.ends_with("def"), "{out:?}");
+        let closed = band.close();
+        assert!(closed.ends_with(&format!("{RESET}\n")), "{closed:?}");
+    }
+
+    #[test]
+    fn a_band_puts_the_background_back_after_an_inline_reset() {
+        let mut band = Band::new(DRACULA.page_bg, 20, true);
+        let out = band.paint(&format!("{}文字{RESET}", DRACULA.inline_code));
+        assert!(
+            out.contains(&format!("文字{RESET}{}", DRACULA.page_bg)),
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn a_disabled_band_changes_nothing() {
+        let mut band = Band::new(DRACULA.page_bg, 20, false);
+        assert_eq!(band.paint("原样\n"), "原样\n");
+        assert_eq!(band.blank(), "");
+        assert_eq!(band.close(), "");
+    }
+
+    #[test]
+    fn the_user_block_reserves_one_padding_row_on_each_side() {
+        let out = user_block("abcdefg", "> ", &DRACULA, 10);
+        // 一行文字 + 上下各一行留白；光标从输入行下面上移两行到块首。
+        assert!(out.starts_with("\x1b[2A\r"), "{out:?}");
+        assert_eq!(out.matches(DRACULA.user_bg).count(), 5, "{out:?}");
+        assert!(out.contains("\x1b[1B"), "{out:?}");
+        assert!(out.contains("abcdefg"), "{out:?}");
+    }
+
+    #[test]
+    fn the_user_block_counts_wrapped_rows_by_display_width() {
+        let out = user_block("一二三四五六七八", "> ", &DRACULA, 10);
+        // 提示符 2 + 十六个显示列 = 18 列，10 列宽下折两行。
+        assert!(out.starts_with("\x1b[3A\r"), "{out:?}");
+        let wide = user_block("abcdefgh", "> ", &DRACULA, 10);
+        // 恰好撑满一行时不额外折行，否则会把上一行擦掉。
+        assert!(wide.starts_with("\x1b[2A\r"), "{wide:?}");
+    }
+
+    #[test]
+    fn a_link_colours_its_text_and_mutes_its_address() {
+        let mut renderer = plain();
+        let out = renderer.push("看 [文字](https://x) 的颜色\n");
+        assert!(
+            out.contains(&format!("{}文字{RESET}", DRACULA.link)),
+            "{out}"
+        );
+        assert!(
+            out.contains(&format!("{}（https://x）{RESET}", DRACULA.muted)),
+            "{out}"
+        );
     }
 
     #[test]

@@ -141,6 +141,11 @@ impl Agent {
         &self.provider_id
     }
 
+    /// 会话标识：页脚取额度时也要带上，供应商按它路由。
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
     pub fn provider_display(&self) -> &str {
         &self.provider_display
     }

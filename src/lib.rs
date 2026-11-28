@@ -17,6 +17,7 @@ pub mod jobs;
 pub mod lsp;
 pub mod program_status;
 pub mod provider;
+pub mod quota;
 pub mod render;
 pub mod session;
 pub mod skills;

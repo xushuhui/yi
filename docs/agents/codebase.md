@@ -13,7 +13,8 @@
 | `src/session.rs` | JSONL 会话：追加、父链与当前路径、`/tree` 分支与回退、上下文重建、压缩规划、中断修复、`/new` 归档 |
 | `src/tools.rs` | 九个工具与 JSON Schema；锚点快照、bash 日志与进程组；子 agent 的只读工具集 |
 | `src/config.rs` | 供应商预置、配置文件、密钥与代理、系统提示词组装 |
-| `src/render.rs` | 行式 markdown：标题/列表/引用/表格对齐、代码块交 `bat` |
+| `src/render.rs` | 行式 markdown：标题/列表/引用/表格对齐、代码块交 `bat`、消息底色带（`Band`） |
+| `src/quota.rs` | opencode-go 额度窗口：后台刷新 `/v1/usage`，给页脚提供已用百分比与重置倒计时 |
 | `src/complete.rs` | 斜杠命令与技能名候选计算；菜单由 `input` 画，不做行内灰字 |
 | `src/clipboard.rs` | `Ctrl-G` 在提交时用 `osascript` 从剪贴板取 PNG，落到 `$YI_HOME/clipboard/` |
 | `src/jobs.rs` | 进程内后台命令登记表，最多 3 条；跑完的结果下一轮取回对话 |

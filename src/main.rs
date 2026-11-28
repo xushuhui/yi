@@ -46,6 +46,8 @@ fn run() -> Result<()> {
         .join(config::encode_project(&cwd))
         .join("session.jsonl");
     let mut agent = Agent::new(&cfg, &cwd, &session_path)?;
+    // 额度是后台信息：拿不到就不显示，绝不影响启动与对话。
+    yi::quota::start(&cfg, agent.session_id());
     let skills: Vec<(String, String)> =
         yi::skills::discover(&yi::skills::roots(&cfg.home, Path::new(&cwd)))
             .into_iter()
@@ -74,6 +76,14 @@ fn run() -> Result<()> {
         None
     };
     let mut renderer = Renderer::new(color);
+    // 回复区左右各留一格底色，表格按剩下的宽度排，避免折到色带之外。
+    if color {
+        let width = render::terminal_width()
+            .unwrap_or(80)
+            .saturating_sub(2)
+            .max(20);
+        renderer = renderer.with_width(width);
+    }
     // 处理中的状态行：只在真终端里动，管道输出一个字节都不写。
     let mut status = Status::new(io::stdout().is_terminal(), color);
 
@@ -121,11 +131,19 @@ fn run() -> Result<()> {
                 line
             }
         };
-        // Ctrl-G 在行里留了标记；这里换回文字，并把图片取出来。
+        // Ctrl-G 在行里留了标记；先留住原文用于重绘，再换回文字并把图片取出来。
+        let typed = line.clone();
         let (line, has_image) = clipboard::strip_tokens(&line);
         let prompt = line.trim();
         if prompt.is_empty() && !has_image {
             continue;
+        }
+        // 真终端里把刚提交的输入行重画成一块底色带，和回复区区分开。
+        if interactive && color {
+            let width = render::terminal_width().unwrap_or(80);
+            let indicator = if agent.plan() { "plan> " } else { "> " };
+            print!("{}", render::user_block(&typed, indicator, &theme, width));
+            let _ = io::stdout().flush();
         }
         agent.note_prompt(prompt)?;
         let mut message = if let Some(rest) = prompt.strip_prefix("/skill:") {
@@ -145,6 +163,10 @@ fn run() -> Result<()> {
             prompt.to_string()
         };
 
+        let columns = render::terminal_width().unwrap_or(80);
+        let mut band = render::Band::new(theme.page_bg, columns, color);
+        // 用户块和回复块之间留一行页面底色，和 omp 的消息间距一致。
+        print!("{}", band.blank());
         yi::cancel::reset();
         yi::cancel::arm();
         // 用户可以直接把图片路径贴进来（拖拽到终端也是路径文本），或用 @路径 提及。
@@ -152,9 +174,12 @@ fn run() -> Result<()> {
         if has_image {
             match clipboard::image_path(&clip_dir) {
                 Some(path) => images.insert(0, path),
-                None => println!(
+                None => print!(
                     "{}",
-                    render::dim_line("剪贴板里没有图片，这一轮只发文字", color, &theme)
+                    band.paint(&format!(
+                        "{}\n",
+                        render::dim_line("剪贴板里没有图片，这一轮只发文字", color, &theme)
+                    ))
                 ),
             }
         }
@@ -163,9 +188,12 @@ fn run() -> Result<()> {
             message = "看看这张图片里有什么。".to_string();
         }
         for path in &images {
-            println!(
+            print!(
                 "{}",
-                render::dim_line(&format!("图片：{}", path.display()), color, &theme)
+                band.paint(&format!(
+                    "{}\n",
+                    render::dim_line(&format!("图片：{}", path.display()), color, &theme)
+                ))
             );
         }
         // 干活期间藏光标：状态行原地刷新，光标停在行尾会被当成「又在等你输入」。
@@ -182,7 +210,9 @@ fn run() -> Result<()> {
                 let previous = status.clear();
                 title.spin();
                 let out = renderer.push(&text);
-                print!("{out}");
+                if !out.is_empty() {
+                    print!("{}", band.paint(&out));
+                }
                 status.resume(previous);
                 let _ = io::stdout().flush();
             }
@@ -196,9 +226,7 @@ fn run() -> Result<()> {
             Event::Notice(notice) => {
                 let half = renderer.flush_line();
                 let previous = status.clear();
-                print!("{half}");
-                println!();
-                println!("· {notice}");
+                print!("{}", band.paint(&format!("{half}\n· {notice}\n")));
                 status.resume(previous);
                 let _ = io::stdout().flush();
             }
@@ -215,13 +243,13 @@ fn run() -> Result<()> {
                 }
                 let half = renderer.flush_line();
                 status.clear();
-                print!("{half}");
                 let short: String = note.chars().take(160).collect();
-                if failed {
-                    println!("{}", render::tool_line(&name, &short, color, &theme));
+                let line = if failed {
+                    render::tool_line(&name, &short, color, &theme)
                 } else {
-                    println!("{}", render::tool_note(&name, &short, color, &theme));
-                }
+                    render::tool_note(&name, &short, color, &theme)
+                };
+                print!("{}", band.paint(&format!("{half}{line}\n")));
                 // 工具跑完必然是再一次模型往返。
                 status.set("等待模型");
                 let _ = io::stdout().flush();
@@ -248,13 +276,12 @@ fn run() -> Result<()> {
         yi::cancel::disarm();
         // 把没换行的半行、没闭合的代码块放出来，再打页脚。
         let tail = renderer.finish();
-        print!("{tail}");
+        print!("{}", band.paint(&tail));
         match result {
             Ok(usage) => {
-                println!();
                 let branch = git_branch(&cwd);
-                println!(
-                    "{}",
+                let line = format!(
+                    "\n{}\n",
                     footer(Footer {
                         usage: &usage,
                         window: agent.window(),
@@ -263,18 +290,23 @@ fn run() -> Result<()> {
                         plan: agent.plan(),
                         provider: agent.provider_display(),
                         model: agent.model_display(),
+                        quota: if agent.provider_id() == "opencode-go" {
+                            yi::quota::suffix(yi::quota::now_ms())
+                        } else {
+                            None
+                        }
+                        .as_deref(),
                         color,
                         theme: &theme,
                     })
                 );
-                println!();
+                print!("{}", band.paint(&line));
             }
             Err(err) => {
-                println!();
-                println!("{err}");
-                println!();
+                print!("{}", band.paint(&format!("\n{err}\n")));
             }
         }
+        print!("{}", band.close());
     }
     // 退出时把还在跑的后台命令整组杀掉，不留孤儿进程。
     yi::jobs::kill_all();
@@ -524,17 +556,29 @@ fn print_replay(agent: &Agent, color: bool, theme: &render::Theme) {
         );
     }
 
+    let columns = render::terminal_width().unwrap_or(80);
     for item in &items[keep_from..] {
         match item {
-            Replay::User(text) => println!("> {text}"),
+            Replay::User(text) => {
+                // 重放的用户消息也铺底色：重启后回看，谁说的仍然一眼可分。
+                let mut band = render::Band::new(theme.user_bg, columns, color);
+                let mut chunk = band.blank();
+                chunk.push_str(&band.paint(&format!("> {text}\n")));
+                chunk.push_str(&band.close());
+                print!("{chunk}");
+                let mut pad = render::Band::new(theme.user_bg, columns, color);
+                print!("{}", pad.blank());
+            }
             Replay::Assistant(text) => {
                 // 每条回答单独一个渲染器：代码块、表格的状态不跨条继承。
                 let mut renderer = Renderer::new(color);
                 let out = format!("{}{}", renderer.push(text), renderer.finish());
-                print!("{out}");
+                let mut band = render::Band::new(theme.page_bg, columns, color);
+                print!("{}", band.paint(&out));
                 if !out.ends_with('\n') {
-                    println!();
+                    print!("{}", band.paint("\n"));
                 }
+                print!("{}", band.close());
             }
             // 工具调用也不重放：与实时输出一样，只看人和模型的对话。
             Replay::Tool(_) => {}
@@ -554,6 +598,8 @@ struct Footer<'a> {
     plan: bool,
     provider: &'a str,
     model: &'a str,
+    /// opencode-go 的额度后缀；没有数据时为 `None`。
+    quota: Option<&'a str>,
     color: bool,
     theme: &'a render::Theme,
 }
@@ -567,6 +613,7 @@ fn footer(f: Footer<'_>) -> String {
         plan,
         provider,
         model,
+        quota,
         color,
         theme,
     } = f;
@@ -593,7 +640,11 @@ fn footer(f: Footer<'_>) -> String {
         Some(cached) => out.push_str(&format!(" · {percent}% · 缓存 {cached}%")),
         None => out.push_str(&format!(" · {percent}%")),
     }
-    out.push_str(&format!(" · {provider} · {model}]"));
+    out.push_str(&format!(" · {provider} · {model}"));
+    if let Some(quota) = quota {
+        out.push_str(quota);
+    }
+    out.push(']');
     out
 }
 
@@ -985,12 +1036,35 @@ mod tests {
             plan: false,
             provider: "OpenCode Go",
             model: "DeepSeek V4.1 Flash",
+            quota: None,
             color: false,
             theme: &render::DRACULA,
         });
         assert_eq!(
             line,
             "[~/gp/yi main · 50% · 缓存 50% · OpenCode Go · DeepSeek V4.1 Flash]"
+        );
+    }
+
+    #[test]
+    fn footer_appends_the_quota_windows_after_the_model() {
+        let line = footer(Footer {
+            usage: &usage(100, 9_000, 1_000),
+            window: 1_048_576,
+            place: "~/gp/yi",
+            branch: Some("main"),
+            plan: false,
+            provider: "OpenCode Go",
+            model: "DeepSeek V4.1 Flash",
+            quota: Some(" · 5h 4% (2h 57m) · 7d 16% (2d 8h) · mo 44% (14d 19h)"),
+            color: false,
+            theme: &render::DRACULA,
+        });
+        assert!(
+            line.ends_with(
+                " · OpenCode Go · DeepSeek V4.1 Flash · 5h 4% (2h 57m) · 7d 16% (2d 8h) · mo 44% (14d 19h)]"
+            ),
+            "{line}"
         );
     }
 
@@ -1004,6 +1078,7 @@ mod tests {
             plan: false,
             provider: "DeepSeek",
             model: "DeepSeek Flash",
+            quota: None,
             color: false,
             theme: &render::DRACULA,
         });
@@ -1020,6 +1095,7 @@ mod tests {
             plan: false,
             provider: "DeepSeek",
             model: "DeepSeek Flash",
+            quota: None,
             color: false,
             theme: &render::DRACULA,
         });
