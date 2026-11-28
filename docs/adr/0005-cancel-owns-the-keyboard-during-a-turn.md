@@ -2,7 +2,7 @@
 
 ## Status
 
-accepted
+accepted（取消键在 ADR-0020 扩展到 Esc，键盘归属不变）
 
 ## 背景
 

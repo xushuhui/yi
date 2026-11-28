@@ -88,7 +88,8 @@ impl Draft {
         match self.escape {
             Escape::Esc => {
                 self.escape = match byte {
-                    b'[' => Escape::Csi,
+                    // `ESC [` 是 CSI，`ESC O` 是 SS3（应用光标模式的方向键）。
+                    b'[' | b'O' => Escape::Csi,
                     0x1b => Escape::Esc,
                     _ => Escape::None,
                 };
@@ -148,29 +149,60 @@ fn poll_terminal() {
             events: libc::POLLIN,
             revents: 0,
         };
-        if libc::poll(&mut fd, 1, 0) <= 0 {
-            return;
-        }
         // 一次最多吞这么多字节：够一整次粘贴，又不会让调用方迟迟不返回。
         let mut bytes = [0u8; 256];
         let mut draft = DRAFT.lock().unwrap_or_else(|err| err.into_inner());
+        // 上一段以 ESC 结尾：可能是单独的 Esc（要中止这一轮），
+        // 也可能是方向键这类控制序列的开头，给它一点时间把后续字节送到。
+        let mut pending = false;
         for _ in 0..4 {
+            let timeout = if pending { ESCAPE_WAIT_MS } else { 0 };
+            if libc::poll(&mut fd, 1, timeout) <= 0 {
+                break;
+            }
             let read = libc::read(libc::STDIN_FILENO, bytes.as_mut_ptr().cast(), bytes.len());
             if read <= 0 {
                 break;
             }
-            for byte in &bytes[..read as usize] {
-                if *byte == 0x03 {
-                    request();
-                } else {
-                    draft.feed(*byte);
-                }
-            }
-            if libc::poll(&mut fd, 1, 0) <= 0 {
-                break;
+            if feed_keys(&mut draft, &bytes[..read as usize], &mut pending) {
+                request();
             }
         }
+        // 等过一小段时间还没有后续字节：这是单独一个 Esc，按取消处理。
+        if pending {
+            request();
+        }
     }
+}
+
+/// Esc 之后等后续字节的时间：方向键的整段序列通常在同一批字节里到达，
+/// 只有终端恰好在 ESC 处被切开时才需要这个等待。按人的手感选 20 毫秒。
+const ESCAPE_WAIT_MS: libc::c_int = 20;
+
+/// 把一段终端字节喂给草稿；返回是否收到 Ctrl-C。
+///
+/// `pending` 记录“上一段以 ESC 结尾，还不知道是 Esc 还是控制序列开头”：
+/// 下一段的首字节如果存在，就把它和 ESC 一起交给 [`Draft`] 判断；一直没等到，
+/// 调用方按单独的 Esc 中止这一轮。
+fn feed_keys(draft: &mut Draft, bytes: &[u8], pending: &mut bool) -> bool {
+    let mut cancel = false;
+    for byte in bytes {
+        if *byte == 0x03 {
+            cancel = true;
+            *pending = false;
+            continue;
+        }
+        if *pending {
+            *pending = false;
+            draft.feed(0x1b);
+            draft.feed(*byte);
+        } else if *byte == 0x1b {
+            *pending = true;
+        } else {
+            draft.feed(*byte);
+        }
+    }
+    cancel
 }
 
 /// 接管 SIGINT：置位标志，不打断系统调用（`SA_RESTART` 不设，让阻塞读能返回）。
@@ -283,6 +315,39 @@ mod tests {
     fn arrow_keys_do_not_become_text() {
         // 上箭头是 ESC [ A，整段吞掉；后面的字照收。
         assert_eq!(draft_after(b"ab\x1b[Acd"), "abcd");
+    }
+
+    #[test]
+    fn a_lone_escape_is_a_cancel_request_after_the_wait() {
+        let mut draft = Draft::default();
+        let mut pending = false;
+        assert!(!feed_keys(&mut draft, b"\x1b", &mut pending));
+        assert!(pending, "单独的 Esc 先挂起，等一小段时间再决定");
+    }
+
+    #[test]
+    fn split_escape_sequences_are_not_mistaken_for_a_cancel() {
+        let mut draft = Draft::default();
+        let mut pending = false;
+        // ESC 和后面的 `[A` 分两次到达：不能取消，也不能把 A 写进草稿。
+        assert!(!feed_keys(&mut draft, b"\x1b", &mut pending));
+        assert!(!feed_keys(&mut draft, b"[A", &mut pending));
+        assert!(!pending);
+        assert_eq!(draft.text(), "");
+    }
+
+    #[test]
+    fn ss3_arrow_keys_do_not_leak_their_final_letter() {
+        assert_eq!(draft_after(b"ab\x1bOAcd"), "abcd");
+    }
+
+    #[test]
+    fn ctrl_c_and_escape_across_a_paste_still_cancel() {
+        let mut draft = Draft::default();
+        let mut pending = false;
+        assert!(feed_keys(&mut draft, b"a\x03b", &mut pending));
+        assert!(!pending);
+        assert_eq!(draft.text(), "ab");
     }
 
     #[test]
